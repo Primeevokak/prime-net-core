@@ -4,6 +4,9 @@
 /.cargo-home-test
 /.home-tmp
 /.cargo/config.local.toml
+.env
+.env.*
+!.env.example
 
 # OS junk
 .DS_Store

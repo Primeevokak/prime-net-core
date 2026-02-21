@@ -2288,7 +2288,7 @@ fn record_bypass_profile_failure(
     let fail_map = DEST_BYPASS_PROFILE_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
     let failures = if let Ok(mut guard) = fail_map.lock() {
         let entry = guard.entry(key.clone()).or_insert(0);
-        *entry = entry.saturating_add(1).min(255);
+        *entry = entry.saturating_add(1);
         *entry
     } else {
         0
