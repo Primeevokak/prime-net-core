@@ -1,10 +1,11 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 
 use crate::anticensorship::ResolverChain;
@@ -23,6 +24,7 @@ pub struct DirectOutbound {
 impl DirectOutbound {
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
     const MAX_DOMAIN_IP_ATTEMPTS: usize = 8;
+    const HAPPY_EYEBALLS_FALLBACK_DELAY: Duration = Duration::from_millis(200);
 
     pub fn new(resolver: Arc<ResolverChain>) -> Self {
         Self {
@@ -60,7 +62,7 @@ impl DirectOutbound {
                 self.connect_addr_with_timeout(&target_label, addr).await
             }
             TargetAddr::Domain(host) => {
-                let mut ips = self.resolver.resolve(&host).await?;
+                let ips = self.resolver.resolve(&host).await?;
                 if ips.is_empty() {
                     return Err(EngineError::Internal(format!(
                         "dns resolver returned no IPs for '{}'",
@@ -68,56 +70,91 @@ impl DirectOutbound {
                     )));
                 }
 
-                // Prefer IPv4 first in this path because many desktop stacks and middleboxes
-                // still handle IPv4 routes more reliably under interference.
-                ips.sort_by_key(|ip| if ip.is_ipv4() { 0u8 } else { 1u8 });
-                let attempts = ips.len().min(Self::MAX_DOMAIN_IP_ATTEMPTS);
+                let ordered = happy_eyeballs_order(ips);
+                let attempts = ordered.len().min(Self::MAX_DOMAIN_IP_ATTEMPTS);
+                let has_v4 = ordered.iter().any(IpAddr::is_ipv4);
+                let has_v6 = ordered.iter().any(IpAddr::is_ipv6);
                 info!(
                     target: "outbound.direct",
                     host = %host,
                     port = target.port,
                     resolved_ips = attempts,
-                    "DNS resolved for direct outbound"
+                    has_ipv4 = has_v4,
+                    has_ipv6 = has_v6,
+                    fallback_delay_ms = Self::HAPPY_EYEBALLS_FALLBACK_DELAY.as_millis(),
+                    "DNS resolved for direct outbound (happy-eyeballs ordering)"
                 );
-
-                let mut last_err: Option<EngineError> = None;
-                for (idx, ip) in ips.into_iter().take(attempts).enumerate() {
-                    let addr = std::net::SocketAddr::new(ip, target.port);
-                    match self.connect_addr_with_timeout(&target_label, addr).await {
-                        Ok(stream) => {
-                            if idx > 0 {
-                                info!(
-                                    target: "outbound.direct",
-                                    destination = %target_label,
-                                    upstream = %addr,
-                                    attempt = idx + 1,
-                                    "Direct outbound connected after fallback"
-                                );
-                            }
-                            return Ok(stream);
-                        }
-                        Err(e) => {
-                            warn!(
-                                target: "outbound.direct",
-                                destination = %target_label,
-                                upstream = %addr,
-                                attempt = idx + 1,
-                                error = %e,
-                                "Direct outbound attempt failed"
-                            );
-                            last_err = Some(e);
-                        }
-                    }
-                }
-
-                Err(last_err.unwrap_or_else(|| {
-                    EngineError::Internal(format!(
-                        "no connect attempts were made for '{}'",
-                        target_label
-                    ))
-                }))
+                self.connect_domain_happy_eyeballs(&target_label, target.port, ordered, attempts)
+                    .await
             }
         }
+    }
+
+    async fn connect_domain_happy_eyeballs(
+        &self,
+        target_label: &str,
+        port: u16,
+        ordered_ips: Vec<IpAddr>,
+        attempts: usize,
+    ) -> Result<BoxStream> {
+        let mut set = JoinSet::new();
+        for (idx, ip) in ordered_ips.into_iter().take(attempts).enumerate() {
+            let this = self.clone();
+            let label = target_label.to_owned();
+            let addr = SocketAddr::new(ip, port);
+            set.spawn(async move {
+                if idx > 0 {
+                    tokio::time::sleep(
+                        DirectOutbound::HAPPY_EYEBALLS_FALLBACK_DELAY.saturating_mul(idx as u32),
+                    )
+                    .await;
+                }
+                let res = this.connect_addr_with_timeout(&label, addr).await;
+                (idx, addr, res)
+            });
+        }
+
+        let mut last_err: Option<EngineError> = None;
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((idx, addr, Ok(stream))) => {
+                    set.abort_all();
+                    if idx > 0 {
+                        info!(
+                            target: "outbound.direct",
+                            destination = %target_label,
+                            upstream = %addr,
+                            attempt = idx + 1,
+                            "Direct outbound connected after happy-eyeballs fallback"
+                        );
+                    }
+                    return Ok(stream);
+                }
+                Ok((idx, addr, Err(e))) => {
+                    warn!(
+                        target: "outbound.direct",
+                        destination = %target_label,
+                        upstream = %addr,
+                        attempt = idx + 1,
+                        error = %e,
+                        "Direct outbound attempt failed"
+                    );
+                    last_err = Some(e);
+                }
+                Err(e) => {
+                    last_err = Some(EngineError::Internal(format!(
+                        "happy-eyeballs task join error: {e}"
+                    )));
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            EngineError::Internal(format!(
+                "no happy-eyeballs connect attempts were made for '{}'",
+                target_label
+            ))
+        }))
     }
 
     async fn connect_addr_with_timeout(
@@ -293,11 +330,81 @@ fn normalize_target_endpoint(target: TargetEndpoint) -> TargetEndpoint {
     }
 }
 
+fn happy_eyeballs_order(ips: Vec<IpAddr>) -> Vec<IpAddr> {
+    let mut v6 = Vec::new();
+    let mut v4 = Vec::new();
+    for ip in ips {
+        match ip {
+            IpAddr::V6(_) => v6.push(ip),
+            IpAddr::V4(_) => v4.push(ip),
+        }
+    }
+    if v6.is_empty() || v4.is_empty() {
+        let mut out = v6;
+        out.extend(v4);
+        return out;
+    }
+
+    let mut out = Vec::with_capacity(v6.len() + v4.len());
+    let mut idx6 = 0usize;
+    let mut idx4 = 0usize;
+    loop {
+        let mut progressed = false;
+        if idx6 < v6.len() {
+            out.push(v6[idx6]);
+            idx6 += 1;
+            progressed = true;
+        }
+        if idx4 < v4.len() {
+            out.push(v4[idx4]);
+            idx4 += 1;
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+    out
+}
+
 impl OutboundConnector for DirectOutbound {
     fn connect<'a>(
         &'a self,
         target: TargetEndpoint,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<BoxStream>> + Send + 'a>> {
         Box::pin(async move { self.connect_impl(target).await })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn happy_eyeballs_order_interleaves_v6_and_v4() {
+        let ips = vec![
+            "2001:db8::1".parse().expect("v6"),
+            "2001:db8::2".parse().expect("v6"),
+            "1.1.1.1".parse().expect("v4"),
+            "8.8.8.8".parse().expect("v4"),
+        ];
+        let ordered = happy_eyeballs_order(ips);
+        assert_eq!(ordered[0].to_string(), "2001:db8::1");
+        assert_eq!(ordered[1].to_string(), "1.1.1.1");
+        assert_eq!(ordered[2].to_string(), "2001:db8::2");
+        assert_eq!(ordered[3].to_string(), "8.8.8.8");
+    }
+
+    #[test]
+    fn happy_eyeballs_order_keeps_single_family_as_is() {
+        let ips = vec![
+            "8.8.8.8".parse().expect("v4"),
+            "1.1.1.1".parse().expect("v4"),
+        ];
+        let ordered = happy_eyeballs_order(ips);
+        assert_eq!(ordered.len(), 2);
+        assert!(ordered.iter().all(IpAddr::is_ipv4));
+        assert_eq!(ordered[0].to_string(), "8.8.8.8");
+        assert_eq!(ordered[1].to_string(), "1.1.1.1");
     }
 }

@@ -39,6 +39,7 @@ static DEST_ROUTE_HEALTH: OnceLock<Mutex<HashMap<String, HashMap<String, RouteHe
 static STAGE_RACE_STATS: OnceLock<Mutex<HashMap<u8, StageRaceStats>>> = OnceLock::new();
 static RACE_SOURCE_COUNTERS: OnceLock<Mutex<RaceSourceCounters>> = OnceLock::new();
 static ROUTE_METRICS: OnceLock<Mutex<RouteMetrics>> = OnceLock::new();
+static ROUTE_CAPABILITIES: OnceLock<Mutex<RouteCapabilities>> = OnceLock::new();
 static LAST_CLASSIFIER_EMIT_UNIX: AtomicU64 = AtomicU64::new(0);
 static CLASSIFIER_STORE_CFG: OnceLock<Option<ClassifierStoreConfig>> = OnceLock::new();
 static CLASSIFIER_STORE_LOADED: AtomicBool = AtomicBool::new(false);
@@ -54,6 +55,9 @@ const ROUTE_WEAK_BASE_SECS: u64 = 45;
 const ROUTE_WEAK_MAX_SECS: u64 = 5 * 60;
 const ROUTE_FAILS_BEFORE_WEAK: u8 = 2;
 const ROUTE_SOFT_ZERO_REPLY_MIN_C2U: u64 = 256;
+const ROUTE_CAPABILITY_NET_UNREACHABLE_SECS: u64 = 3 * 60;
+const ROUTE_CAPABILITY_BYPASS_REP03_SECS: u64 = 10 * 60;
+const ROUTE_CAPABILITY_BYPASS_REP_OTHER_SECS: u64 = 4 * 60;
 
 #[derive(Debug, Clone)]
 pub struct RelayOptions {
@@ -244,30 +248,66 @@ enum RouteKind {
     Bypass,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteIpFamily {
+    Any,
+    V4,
+    V6,
+}
+
+impl RouteIpFamily {
+    fn label(self) -> &'static str {
+        match self {
+            RouteIpFamily::Any => "any",
+            RouteIpFamily::V4 => "v4",
+            RouteIpFamily::V6 => "v6",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RouteCandidate {
     kind: RouteKind,
     source: &'static str,
+    family: RouteIpFamily,
     bypass_addr: Option<SocketAddr>,
     bypass_profile_idx: u8,
     bypass_profile_total: u8,
 }
 
 impl RouteCandidate {
+    #[cfg(test)]
     fn direct(source: &'static str) -> Self {
+        Self::direct_with_family(source, RouteIpFamily::Any)
+    }
+
+    fn direct_with_family(source: &'static str, family: RouteIpFamily) -> Self {
         Self {
             kind: RouteKind::Direct,
             source,
+            family,
             bypass_addr: None,
             bypass_profile_idx: 0,
             bypass_profile_total: 1,
         }
     }
 
+    #[cfg(test)]
     fn bypass(source: &'static str, addr: SocketAddr, profile_idx: u8, profile_total: u8) -> Self {
+        Self::bypass_with_family(source, addr, profile_idx, profile_total, RouteIpFamily::Any)
+    }
+
+    fn bypass_with_family(
+        source: &'static str,
+        addr: SocketAddr,
+        profile_idx: u8,
+        profile_total: u8,
+        family: RouteIpFamily,
+    ) -> Self {
         Self {
             kind: RouteKind::Bypass,
             source,
+            family,
             bypass_addr: Some(addr),
             bypass_profile_idx: profile_idx,
             bypass_profile_total: profile_total,
@@ -294,6 +334,14 @@ impl RouteCandidate {
             RouteKind::Bypass => 1,
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct RouteCapabilities {
+    direct_v4_weak_until_unix: u64,
+    direct_v6_weak_until_unix: u64,
+    bypass_v4_weak_until_unix: u64,
+    bypass_v6_weak_until_unix: u64,
 }
 
 struct ConnectedRoute {
@@ -571,6 +619,60 @@ async fn connect_route_candidate(
     }
 }
 
+fn engine_error_is_network_unreachable(err: &EngineError) -> bool {
+    match err {
+        EngineError::Io(io) => {
+            matches!(
+                io.kind(),
+                ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable
+            ) || matches!(io.raw_os_error(), Some(10051 | 10065 | 113))
+        }
+        _ => false,
+    }
+}
+
+fn engine_error_bypass_rep_code(err: &EngineError) -> Option<u8> {
+    let EngineError::Internal(msg) = err else {
+        return None;
+    };
+    let marker = "REP=0x";
+    let idx = msg.find(marker)?;
+    let hex = msg.get(idx + marker.len()..idx + marker.len() + 2)?;
+    u8::from_str_radix(hex, 16).ok()
+}
+
+fn maybe_mark_route_capability_failure(candidate: &RouteCandidate, err: &EngineError) {
+    if candidate.family == RouteIpFamily::Any {
+        return;
+    }
+
+    if engine_error_is_network_unreachable(err) {
+        mark_route_capability_weak(
+            candidate.kind,
+            candidate.family,
+            "network-unreachable",
+            ROUTE_CAPABILITY_NET_UNREACHABLE_SECS,
+        );
+        return;
+    }
+
+    if candidate.kind == RouteKind::Bypass {
+        if let Some(rep) = engine_error_bypass_rep_code(err) {
+            let penalty = if rep == 0x03 {
+                ROUTE_CAPABILITY_BYPASS_REP03_SECS
+            } else {
+                ROUTE_CAPABILITY_BYPASS_REP_OTHER_SECS
+            };
+            mark_route_capability_weak(
+                RouteKind::Bypass,
+                candidate.family,
+                "bypass-rep-nonzero",
+                penalty,
+            );
+        }
+    }
+}
+
 async fn connect_via_best_route(
     conn_id: u64,
     outbound: DynOutbound,
@@ -578,7 +680,7 @@ async fn connect_via_best_route(
     target_endpoint: &TargetEndpoint,
     destination: &str,
 ) -> Result<ConnectedRoute> {
-    let route_key = route_decision_key(destination);
+    let route_key = route_decision_key(destination, &target_endpoint.addr);
     let candidates = select_route_candidates(
         relay_opts,
         &target_endpoint.addr,
@@ -642,6 +744,7 @@ async fn connect_via_best_route(
                     });
                 }
                 Ok((candidate, _, Err(e))) => {
+                    maybe_mark_route_capability_failure(&candidate, &e);
                     record_route_failure(&route_key, &candidate, "connect-failed");
                     last_error = Some(e);
                 }
@@ -678,6 +781,7 @@ async fn connect_via_best_route(
                 });
             }
             Err(e) => {
+                maybe_mark_route_capability_failure(&candidate, &e);
                 record_route_failure(&route_key, &candidate, "connect-failed");
                 last_error = Some(e);
             }
@@ -880,7 +984,7 @@ async fn handle_client(
                         bypass_profiles = connected.candidate.bypass_profile_total,
                         "bypass profile marked as weak for destination"
                     );
-                } else if should_mark_route_soft_zero_reply(port, c2u, u2c) {
+                } else if should_mark_bypass_zero_reply_soft(port, c2u, u2c) {
                     record_route_failure(
                         &connected.route_key,
                         &connected.candidate,
@@ -1206,7 +1310,7 @@ async fn handle_http_proxy(
                             bypass_profiles = connected.candidate.bypass_profile_total,
                             "bypass profile marked as weak for destination"
                         );
-                    } else if should_mark_route_soft_zero_reply(port, c2u, u2c) {
+                    } else if should_mark_bypass_zero_reply_soft(port, c2u, u2c) {
                         record_route_failure(
                             &connected.route_key,
                             &connected.candidate,
@@ -1742,8 +1846,107 @@ fn tune_relay_for_target(
     }
 }
 
-fn route_decision_key(destination: &str) -> String {
-    bypass_profile_key(destination)
+fn route_family_for_target(target: &TargetAddr) -> RouteIpFamily {
+    match target {
+        TargetAddr::Ip(std::net::IpAddr::V4(_)) => RouteIpFamily::V4,
+        TargetAddr::Ip(std::net::IpAddr::V6(_)) => RouteIpFamily::V6,
+        TargetAddr::Domain(host) => parse_ip_literal(host)
+            .map(route_family_for_ip)
+            .unwrap_or(RouteIpFamily::Any),
+    }
+}
+
+fn route_family_for_ip(ip: std::net::IpAddr) -> RouteIpFamily {
+    match ip {
+        std::net::IpAddr::V4(_) => RouteIpFamily::V4,
+        std::net::IpAddr::V6(_) => RouteIpFamily::V6,
+    }
+}
+
+fn route_decision_key(destination: &str, target: &TargetAddr) -> String {
+    format!(
+        "{}|{}",
+        bypass_profile_key(destination),
+        route_family_for_target(target).label()
+    )
+}
+
+fn route_destination_key(route_key: &str) -> &str {
+    route_key
+        .split_once('|')
+        .map(|(k, _)| k)
+        .unwrap_or(route_key)
+}
+
+fn route_capability_slot_mut(
+    caps: &mut RouteCapabilities,
+    kind: RouteKind,
+    family: RouteIpFamily,
+) -> Option<&mut u64> {
+    match (kind, family) {
+        (RouteKind::Direct, RouteIpFamily::V4) => Some(&mut caps.direct_v4_weak_until_unix),
+        (RouteKind::Direct, RouteIpFamily::V6) => Some(&mut caps.direct_v6_weak_until_unix),
+        (RouteKind::Bypass, RouteIpFamily::V4) => Some(&mut caps.bypass_v4_weak_until_unix),
+        (RouteKind::Bypass, RouteIpFamily::V6) => Some(&mut caps.bypass_v6_weak_until_unix),
+        (_, RouteIpFamily::Any) => None,
+    }
+}
+
+fn route_capability_is_available(kind: RouteKind, family: RouteIpFamily, now: u64) -> bool {
+    let map = ROUTE_CAPABILITIES.get_or_init(|| Mutex::new(RouteCapabilities::default()));
+    let Ok(guard) = map.lock() else {
+        return true;
+    };
+    let until = match (kind, family) {
+        (RouteKind::Direct, RouteIpFamily::V4) => guard.direct_v4_weak_until_unix,
+        (RouteKind::Direct, RouteIpFamily::V6) => guard.direct_v6_weak_until_unix,
+        (RouteKind::Bypass, RouteIpFamily::V4) => guard.bypass_v4_weak_until_unix,
+        (RouteKind::Bypass, RouteIpFamily::V6) => guard.bypass_v6_weak_until_unix,
+        (_, RouteIpFamily::Any) => 0,
+    };
+    until <= now
+}
+
+fn mark_route_capability_weak(
+    kind: RouteKind,
+    family: RouteIpFamily,
+    reason: &'static str,
+    penalty_secs: u64,
+) {
+    if family == RouteIpFamily::Any {
+        return;
+    }
+    let now = now_unix_secs();
+    let until = now.saturating_add(penalty_secs);
+    let map = ROUTE_CAPABILITIES.get_or_init(|| Mutex::new(RouteCapabilities::default()));
+    if let Ok(mut guard) = map.lock() {
+        if let Some(slot) = route_capability_slot_mut(&mut guard, kind, family) {
+            *slot = (*slot).max(until);
+        }
+    }
+    warn!(
+        target: "socks5.route",
+        route = match kind {
+            RouteKind::Direct => "direct",
+            RouteKind::Bypass => "bypass",
+        },
+        family = family.label(),
+        reason,
+        weak_for_secs = penalty_secs,
+        "route capability temporarily downgraded"
+    );
+}
+
+fn mark_route_capability_healthy(kind: RouteKind, family: RouteIpFamily) {
+    if family == RouteIpFamily::Any {
+        return;
+    }
+    let map = ROUTE_CAPABILITIES.get_or_init(|| Mutex::new(RouteCapabilities::default()));
+    if let Ok(mut guard) = map.lock() {
+        if let Some(slot) = route_capability_slot_mut(&mut guard, kind, family) {
+            *slot = 0;
+        }
+    }
 }
 
 fn should_enable_universal_bypass_domain(host: &str) -> bool {
@@ -1827,27 +2030,39 @@ fn select_route_candidates(
     port: u16,
     destination: &str,
 ) -> Vec<RouteCandidate> {
-    let mut out = vec![RouteCandidate::direct("adaptive")];
+    let family = route_family_for_target(target);
+    let mut out = vec![RouteCandidate::direct_with_family("adaptive", family)];
     let Some(source) = select_bypass_source(relay_opts, target, port) else {
         return out;
     };
     for (addr, idx, total) in select_bypass_candidates(relay_opts, destination) {
-        out.push(RouteCandidate::bypass(source, addr, idx, total));
+        out.push(RouteCandidate::bypass_with_family(
+            source, addr, idx, total, family,
+        ));
     }
     out
 }
 
-fn route_health_score(route_key: &str, route_id: &str, now: u64) -> i64 {
+fn bypass_profile_health_key(route_id: &str, family: RouteIpFamily) -> String {
+    if family == RouteIpFamily::Any {
+        route_id.to_owned()
+    } else {
+        format!("{route_id}|{}", family.label())
+    }
+}
+
+fn route_health_score(route_key: &str, candidate: &RouteCandidate, now: u64) -> i64 {
+    let route_id = candidate.route_id();
     let local_score = {
         let map = DEST_ROUTE_HEALTH.get_or_init(|| Mutex::new(HashMap::new()));
         let Ok(guard) = map.lock() else {
-            return global_bypass_profile_score(route_id, now);
+            return global_bypass_profile_score(candidate, now);
         };
         let Some(per_route) = guard.get(route_key) else {
-            return global_bypass_profile_score(route_id, now);
+            return global_bypass_profile_score(candidate, now);
         };
-        let Some(health) = per_route.get(route_id) else {
-            return global_bypass_profile_score(route_id, now);
+        let Some(health) = per_route.get(&route_id) else {
+            return global_bypass_profile_score(candidate, now);
         };
         let mut score = (health.successes as i64 * 3) - (health.failures as i64 * 4);
         score -= i64::from(health.consecutive_failures) * 8;
@@ -1856,7 +2071,7 @@ fn route_health_score(route_key: &str, route_id: &str, now: u64) -> i64 {
         }
         score
     };
-    local_score + global_bypass_profile_score(route_id, now)
+    local_score + global_bypass_profile_score(candidate, now)
 }
 
 fn bypass_profile_health_last_seen_unix(health: &BypassProfileHealth) -> u64 {
@@ -1873,18 +2088,25 @@ fn bypass_profile_health_is_empty(health: &BypassProfileHealth) -> bool {
         && health.last_failure_unix == 0
 }
 
-fn global_bypass_profile_score(route_id: &str, now: u64) -> i64 {
+fn global_bypass_profile_score(candidate: &RouteCandidate, now: u64) -> i64 {
+    let route_id = candidate.route_id();
     if !route_id.starts_with("bypass:") {
         return 0;
     }
+    let primary_key = bypass_profile_health_key(&route_id, candidate.family);
     let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(|| Mutex::new(HashMap::new()));
     let Ok(guard) = map.lock() else {
         return 0;
     };
-    let Some(health) = guard.get(route_id) else {
-        return 0;
-    };
-    bypass_profile_score_from_health(health, now)
+    if let Some(health) = guard.get(&primary_key) {
+        return bypass_profile_score_from_health(health, now);
+    }
+    if candidate.family != RouteIpFamily::Any {
+        if let Some(legacy) = guard.get(&route_id) {
+            return bypass_profile_score_from_health(legacy, now);
+        }
+    }
+    0
 }
 
 fn bypass_profile_score_from_health(health: &BypassProfileHealth, now: u64) -> i64 {
@@ -1929,6 +2151,7 @@ fn ordered_route_candidates(
     let winner = route_winner_for_key(route_key);
     let mut filtered: Vec<RouteCandidate> = candidates
         .iter()
+        .filter(|c| route_capability_is_available(c.kind, c.family, now))
         .filter(|c| !route_is_temporarily_weak(route_key, &c.route_id(), now))
         .cloned()
         .collect();
@@ -1947,8 +2170,8 @@ fn ordered_route_candidates(
                 std::cmp::Ordering::Greater
             };
         }
-        let a_score = route_health_score(route_key, &a_id, now);
-        let b_score = route_health_score(route_key, &b_id, now);
+        let a_score = route_health_score(route_key, a, now);
+        let b_score = route_health_score(route_key, b, now);
         b_score
             .cmp(&a_score)
             .then_with(|| a.kind_rank().cmp(&b.kind_rank()))
@@ -2099,8 +2322,9 @@ fn record_route_success(route_key: &str, candidate: &RouteCandidate) {
         );
     }
     if matches!(candidate.kind, RouteKind::Bypass) {
-        record_global_bypass_profile_success(&route_id, now);
+        record_global_bypass_profile_success(candidate, now);
     }
+    mark_route_capability_healthy(candidate.kind, candidate.family);
     info!(
         target: "socks5.route",
         route_key = %route_key,
@@ -2167,10 +2391,10 @@ fn record_route_failure(route_key: &str, candidate: &RouteCandidate, reason: &'s
         }
     }
     if matches!(candidate.kind, RouteKind::Bypass) {
-        record_global_bypass_profile_failure(&route_id, reason, now);
+        record_global_bypass_profile_failure(candidate, reason, now);
         if reason == "zero-reply-soft" && candidate.bypass_profile_total > 1 {
             record_bypass_profile_failure(
-                route_key,
+                route_destination_key(route_key),
                 candidate.bypass_profile_idx,
                 candidate.bypass_profile_total,
                 "route-soft-zero-reply",
@@ -2188,13 +2412,15 @@ fn record_route_failure(route_key: &str, candidate: &RouteCandidate, reason: &'s
     maybe_flush_classifier_store(false);
 }
 
-fn record_global_bypass_profile_success(route_id: &str, now: u64) {
+fn record_global_bypass_profile_success(candidate: &RouteCandidate, now: u64) {
+    let route_id = candidate.route_id();
     if !route_id.starts_with("bypass:") {
         return;
     }
+    let key = bypass_profile_health_key(&route_id, candidate.family);
     let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut guard) = map.lock() {
-        let entry = guard.entry(route_id.to_owned()).or_default();
+        let entry = guard.entry(key).or_default();
         entry.successes = entry.successes.saturating_add(1);
         entry.last_success_unix = now;
         if entry.failures > 0 {
@@ -2212,13 +2438,19 @@ fn record_global_bypass_profile_success(route_id: &str, now: u64) {
     }
 }
 
-fn record_global_bypass_profile_failure(route_id: &str, reason: &'static str, now: u64) {
+fn record_global_bypass_profile_failure(
+    candidate: &RouteCandidate,
+    reason: &'static str,
+    now: u64,
+) {
+    let route_id = candidate.route_id();
     if !route_id.starts_with("bypass:") {
         return;
     }
+    let key = bypass_profile_health_key(&route_id, candidate.family);
     let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut guard) = map.lock() {
-        let entry = guard.entry(route_id.to_owned()).or_default();
+        let entry = guard.entry(key).or_default();
         entry.failures = entry.failures.saturating_add(1);
         entry.last_failure_unix = now;
         if reason == "connect-failed" {
@@ -2264,6 +2496,14 @@ fn should_mark_route_soft_zero_reply(
     port == 443
         && bytes_upstream_to_client == 0
         && bytes_client_to_upstream >= ROUTE_SOFT_ZERO_REPLY_MIN_C2U
+}
+
+fn should_mark_bypass_zero_reply_soft(
+    port: u16,
+    bytes_client_to_bypass: u64,
+    bytes_bypass_to_client: u64,
+) -> bool {
+    port == 443 && bytes_client_to_bypass > 0 && bytes_bypass_to_client == 0
 }
 
 fn record_bypass_profile_failure(
@@ -3908,6 +4148,15 @@ mod tests {
         }
     }
 
+    fn clear_route_capabilities_for_test() {
+        if let Ok(mut guard) = ROUTE_CAPABILITIES
+            .get_or_init(|| Mutex::new(RouteCapabilities::default()))
+            .lock()
+        {
+            *guard = RouteCapabilities::default();
+        }
+    }
+
     #[test]
     fn connect_target_rejects_empty_host() {
         assert!(split_host_port_for_connect(":443").is_none());
@@ -3960,6 +4209,30 @@ mod tests {
             parse_ip_literal("[2001:db8::3]").map(|ip| ip.to_string()),
             Some("2001:db8::3".to_owned())
         );
+    }
+
+    #[test]
+    fn route_decision_key_is_family_aware_for_ip_targets() {
+        let key_v4 = route_decision_key(
+            "149.154.167.50:443",
+            &TargetAddr::Ip("149.154.167.50".parse().expect("ip")),
+        );
+        let key_v6 = route_decision_key(
+            "2001:67c:4e8:f002::a:443",
+            &TargetAddr::Ip("2001:67c:4e8:f002::a".parse().expect("ip")),
+        );
+        assert_ne!(key_v4, key_v6);
+        assert!(key_v4.ends_with("|v4"));
+        assert!(key_v6.ends_with("|v6"));
+    }
+
+    #[test]
+    fn bypass_zero_reply_soft_marks_tls_zero_reply_after_any_payload() {
+        assert!(should_mark_bypass_zero_reply_soft(443, 1, 0));
+        assert!(should_mark_bypass_zero_reply_soft(443, 120, 0));
+        assert!(!should_mark_bypass_zero_reply_soft(443, 0, 0));
+        assert!(!should_mark_bypass_zero_reply_soft(443, 10, 5));
+        assert!(!should_mark_bypass_zero_reply_soft(80, 100, 0));
     }
 
     #[test]
@@ -4038,6 +4311,32 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn route_capability_filter_skips_temporarily_weak_ipv6_bypass() {
+        clear_route_capabilities_for_test();
+        mark_route_capability_weak(
+            RouteKind::Bypass,
+            RouteIpFamily::V6,
+            "unit-test",
+            ROUTE_CAPABILITY_BYPASS_REP03_SECS,
+        );
+        let route_key = "capability-filter-test:443|v6";
+        let candidates = vec![
+            RouteCandidate::direct_with_family("test", RouteIpFamily::V6),
+            RouteCandidate::bypass_with_family(
+                "test",
+                "127.0.0.1:19080".parse().expect("addr"),
+                0,
+                1,
+                RouteIpFamily::V6,
+            ),
+        ];
+        let ordered = ordered_route_candidates(route_key, candidates);
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered[0].route_id(), "direct");
+        clear_route_capabilities_for_test();
     }
 
     #[test]
