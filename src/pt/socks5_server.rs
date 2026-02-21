@@ -608,7 +608,14 @@ async fn connect_via_best_route(
                     tokio::time::sleep(Duration::from_millis((idx as u64) * 75)).await;
                 }
                 let started = Instant::now();
-                let res = connect_route_candidate(conn_id, outbound, target, destination, candidate.clone()).await;
+                let res = connect_route_candidate(
+                    conn_id,
+                    outbound,
+                    target,
+                    destination,
+                    candidate.clone(),
+                )
+                .await;
                 (candidate, started.elapsed().as_millis(), res)
             });
         }
@@ -874,7 +881,11 @@ async fn handle_client(
                         "bypass profile marked as weak for destination"
                     );
                 } else if should_mark_route_soft_zero_reply(port, c2u, u2c) {
-                    record_route_failure(&connected.route_key, &connected.candidate, "zero-reply-soft");
+                    record_route_failure(
+                        &connected.route_key,
+                        &connected.candidate,
+                        "zero-reply-soft",
+                    );
                     warn!(
                         target: "socks5.route",
                         conn_id,
@@ -948,7 +959,11 @@ async fn handle_client(
                 bytes_client_to_upstream,
                 bytes_upstream_to_client,
             ) {
-                record_route_failure(&connected.route_key, &connected.candidate, "zero-reply-soft");
+                record_route_failure(
+                    &connected.route_key,
+                    &connected.candidate,
+                    "zero-reply-soft",
+                );
                 warn!(
                     target: "socks5.route",
                     conn_id,
@@ -1079,7 +1094,7 @@ async fn handle_http_proxy(
             return Ok(());
         };
 
-        let target_addr = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let target_addr = if let Some(ip) = parse_ip_literal(&host) {
             TargetAddr::Ip(ip)
         } else {
             TargetAddr::Domain(host.clone())
@@ -1363,7 +1378,7 @@ async fn handle_http_proxy(
         "HTTP proxy forward route selected"
     );
 
-    let target_addr = if let Ok(ip) = parsed.host.parse::<std::net::IpAddr>() {
+    let target_addr = if let Some(ip) = parse_ip_literal(&parsed.host) {
         TargetAddr::Ip(ip)
     } else {
         TargetAddr::Domain(parsed.host.clone())
@@ -1736,7 +1751,7 @@ fn should_enable_universal_bypass_domain(host: &str) -> bool {
     if host.is_empty() || host == "localhost" || host.ends_with(".local") {
         return false;
     }
-    if host.parse::<std::net::IpAddr>().is_ok() {
+    if parse_ip_literal(&host).is_some() {
         return false;
     }
     host.contains('.')
@@ -1752,6 +1767,15 @@ fn select_bypass_source(
     }
     match target {
         TargetAddr::Domain(host) => {
+            if let Some(ip) = parse_ip_literal(host) {
+                if should_bypass_by_classifier_ip(ip, port) {
+                    return Some("learned-ip");
+                }
+                if is_bypassable_public_ip(ip) {
+                    return Some("adaptive-race");
+                }
+                return None;
+            }
             if let Some(check_fn) = relay_opts.bypass_domain_check {
                 if check_fn(host) {
                     return Some("builtin");
@@ -1777,7 +1801,10 @@ fn select_bypass_source(
     }
 }
 
-fn select_bypass_candidates(relay_opts: &RelayOptions, destination: &str) -> Vec<(SocketAddr, u8, u8)> {
+fn select_bypass_candidates(
+    relay_opts: &RelayOptions,
+    destination: &str,
+) -> Vec<(SocketAddr, u8, u8)> {
     if !relay_opts.bypass_socks5_pool.is_empty() {
         let total = relay_opts.bypass_socks5_pool.len().min(255) as u8;
         let preferred = destination_bypass_profile_idx(destination, total);
@@ -1894,7 +1921,10 @@ fn route_winner_for_key(route_key: &str) -> Option<RouteWinner> {
     guard.get(route_key).cloned()
 }
 
-fn ordered_route_candidates(route_key: &str, candidates: Vec<RouteCandidate>) -> Vec<RouteCandidate> {
+fn ordered_route_candidates(
+    route_key: &str,
+    candidates: Vec<RouteCandidate>,
+) -> Vec<RouteCandidate> {
     let now = now_unix_secs();
     let winner = route_winner_for_key(route_key);
     let mut filtered: Vec<RouteCandidate> = candidates
@@ -1908,14 +1938,8 @@ fn ordered_route_candidates(route_key: &str, candidates: Vec<RouteCandidate>) ->
     filtered.sort_by(|a, b| {
         let a_id = a.route_id();
         let b_id = b.route_id();
-        let a_winner = winner
-            .as_ref()
-            .map(|w| w.route_id == a_id)
-            .unwrap_or(false);
-        let b_winner = winner
-            .as_ref()
-            .map(|w| w.route_id == b_id)
-            .unwrap_or(false);
+        let a_winner = winner.as_ref().map(|w| w.route_id == a_id).unwrap_or(false);
+        let b_winner = winner.as_ref().map(|w| w.route_id == b_id).unwrap_or(false);
         if a_winner != b_winner {
             return if a_winner {
                 std::cmp::Ordering::Less
@@ -1997,7 +2021,9 @@ fn record_route_race_decision(race: bool, reason: RouteRaceReason) {
             m.race_skipped = m.race_skipped.saturating_add(1);
         }
         match reason {
-            RouteRaceReason::NonTlsPort => m.race_reason_non_tls = m.race_reason_non_tls.saturating_add(1),
+            RouteRaceReason::NonTlsPort => {
+                m.race_reason_non_tls = m.race_reason_non_tls.saturating_add(1)
+            }
             RouteRaceReason::SingleCandidate => {
                 m.race_reason_single_candidate = m.race_reason_single_candidate.saturating_add(1)
             }
@@ -2087,27 +2113,23 @@ fn record_route_success(route_key: &str, candidate: &RouteCandidate) {
 fn record_route_failure(route_key: &str, candidate: &RouteCandidate, reason: &'static str) {
     let now = now_unix_secs();
     let route_id = candidate.route_id();
-    with_route_metrics(|m| {
-        match candidate.kind {
-            RouteKind::Direct => {
-                m.route_failure_direct = m.route_failure_direct.saturating_add(1);
-                if reason == "connect-failed" {
-                    m.connect_failure_direct = m.connect_failure_direct.saturating_add(1);
-                }
-                if reason == "zero-reply-soft" {
-                    m.route_soft_zero_reply_direct =
-                        m.route_soft_zero_reply_direct.saturating_add(1);
-                }
+    with_route_metrics(|m| match candidate.kind {
+        RouteKind::Direct => {
+            m.route_failure_direct = m.route_failure_direct.saturating_add(1);
+            if reason == "connect-failed" {
+                m.connect_failure_direct = m.connect_failure_direct.saturating_add(1);
             }
-            RouteKind::Bypass => {
-                m.route_failure_bypass = m.route_failure_bypass.saturating_add(1);
-                if reason == "connect-failed" {
-                    m.connect_failure_bypass = m.connect_failure_bypass.saturating_add(1);
-                }
-                if reason == "zero-reply-soft" {
-                    m.route_soft_zero_reply_bypass =
-                        m.route_soft_zero_reply_bypass.saturating_add(1);
-                }
+            if reason == "zero-reply-soft" {
+                m.route_soft_zero_reply_direct = m.route_soft_zero_reply_direct.saturating_add(1);
+            }
+        }
+        RouteKind::Bypass => {
+            m.route_failure_bypass = m.route_failure_bypass.saturating_add(1);
+            if reason == "connect-failed" {
+                m.connect_failure_bypass = m.connect_failure_bypass.saturating_add(1);
+            }
+            if reason == "zero-reply-soft" {
+                m.route_soft_zero_reply_bypass = m.route_soft_zero_reply_bypass.saturating_add(1);
             }
         }
     });
@@ -2132,7 +2154,10 @@ fn record_route_failure(route_key: &str, candidate: &RouteCandidate, reason: &'s
             entry.weak_until_unix = now.saturating_add(penalty);
         }
     }
-    if let Ok(mut guard) = DEST_ROUTE_WINNER.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+    if let Ok(mut guard) = DEST_ROUTE_WINNER
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
         if guard
             .get(route_key)
             .map(|w| w.route_id == route_id)
@@ -2228,9 +2253,7 @@ fn should_mark_bypass_profile_failure(
     bytes_bypass_to_client: u64,
     min_c2u: u64,
 ) -> bool {
-    port == 443
-        && bytes_bypass_to_client == 0
-        && bytes_client_to_bypass >= min_c2u
+    port == 443 && bytes_bypass_to_client == 0 && bytes_client_to_bypass >= min_c2u
 }
 
 fn should_mark_route_soft_zero_reply(
@@ -2306,8 +2329,8 @@ fn bypass_profile_key(destination: &str) -> String {
     if let Some((host, port)) = split_host_port_for_connect(destination) {
         let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
         if !normalized_host.is_empty() {
-            if normalized_host.parse::<std::net::IpAddr>().is_ok() {
-                return format!("{normalized_host}:{port}");
+            if let Some(ip) = parse_ip_literal(&normalized_host) {
+                return format!("{ip}:{port}");
             }
             let service_bucket = host_service_bucket(&normalized_host);
             return format!("{service_bucket}:{port}");
@@ -2340,7 +2363,7 @@ fn should_bypass_by_classifier_host(host: &str, port: u16) -> bool {
     if host.is_empty() {
         return false;
     }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+    if let Some(ip) = parse_ip_literal(host) {
         return should_bypass_by_classifier_ip(ip, port);
     }
 
@@ -3043,10 +3066,7 @@ fn write_classifier_snapshot(cfg: &ClassifierStoreConfig) -> std::io::Result<()>
         if winner.route_id.trim().is_empty() {
             continue;
         }
-        entries
-            .entry(destination.clone())
-            .or_default()
-            .route_winner = Some(winner.clone());
+        entries.entry(destination.clone()).or_default().route_winner = Some(winner.clone());
     }
     for (destination, per_route) in route_health_guard.iter() {
         if per_route.is_empty() {
@@ -3060,10 +3080,7 @@ fn write_classifier_snapshot(cfg: &ClassifierStoreConfig) -> std::io::Result<()>
             filtered.insert(route_id.clone(), health.clone());
         }
         if !filtered.is_empty() {
-            entries
-                .entry(destination.clone())
-                .or_default()
-                .route_health = filtered;
+            entries.entry(destination.clone()).or_default().route_health = filtered;
         }
     }
     entries.retain(|_, entry| {
@@ -3542,6 +3559,22 @@ fn split_host_port_for_connect(target: &str) -> Option<(String, u16)> {
     Some((host.to_owned(), port))
 }
 
+fn normalize_host_literal(host: &str) -> String {
+    let trimmed = host.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('[') && trimmed.ends_with(']') {
+        let inner = trimmed[1..trimmed.len() - 1].trim();
+        if !inner.is_empty() {
+            return inner.to_owned();
+        }
+    }
+    trimmed.to_owned()
+}
+
+fn parse_ip_literal(host: &str) -> Option<std::net::IpAddr> {
+    let normalized = normalize_host_literal(host);
+    normalized.parse::<std::net::IpAddr>().ok()
+}
+
 #[derive(Debug)]
 struct HttpForwardTarget {
     host: String,
@@ -3565,7 +3598,7 @@ fn parse_http_forward_target(target: &str, request_head: &str) -> Option<HttpFor
         if !url.scheme().eq_ignore_ascii_case("http") {
             return None;
         }
-        let host = url.host_str()?.to_owned();
+        let host = normalize_host_literal(url.host_str()?);
         let port = url.port_or_known_default().unwrap_or(80);
         let mut request_uri = url.path().to_owned();
         if request_uri.is_empty() {
@@ -3586,7 +3619,7 @@ fn parse_http_forward_target(target: &str, request_head: &str) -> Option<HttpFor
         let host_header = extract_header_value(request_head, "Host")?;
         let (host, port) = split_host_port_with_default(&host_header, 80)?;
         return Some(HttpForwardTarget {
-            host,
+            host: normalize_host_literal(&host),
             port,
             request_uri: target.to_owned(),
         });
@@ -3903,6 +3936,33 @@ mod tests {
     }
 
     #[test]
+    fn parse_http_forward_target_normalizes_ipv6_host_header() {
+        let req = "GET /api HTTP/1.1\r\nHost: [2001:db8::1]:8080\r\n\r\n";
+        let parsed = parse_http_forward_target("/api", req).expect("parsed");
+        assert_eq!(parsed.host, "2001:db8::1");
+        assert_eq!(parsed.port, 8080);
+        assert_eq!(parsed.request_uri, "/api");
+    }
+
+    #[test]
+    fn parse_http_forward_target_normalizes_ipv6_absolute_uri() {
+        let req = "GET http://[2001:db8::2]:8000/v1?q=1 HTTP/1.1\r\n\r\n";
+        let parsed =
+            parse_http_forward_target("http://[2001:db8::2]:8000/v1?q=1", req).expect("parsed");
+        assert_eq!(parsed.host, "2001:db8::2");
+        assert_eq!(parsed.port, 8000);
+        assert_eq!(parsed.request_uri, "/v1?q=1");
+    }
+
+    #[test]
+    fn parse_ip_literal_accepts_bracketed_ipv6() {
+        assert_eq!(
+            parse_ip_literal("[2001:db8::3]").map(|ip| ip.to_string()),
+            Some("2001:db8::3".to_owned())
+        );
+    }
+
+    #[test]
     fn learned_bypass_activates_after_failures_for_tls_domain() {
         let key = "learned-bypass-test.invalid:443".to_owned();
         let map = DEST_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
@@ -3984,12 +4044,8 @@ mod tests {
     fn adaptive_route_weakens_and_recovers_after_cooldown() {
         let route_key = "adaptive-route-test:443";
         clear_route_state_for_test(route_key);
-        let candidate = RouteCandidate::bypass(
-            "test",
-            "127.0.0.1:19080".parse().expect("addr"),
-            0,
-            1,
-        );
+        let candidate =
+            RouteCandidate::bypass("test", "127.0.0.1:19080".parse().expect("addr"), 0, 1);
         record_route_failure(route_key, &candidate, "unit-failure");
         record_route_failure(route_key, &candidate, "unit-failure");
         assert!(route_is_temporarily_weak(
@@ -4109,12 +4165,8 @@ mod tests {
     fn route_soft_zero_reply_immediately_sets_weak_cooldown() {
         let route_key = "adaptive-route-soft-zero:443";
         clear_route_state_for_test(route_key);
-        let candidate = RouteCandidate::bypass(
-            "test",
-            "127.0.0.1:19080".parse().expect("addr"),
-            0,
-            1,
-        );
+        let candidate =
+            RouteCandidate::bypass("test", "127.0.0.1:19080".parse().expect("addr"), 0, 1);
         record_route_failure(route_key, &candidate, "zero-reply-soft");
         assert!(route_is_temporarily_weak(
             route_key,
@@ -4189,7 +4241,10 @@ mod tests {
             RouteCandidate::bypass("test", "127.0.0.1:19080".parse().expect("addr"), 0, 1),
         ];
         let ordered = ordered_route_candidates(route_key, candidates);
-        assert_eq!(ordered.first().map(|c| c.route_id()), Some("direct".to_owned()));
+        assert_eq!(
+            ordered.first().map(|c| c.route_id()),
+            Some("direct".to_owned())
+        );
         clear_route_state_for_test(route_key);
     }
 }

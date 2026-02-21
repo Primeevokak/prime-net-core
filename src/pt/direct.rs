@@ -43,6 +43,7 @@ impl DirectOutbound {
     }
 
     async fn connect_impl(&self, target: TargetEndpoint) -> Result<BoxStream> {
+        let target = normalize_target_endpoint(target);
         let target_label = match &target.addr {
             TargetAddr::Ip(ip) => format!("{ip}:{}", target.port),
             TargetAddr::Domain(host) => format!("{host}:{}", target.port),
@@ -255,6 +256,40 @@ impl DirectOutbound {
             "Direct outbound connected via upstream SOCKS5"
         );
         Ok(Box::new(tcp))
+    }
+}
+
+fn normalize_host_literal(host: &str) -> String {
+    let trimmed = host.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('[') && trimmed.ends_with(']') {
+        let inner = trimmed[1..trimmed.len() - 1].trim();
+        if !inner.is_empty() {
+            return inner.to_owned();
+        }
+    }
+    trimmed.to_owned()
+}
+
+fn normalize_target_endpoint(target: TargetEndpoint) -> TargetEndpoint {
+    match target.addr {
+        TargetAddr::Ip(ip) => TargetEndpoint {
+            addr: TargetAddr::Ip(ip),
+            port: target.port,
+        },
+        TargetAddr::Domain(host) => {
+            let normalized_host = normalize_host_literal(&host);
+            if let Ok(ip) = normalized_host.parse::<std::net::IpAddr>() {
+                TargetEndpoint {
+                    addr: TargetAddr::Ip(ip),
+                    port: target.port,
+                }
+            } else {
+                TargetEndpoint {
+                    addr: TargetAddr::Domain(normalized_host),
+                    port: target.port,
+                }
+            }
+        }
     }
 }
 
