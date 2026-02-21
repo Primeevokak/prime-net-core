@@ -1,0 +1,229 @@
+[download]
+initial_concurrency = 4
+max_concurrency = 16
+chunk_size_mb = 4
+max_retries = 2
+adaptive_enabled = true
+adaptive_threshold_mbps = 25.0
+request_timeout_secs = 30
+connect_timeout_secs = 10
+max_idle_per_host = 16
+pool_idle_timeout_secs = 30
+# Optional: client-side HTTP/2 RESET_STREAM limit (for problematic servers under high concurrency).
+# http2_max_concurrent_reset_streams = 10
+# Optional: integrity verification for downloads.
+# - "sha256:<64 hex>" to verify against an explicit digest
+# - "auto" to read expected digest from a sibling "<file>.sha256" file
+# verify_hash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+# verify_hash = "auto"
+
+[tls]
+# Supported by current TLS backend (rustls): TLS 1.2 and TLS 1.3.
+min_version = "tls1_2"
+max_version = "tls1_3"
+alpn_protocols = ["h2", "http/1.1"]
+# Best-effort TLS ClientHello fingerprint selection.
+# Note: in this build it is implemented on top of rustls (not full uTLS impersonation).
+# Supported: "rustls_default", "chrome_120", "firefox_121", "random"
+ja3_fingerprint = "rustls_default"
+
+[transport]
+# Best-effort: prefer QUIC transport (HTTP/3) when supported by the build and reachable (no proxy).
+# prefer_http3 = true
+# If true, do not fall back to TCP transports when HTTP/3 was selected.
+# http3_only = false
+# http3_connect_timeout_ms = 10000
+# http3_idle_timeout_ms = 30000
+# Optional: keep-alive interval (useful on NATs).
+# http3_keep_alive_interval_ms = 15000
+# DANGEROUS: accept invalid certificates for HTTP/3 (intended for testing).
+# http3_insecure_skip_verify = false
+
+[anticensorship]
+# DNS chain: order matters. Supported (in this build): "doh", "dot", "doq", "system".
+doh_enabled = true
+doh_providers = ["cloudflare", "google", "adguard"]
+doh_cache_ttl_secs = 300
+# Optional: hardcode IPs for DoH endpoint hostnames to avoid system DNS leakage when reaching DoH itself.
+# Example: bootstrap_ips = ["1.1.1.1", "1.0.0.1"]
+bootstrap_ips = []
+
+# DNSSEC validation + cache (Hickory resolver).
+dnssec_enabled = true
+dns_cache_size = 4096
+dns_query_timeout_secs = 5
+dns_attempts = 2
+
+# DNS-over-TLS (DoT)
+dot_enabled = false
+dot_servers = ["1.1.1.1:853", "1.0.0.1:853"]
+dot_sni = "cloudflare-dns.com"
+
+# DNS-over-QUIC (DoQ)
+doq_enabled = false
+doq_servers = ["1.1.1.1:784", "1.0.0.1:784"]
+doq_sni = "cloudflare-dns.com"
+
+dns_fallback_chain = ["doh", "system"]
+system_dns_enabled = true
+
+# ECH mode: "grease" (placeholder), "real" (DNS HTTPS RR ECHConfigList), "auto" (try real, then grease).
+# If set, it enables ECH and overrides legacy `ech_enabled`.
+# ech_mode = "auto"
+ech_enabled = false
+domain_fronting_enabled = false
+tls_randomization_enabled = true
+
+# Example fronting rule:
+# domain_fronting_enabled = true
+# domain_fronting_rules = [
+#   # v1 (single front domain):
+#   # { target_host = "blocked.example", front_domain = "front.examplecdn.com", real_host = "blocked.example", sni_domain = "front.examplecdn.com", provider = "cloudflare" }
+#   #
+#   # v2 (dynamic front domain selection):
+#   # { target_host = "blocked.example", front_domains = ["front1.examplecdn.com", "front2.examplecdn.com"], real_host = "blocked.example", provider = "cloudflare" }
+# ]
+# fronting_probe_ttl_secs = 600
+# fronting_probe_timeout_secs = 5
+
+[evasion]
+## prime-mode: основной offline DPI bypass режим для прямого SOCKS relay без PT.
+# prime_mode = true
+## DPI bypass on socket level (user-space) and optionally via TUN (root/admin).
+## strategy:
+## - "fragment": split initial TLS writes into small chunks (first write <= 64 bytes) + optional sleeps
+## - "desync": userspace TCP segmentation for the initial TLS bytes (ClientHello split by explicit offsets)
+## - "auto": choose best available (fragment by default; switches to desync when client_hello_split_offsets is set)
+# strategy = "auto"
+# fragment_size = 64
+# fragment_sleep_ms = 10
+# fragment_budget_bytes = 16384
+# Optional: for strategy="desync", split offsets (byte positions within the first TLS write buffer).
+# Example: split into 3+ parts at offsets 1, 5, 40, 64 (best-effort).
+# client_hello_split_offsets = [1, 5, 40, 64]
+# split_at_sni = true
+# first_packet_ttl = 5 # Windows only, 0 disables
+# packet_bypass_enabled = true
+# classifier_persist_enabled = true
+# classifier_cache_path = "~/.cache/prime-net-engine/relay-classifier.json"
+# classifier_entry_ttl_secs = 604800
+# strategy_race_enabled = true
+# Optional: TLS maximum fragment length (MFL) for the fragment path (best-effort, depends on peer support).
+# tls_record_max_fragment_size = 1024
+# rst_retry_max = 2
+traffic_shaping_enabled = false
+timing_jitter_ms_min = 5
+timing_jitter_ms_max = 35
+
+[privacy]
+
+[privacy.tracker_blocker]
+enabled = false
+lists = ["easyprivacy", "easylist"]
+custom_lists = []
+mode = "block"       # block | log_only
+on_block = "error"   # error | empty_200
+allowlist = []
+
+[privacy.referer]
+enabled = false
+mode = "origin_only"                 # strip | origin_only | pass_through
+strip_from_search_engines = true
+search_engine_domains = []
+
+[privacy.signals]
+send_dnt = true
+send_gpc = true
+
+[privacy.user_agent]
+enabled = false
+preset = "custom"
+custom_value = ""
+
+[privacy.referer_override]
+enabled = false
+value = "https://primeevolution.com"
+
+[privacy.ip_spoof]
+enabled = false
+spoofed_ip = "77.88.21.10"
+
+[privacy.webrtc]
+block_enabled = false
+
+[privacy.location_api]
+block_enabled = false
+
+# Pluggable transports (PT) client mode: starts a local SOCKS5 listener and routes HTTP through it.
+# NOTE: do not set [proxy] together with [pt].
+#
+# [pt]
+# kind = "trojan" # or "shadowsocks" | "obfs4" | "snowflake"
+# local_socks5_bind = "127.0.0.1:0"
+# silent_drop = true
+#
+# [pt.trojan]
+# server = "your-trojan.example:443"
+# password = "password"
+# sni = "your-trojan.example"
+# alpn_protocols = ["http/1.1"]
+# insecure_skip_verify = false
+#
+# [pt.shadowsocks]
+# server = "your-ss.example:8388"
+# password = "password"
+# method = "aes-256-gcm"
+#
+# Tor PT: obfs4 (requires `tor` + `obfs4proxy` installed)
+# [pt.obfs4]
+# server = "BRIDGE_IP:PORT"
+# fingerprint = "40HEX..." # optional; bridge identity fingerprint
+# cert = "BASE64..."       # from Tor bridge line: cert=...
+# iat_mode = 0             # 0..=2 (iat-mode)
+# tor_bin = "tor"
+# tor_args = []
+# obfs4proxy_bin = "obfs4proxy"
+# obfs4proxy_args = []
+#
+# Tor PT: snowflake (requires `tor` + `snowflake-client` installed)
+# [pt.snowflake]
+# tor_bin = "tor"
+# tor_args = []
+# snowflake_bin = "snowflake-client"
+# broker = "https://broker.torproject.net/" # optional
+# front = ""                               # optional (domain fronting)
+# amp_cache = ""                           # optional
+# stun_servers = ["stun.l.google.com:19302"] # optional
+# bridge = "192.0.2.3:1"                   # optional placeholder
+# snowflake_args = []
+
+# Optional proxy:
+# [proxy]
+# kind = "socks5" # NOTE: fragment/desync path supports only SOCKS5 without auth.
+# address = "127.0.0.1:9050" # IPv6: "[::1]:9050"
+
+# System-wide proxy automation settings (used by `prime-net-engine proxy ...`)
+[system_proxy]
+auto_configure = false
+mode = "pac" # off | all | pac | custom
+pac_port = 8888
+socks_endpoint = "127.0.0.1:1080"
+
+[blocklist]
+enabled = true
+source = "https://github.com/zapret-info/z-i/raw/master/dump.csv"
+auto_update = true
+update_interval_hours = 24
+cache_path = "~/.cache/prime-net-engine/blocklist.json"
+
+[updater]
+enabled = true
+auto_check = true
+check_interval_hours = 24
+repo = "your-username/prime-net-engine"
+channel = "beta" # stable | beta | nightly
+
+[telemetry]
+crash_reports = false
+endpoint = "https://crashes.example.com"
+include_config = false

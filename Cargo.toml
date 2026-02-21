@@ -1,0 +1,129 @@
+[package]
+name = "prime-net-engine"
+version = "0.3.7"
+edition = "2021"
+
+[features]
+default = ["hickory-dns", "websocket", "observability"]
+hickory-dns = ["dep:hickory-resolver"]
+websocket = []
+observability = []
+signature-verification = ["dep:gpgme"]
+require-signatures = ["signature-verification"]
+
+[lib]
+name = "prime_net_engine_core"
+crate-type = ["cdylib", "staticlib", "rlib"]
+doc = false
+
+[[bin]]
+name = "prime-net-engine"
+path = "src/bin/prime-net-engine/main.rs"
+doc = false
+
+[[bin]]
+name = "prime-tui"
+path = "src/bin/prime-tui.rs"
+doc = false
+
+[dependencies]
+base64 = "0.22.1"
+bytes = "1.11.1"
+csv = "1.3"
+crossterm = "0.27"
+dirs = "5.0"
+flate2 = "1.1.9"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+hickory-resolver = { version = "0.25.2", optional = true, default-features = false, features = ["tokio", "system-config", "dnssec-ring", "https-ring", "tls-ring", "quic-ring", "webpki-roots"] }
+http = "1.4.0"
+http-body-util = "0.1.3"
+hyper = { version = "1.8.1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1.20", features = ["client", "http1", "http2", "tokio"] }
+once_cell = "1.21.3"
+parking_lot = "0.12.5"
+rand = "0.8.5"
+quinn = "0.11.9"
+ratatui = "0.26"
+arboard = "3.4"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "http2", "json", "gzip", "brotli", "zstd", "deflate", "socks", "stream"] }
+rustls = "0.23.36"
+self_update = "0.39"
+sentry = { version = "0.32", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+sha2 = "0.10.9"
+gpgme = { version = "0.11", optional = true }
+shadowsocks = { version = "1.24.0", default-features = false, features = ["aead-cipher", "aead-cipher-2022", "stream-cipher"] }
+thiserror = "2.0.18"
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util", "io-std", "fs", "process", "signal"] }
+tokio-util = { version = "0.7.16", features = ["io"] }
+futures-util = "0.3.31"
+tokio-rustls = "0.26.4"
+tiny_http = "0.12"
+toml = "0.8"
+toml_edit = "0.22"
+tracing = "0.1.4"
+tracing-subscriber = "0.3"
+url = "2.5.8"
+webpki-roots = "0.26.11"
+regex = "1.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Networking_WinInet"] }
+winreg = "0.52"
+winapi = { version = "0.3", features = ["shellapi", "wininet"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1.6"
+security-framework = "2.9"
+
+[dev-dependencies]
+mockito = "1.2"
+rcgen = "0.13.2"
+assert_cmd = "2.0"
+predicates = "3.0"
+tempfile = "3.8"
+serde_json = "1.0"
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+rexpect = "0.5"
+
+[target.'cfg(windows)'.dev-dependencies]
+winreg = "0.52"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
+
+[package.metadata.deb]
+maintainer = "Your Name <email@example.com>"
+copyright = "2026, Your Name"
+license-file = ["LICENSE", "4"]
+extended-description = """\
+Anti-censorship network engine with HTTP/HTTPS/WebSocket support, \
+DNS privacy, TLS fingerprinting, and pluggable transports."""
+depends = "$auto"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/prime-net-engine", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/prime-net-engine/README", "644"],
+]
+
+[package.metadata.wix]
+upgrade-guid = "GENERATE-NEW-UUID"
+path-guid = "GENERATE-NEW-UUID"
+license = false
+eula = false

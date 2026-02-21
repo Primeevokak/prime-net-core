@@ -1,0 +1,952 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+#[cfg(unix)]
+use std::{fs, os::unix::fs::PermissionsExt};
+
+use prime_net_engine_core::error::{EngineError, Result};
+use prime_net_engine_core::version::APP_VERSION;
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::sync::{Mutex, OnceCell};
+use tracing::{info, warn};
+
+static RELEASE_CACHE: OnceCell<Mutex<HashMap<String, Option<String>>>> = OnceCell::const_new();
+
+#[derive(Debug)]
+pub struct PacketBypassGuard {
+    children: Vec<Child>,
+    log_tasks: Vec<tokio::task::JoinHandle<()>>,
+    pub socks5_ports: Vec<u16>,
+}
+
+#[derive(Debug, Clone)]
+struct PacketBypassProfile {
+    name: String,
+    args: Vec<String>,
+}
+
+impl Drop for PacketBypassGuard {
+    fn drop(&mut self) {
+        for mut child in self.children.drain(..) {
+            let _ = child.start_kill();
+        }
+        for task in self.log_tasks.drain(..) {
+            task.abort();
+        }
+    }
+}
+
+impl PacketBypassGuard {
+    pub fn socks5_addrs(&self) -> Vec<std::net::SocketAddr> {
+        self.socks5_ports
+            .iter()
+            .copied()
+            .map(|p| std::net::SocketAddr::from(([127, 0, 0, 1], p)))
+            .collect()
+    }
+}
+
+pub async fn maybe_start_packet_bypass(
+    enabled_by_config: bool,
+) -> Result<Option<PacketBypassGuard>> {
+    if !packet_bypass_enabled(enabled_by_config) {
+        info!(
+            target: "packet_bypass",
+            "packet-level bypass backend is disabled by config/env"
+        );
+        return Ok(None);
+    }
+
+    #[cfg(windows)]
+    {
+        let require_admin = std::env::var("PRIME_PACKET_BYPASS_REQUIRE_ADMIN")
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off"
+                )
+            })
+            .unwrap_or(true);
+        if require_admin && !is_elevated() {
+            return Err(EngineError::Config(
+                "packet-level bypass requires administrator rights. restart terminal as Administrator or set PRIME_PACKET_BYPASS_REQUIRE_ADMIN=0".to_owned(),
+            ));
+        }
+    }
+
+    let install_dir = bootstrap_install_dir()?;
+    let bin = resolve_or_bootstrap_binary(&install_dir).await?;
+    let profiles = resolve_packet_profiles();
+    let mut children = Vec::new();
+    let mut log_tasks = Vec::new();
+    let mut socks5_ports = Vec::new();
+    let mut last_err: Option<EngineError> = None;
+
+    for profile in profiles {
+        match start_packet_bypass_process(&bin, &profile).await {
+            Ok((child, mut tasks, socks5_port)) => {
+                children.push(child);
+                log_tasks.append(&mut tasks);
+                if let Some(port) = socks5_port {
+                    socks5_ports.push(port);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    target: "packet_bypass",
+                    profile = profile.name.as_str(),
+                    error = %e,
+                    "packet-level bypass profile failed to start; trying next profile"
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+
+    if children.is_empty() {
+        return Err(last_err.unwrap_or_else(|| {
+            EngineError::Config(
+                "all packet-level bypass profiles failed to start; check PRIME_PACKET_BYPASS_BIN / PRIME_PACKET_BYPASS_ARGS".to_owned(),
+            )
+        }));
+    }
+
+    info!(
+        target: "packet_bypass",
+        profiles = children.len(),
+        socks5_ports = ?socks5_ports,
+        "packet-level bypass profile pool is active"
+    );
+
+    Ok(Some(PacketBypassGuard {
+        children,
+        log_tasks,
+        socks5_ports,
+    }))
+}
+
+fn parse_port_arg(args: &[String]) -> Option<u16> {
+    let mut idx = 0usize;
+    while idx < args.len() {
+        if args[idx] == "--port" {
+            if let Some(v) = args.get(idx + 1) {
+                return v.parse::<u16>().ok();
+            }
+            return None;
+        }
+        if let Some(v) = args[idx].strip_prefix("--port=") {
+            return v.parse::<u16>().ok();
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn packet_bypass_enabled(enabled_by_config: bool) -> bool {
+    if !enabled_by_config {
+        return false;
+    }
+    std::env::var("PRIME_PACKET_BYPASS")
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off"
+            )
+        })
+        .unwrap_or(true)
+}
+
+fn parse_packet_args_from_env() -> Option<Vec<String>> {
+    if let Ok(v) = std::env::var("PRIME_PACKET_BYPASS_ARGS") {
+        let args: Vec<String> = v
+            .split_whitespace()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !args.is_empty() {
+            return Some(args);
+        }
+    }
+    None
+}
+
+fn resolve_packet_profiles() -> Vec<PacketBypassProfile> {
+    if let Some(args) = parse_packet_args_from_env() {
+        return vec![PacketBypassProfile {
+            name: "env".to_owned(),
+            args,
+        }];
+    }
+    default_bypass_profiles()
+}
+
+async fn get_release_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
+    RELEASE_CACHE
+        .get_or_init(|| async { Mutex::new(HashMap::new()) })
+        .await
+}
+
+/// Finds a free TCP port on 127.0.0.1.
+fn find_free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(10801)
+}
+
+fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
+    #[cfg(target_os = "windows")]
+    {
+        vec![
+            PacketBypassProfile {
+                name: "balanced".to_owned(),
+                args: vec![
+                    "--port".to_owned(),
+                    find_free_port().to_string(),
+                    "--disorder".to_owned(),
+                    "1".to_owned(),
+                    "--tlsrec".to_owned(),
+                    "1+s".to_owned(),
+                    "--auto".to_owned(),
+                    "torst,ssl_err".to_owned(),
+                    "--auto-mode".to_owned(),
+                    "2".to_owned(),
+                    "--cache-ttl".to_owned(),
+                    "3600".to_owned(),
+                    "--timeout".to_owned(),
+                    "5".to_owned(),
+                ],
+            },
+            PacketBypassProfile {
+                name: "split-heavy".to_owned(),
+                args: vec![
+                    "--port".to_owned(),
+                    find_free_port().to_string(),
+                    "--split".to_owned(),
+                    "1+s".to_owned(),
+                    "--tlsrec".to_owned(),
+                    "1+s".to_owned(),
+                    "--auto".to_owned(),
+                    "torst,ssl_err".to_owned(),
+                    "--auto-mode".to_owned(),
+                    "3".to_owned(),
+                    "--cache-ttl".to_owned(),
+                    "3600".to_owned(),
+                    "--timeout".to_owned(),
+                    "6".to_owned(),
+                ],
+            },
+            PacketBypassProfile {
+                name: "mixed-fast".to_owned(),
+                args: vec![
+                    "--port".to_owned(),
+                    find_free_port().to_string(),
+                    "--disorder".to_owned(),
+                    "1".to_owned(),
+                    "--split".to_owned(),
+                    "1+s".to_owned(),
+                    "--tlsrec".to_owned(),
+                    "1+s".to_owned(),
+                    "--auto".to_owned(),
+                    "torst,ssl_err".to_owned(),
+                    "--auto-mode".to_owned(),
+                    "1".to_owned(),
+                    "--cache-ttl".to_owned(),
+                    "3600".to_owned(),
+                    "--timeout".to_owned(),
+                    "4".to_owned(),
+                ],
+            },
+        ]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        vec![
+            PacketBypassProfile {
+                name: "balanced".to_owned(),
+                args: vec![
+                    "--port".to_owned(),
+                    find_free_port().to_string(),
+                    "--disorder".to_owned(),
+                    "1".to_owned(),
+                    "--fake-ttl".to_owned(),
+                    "5".to_owned(),
+                    "--auto".to_owned(),
+                    "torst,ssl_err".to_owned(),
+                    "--auto-mode".to_owned(),
+                    "2".to_owned(),
+                    "--cache-ttl".to_owned(),
+                    "3600".to_owned(),
+                    "--timeout".to_owned(),
+                    "5".to_owned(),
+                ],
+            },
+            PacketBypassProfile {
+                name: "split-heavy".to_owned(),
+                args: vec![
+                    "--port".to_owned(),
+                    find_free_port().to_string(),
+                    "--split".to_owned(),
+                    "1+s".to_owned(),
+                    "--fake-ttl".to_owned(),
+                    "5".to_owned(),
+                    "--auto".to_owned(),
+                    "torst,ssl_err".to_owned(),
+                    "--auto-mode".to_owned(),
+                    "3".to_owned(),
+                    "--cache-ttl".to_owned(),
+                    "3600".to_owned(),
+                    "--timeout".to_owned(),
+                    "6".to_owned(),
+                ],
+            },
+            PacketBypassProfile {
+                name: "mixed-fast".to_owned(),
+                args: vec![
+                    "--port".to_owned(),
+                    find_free_port().to_string(),
+                    "--disorder".to_owned(),
+                    "1".to_owned(),
+                    "--split".to_owned(),
+                    "1+s".to_owned(),
+                    "--fake-ttl".to_owned(),
+                    "4".to_owned(),
+                    "--auto".to_owned(),
+                    "torst,ssl_err".to_owned(),
+                    "--auto-mode".to_owned(),
+                    "1".to_owned(),
+                    "--cache-ttl".to_owned(),
+                    "3600".to_owned(),
+                    "--timeout".to_owned(),
+                    "4".to_owned(),
+                ],
+            },
+        ]
+    }
+    #[cfg(target_os = "macos")]
+    {
+        vec![PacketBypassProfile {
+            name: "default".to_owned(),
+            args: vec!["--port".to_owned(), find_free_port().to_string()],
+        }]
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        vec![]
+    }
+}
+
+async fn start_packet_bypass_process(
+    bin: &Path,
+    profile: &PacketBypassProfile,
+) -> Result<(Child, Vec<tokio::task::JoinHandle<()>>, Option<u16>)> {
+    let socks5_port = parse_port_arg(&profile.args);
+    info!(
+        target: "packet_bypass",
+        profile = profile.name.as_str(),
+        binary = %bin.display(),
+        args = ?profile.args,
+        "starting packet-level bypass backend"
+    );
+
+    let mut cmd = Command::new(bin);
+    cmd.args(profile.args.iter())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null());
+
+    let mut child = cmd.spawn().map_err(|e| {
+        EngineError::Config(format!(
+            "failed to start packet-level bypass backend '{}' profile '{}': {e}",
+            bin.display(),
+            profile.name
+        ))
+    })?;
+
+    let mut log_tasks = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        let profile_name = profile.name.clone();
+        log_tasks.push(tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if !line.trim().is_empty() {
+                    info!(
+                        target: "packet_bypass",
+                        profile = profile_name.as_str(),
+                        stream = "stdout",
+                        "{line}"
+                    );
+                }
+            }
+        }));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let profile_name = profile.name.clone();
+        log_tasks.push(tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if !line.trim().is_empty() {
+                    info!(
+                        target: "packet_bypass",
+                        profile = profile_name.as_str(),
+                        stream = "stderr",
+                        "{line}"
+                    );
+                }
+            }
+        }));
+    }
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    if let Some(status) = child.try_wait().map_err(EngineError::Io)? {
+        return Err(EngineError::Config(format!(
+            "packet-level bypass profile '{}' exited immediately with status {status}; check PRIME_PACKET_BYPASS_BIN / PRIME_PACKET_BYPASS_ARGS",
+            profile.name
+        )));
+    }
+
+    Ok((child, log_tasks, socks5_port))
+}
+
+fn bootstrap_install_dir() -> Result<PathBuf> {
+    if let Ok(v) = std::env::var("PRIME_PT_BOOTSTRAP_DIR") {
+        let p = PathBuf::from(v);
+        ensure_dir_writable(&p).map_err(|e| {
+            EngineError::Config(format!(
+                "cannot use PRIME_PT_BOOTSTRAP_DIR '{}': {e}",
+                p.display()
+            ))
+        })?;
+        return Ok(p);
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("pt-tools"));
+        }
+    }
+    if let Some(base) = dirs::data_local_dir() {
+        candidates.push(base.join("prime-net-engine").join("tools"));
+    }
+    candidates.push(std::env::temp_dir().join("prime-net-engine-tools"));
+
+    let mut errors: Vec<String> = Vec::new();
+    for path in candidates {
+        match ensure_dir_writable(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) => errors.push(format!("{} ({e})", path.display())),
+        }
+    }
+    Err(EngineError::Config(format!(
+        "cannot create writable bootstrap directory for packet bypass; tried: {}",
+        errors.join("; ")
+    )))
+}
+
+async fn resolve_or_bootstrap_binary(install_dir: &Path) -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("PRIME_PACKET_BYPASS_BIN") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            if p.exists() {
+                return Ok(p);
+            }
+            warn!(
+                target: "packet_bypass",
+                path = %p.display(),
+                "PRIME_PACKET_BYPASS_BIN is set but file does not exist; continuing auto-discovery"
+            );
+        } else {
+            warn!(
+                target: "packet_bypass",
+                "PRIME_PACKET_BYPASS_BIN is set but empty; continuing auto-discovery"
+            );
+        }
+    }
+
+    let candidates = candidate_binary_names();
+    for name in &candidates {
+        if let Some(found) = which_binary(name) {
+            return Ok(found);
+        }
+    }
+
+    for name in &candidates {
+        let p = install_dir.join(name);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+
+    download_best_binary(install_dir).await
+}
+
+#[cfg(target_os = "windows")]
+fn candidate_binary_names() -> Vec<String> {
+    vec!["ciadpi.exe".into()]
+}
+
+#[cfg(target_os = "linux")]
+fn candidate_binary_names() -> Vec<String> {
+    vec!["ciadpi".into(), "byedpi".into()]
+}
+
+#[cfg(target_os = "macos")]
+fn candidate_binary_names() -> Vec<String> {
+    vec!["byedpi".into()]
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+fn candidate_binary_names() -> Vec<String> {
+    vec![]
+}
+
+async fn resolve_latest_asset_url(repo: &str, asset_pattern: &str) -> Result<String> {
+    let cache_key = format!("{repo}#{asset_pattern}");
+    {
+        let cache = get_release_cache().await.lock().await;
+        if let Some(entry) = cache.get(&cache_key) {
+            return entry.clone().ok_or_else(|| {
+                EngineError::Config(format!(
+                    "cached: no asset matching '{asset_pattern}' in latest release of {repo}"
+                ))
+            });
+        }
+    }
+
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let result: Result<String> = async {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(15))
+            .user_agent(format!(
+                "prime-net-engine/{APP_VERSION} (packet-bypass-bootstrap)"
+            ))
+            .build()
+            .map_err(|e| EngineError::Config(format!("failed to build api client: {e}")))?;
+
+        let resp = client
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .map_err(|e| EngineError::Config(format!("github api request failed: {e}")))?;
+
+        if resp.status() == reqwest::StatusCode::FORBIDDEN {
+            if resp
+                .headers()
+                .get("x-ratelimit-remaining")
+                .and_then(|v| v.to_str().ok())
+                == Some("0")
+            {
+                warn!(
+                    target: "packet_bypass",
+                    "github api rate limit reached; cannot auto-download"
+                );
+            }
+            return Err(EngineError::Config(format!(
+                "github api returned {} for {repo}",
+                resp.status()
+            )));
+        }
+
+        if !resp.status().is_success() {
+            return Err(EngineError::Config(format!(
+                "github api returned {} for {repo}",
+                resp.status()
+            )));
+        }
+
+        let json: Value = resp
+            .json()
+            .await
+            .map_err(|e| EngineError::Config(format!("failed to parse github api response: {e}")))?;
+
+        let tag_name = json["tag_name"].as_str().unwrap_or("unknown");
+        let assets = json["assets"]
+            .as_array()
+            .ok_or_else(|| EngineError::Config(format!("no assets in release for {repo}")))?;
+
+        for asset in assets {
+            let name = asset["name"].as_str().unwrap_or("");
+            let download_url = asset["browser_download_url"].as_str().unwrap_or("");
+            if (name == asset_pattern || name.contains(asset_pattern)) && !download_url.is_empty() {
+                info!(
+                    target: "packet_bypass",
+                    repo = repo,
+                    tag = tag_name,
+                    asset = name,
+                    "resolved latest release asset"
+                );
+                return Ok(download_url.to_owned());
+            }
+        }
+
+        Err(EngineError::Config(format!(
+            "no asset matching '{asset_pattern}' found in latest release of {repo} (tag: {tag_name})"
+        )))
+    }
+    .await;
+
+    if let Ok(download_url) = &result {
+        let mut cache = get_release_cache().await.lock().await;
+        cache.insert(cache_key, Some(download_url.clone()));
+    }
+
+    result
+}
+
+async fn build_mirror_urls(filename: &str) -> Vec<String> {
+    let mut out = Vec::new();
+
+    if let Ok(v) = std::env::var("PRIME_PACKET_BYPASS_URLS") {
+        out.extend(
+            v.split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty()),
+        );
+    }
+    if let Ok(v) = std::env::var("PRIME_PACKET_BYPASS_URL") {
+        let url = v.trim();
+        if !url.is_empty() {
+            out.push(url.to_owned());
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        match filename {
+            "ciadpi.exe" => match std::env::consts::ARCH {
+                "aarch64" | "arm64" => {
+                    warn!(
+                        target: "packet_bypass",
+                        "no byedpi Windows build for aarch64"
+                    );
+                    vec![]
+                }
+                arch => {
+                    let pattern = if matches!(arch, "x86" | "i686") {
+                        "-i686-w64.zip"
+                    } else {
+                        "-x86_64-w64.zip"
+                    };
+                    match resolve_latest_asset_url("hufrea/byedpi", pattern).await {
+                        Ok(url) => {
+                            info!(
+                                target: "packet_bypass",
+                                url = %url,
+                                "resolved byedpi zip via github api"
+                            );
+                            vec![url]
+                        }
+                        Err(e) => {
+                            warn!(
+                                target: "packet_bypass",
+                                "byedpi api lookup failed: {e}"
+                            );
+                            vec![]
+                        }
+                    }
+                }
+            },
+            _ => vec![],
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        match filename {
+            "ciadpi" | "byedpi" => {
+                let arch_suffix = match std::env::consts::ARCH {
+                    "x86_64" => Some("x86_64"),
+                    "aarch64" | "arm64" => Some("aarch64"),
+                    "arm" | "armv7" | "armv7l" => Some("armhf"),
+                    _ => None,
+                };
+                match arch_suffix {
+                    Some(arch_suffix) => {
+                        let pattern = format!("ciadpi-{arch_suffix}");
+                        match resolve_latest_asset_url("hufrea/byedpi", &pattern).await {
+                            Ok(url) => vec![url],
+                            Err(e) => {
+                                warn!(
+                                    target: "packet_bypass",
+                                    error = %e,
+                                    "api lookup failed for byedpi/linux asset"
+                                );
+                                vec![]
+                            }
+                        }
+                    }
+                    None => {
+                        warn!(
+                            target: "packet_bypass",
+                            arch = std::env::consts::ARCH,
+                            "unsupported linux architecture for byedpi asset"
+                        );
+                        vec![]
+                    }
+                }
+            }
+            _ => vec![],
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        match filename {
+            "byedpi" => {
+                let darwin_arch = match std::env::consts::ARCH {
+                    "aarch64" | "arm64" => Some("darwin-arm64"),
+                    "x86_64" => Some("darwin-x86_64"),
+                    _ => None,
+                };
+                match darwin_arch {
+                    Some(darwin_arch) => {
+                        match resolve_latest_asset_url("hufrea/byedpi", darwin_arch).await {
+                            Ok(url) => vec![url],
+                            Err(e) => {
+                                warn!(
+                                    target: "packet_bypass",
+                                    error = %e,
+                                    "api lookup failed for byedpi/macos asset"
+                                );
+                                vec![]
+                            }
+                        }
+                    }
+                    None => {
+                        warn!(
+                            target: "packet_bypass",
+                            arch = std::env::consts::ARCH,
+                            "unsupported macos architecture for byedpi asset"
+                        );
+                        vec![]
+                    }
+                }
+            }
+            _ => vec![],
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        let _ = filename;
+        vec![]
+    }
+}
+
+fn extract_from_zip(zip_bytes: &[u8], target_filename: &str) -> Result<Vec<u8>> {
+    use std::io::Read;
+
+    let cursor = std::io::Cursor::new(zip_bytes);
+    let mut archive = zip::ZipArchive::new(cursor)
+        .map_err(|e| EngineError::Config(format!("failed to open zip: {e}")))?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| EngineError::Config(format!("zip entry error: {e}")))?;
+        let entry_name = entry.name().to_owned();
+        let file_name = std::path::Path::new(&entry_name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if file_name.eq_ignore_ascii_case(target_filename) {
+            let mut buf = Vec::with_capacity(entry.size() as usize);
+            entry
+                .read_to_end(&mut buf)
+                .map_err(|e| EngineError::Config(format!("failed to read zip entry: {e}")))?;
+            info!(
+                target: "packet_bypass",
+                zip_entry = entry_name.as_str(),
+                filename = target_filename,
+                "extracted binary from zip"
+            );
+            return Ok(buf);
+        }
+    }
+
+    Err(EngineError::Config(format!(
+        "'{target_filename}' not found inside zip archive"
+    )))
+}
+
+async fn download_best_binary(install_dir: &Path) -> Result<PathBuf> {
+    let candidates = candidate_binary_names();
+    if candidates.is_empty() {
+        return Err(EngineError::Config(
+            "packet-level bypass is not supported on this platform".to_owned(),
+        ));
+    }
+
+    let mut last_err = EngineError::Config("no mirrors tried".to_owned());
+
+    for name in &candidates {
+        let urls = build_mirror_urls(name).await;
+        if urls.is_empty() {
+            warn!(
+                target: "packet_bypass",
+                binary = %name,
+                "no packet bypass mirrors available for candidate"
+            );
+            continue;
+        }
+
+        info!(
+            target: "packet_bypass",
+            binary = %name,
+            mirrors = urls.len(),
+            "downloading packet bypass binary"
+        );
+        match download_from_mirrors(name, &urls).await {
+            Ok((bytes, source_url)) => {
+                let final_bytes = if source_url.ends_with(".zip") {
+                    match extract_from_zip(&bytes, name) {
+                        Ok(extracted) => extracted,
+                        Err(e) => {
+                            warn!(
+                                target: "packet_bypass",
+                                binary = %name,
+                                "zip extraction failed: {e}"
+                            );
+                            last_err = e;
+                            continue;
+                        }
+                    }
+                } else {
+                    bytes
+                };
+
+                let path = install_dir.join(name);
+                std::fs::write(&path, &final_bytes).map_err(EngineError::Io)?;
+                make_executable(&path)?;
+                info!(
+                    target: "packet_bypass",
+                    path = %path.display(),
+                    bytes = final_bytes.len(),
+                    "packet bypass binary installed successfully"
+                );
+                return Ok(path);
+            }
+            Err(e) => {
+                warn!(
+                    target: "packet_bypass",
+                    binary = %name,
+                    error = %e,
+                    "packet bypass download failed; trying next candidate"
+                );
+                last_err = e;
+            }
+        }
+    }
+
+    Err(EngineError::Config(format!(
+        "failed to install any packet bypass binary; last error: {last_err}"
+    )))
+}
+
+fn which_binary(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var("PATH").ok()?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(name);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> Result<()> {
+    let mut perms = fs::metadata(path).map_err(EngineError::Io)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).map_err(EngineError::Io)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn make_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+async fn download_from_mirrors(name: &str, urls: &[String]) -> Result<(Vec<u8>, String)> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .user_agent("prime-net-engine/packet-bypass-bootstrap")
+        .build()
+        .map_err(|e| {
+            EngineError::Config(format!(
+                "failed to build packet bypass download client: {e}"
+            ))
+        })?;
+
+    let mut errors = Vec::new();
+    for url in urls {
+        info!(
+            target: "packet_bypass",
+            binary = %name,
+            url = %url,
+            "packet bypass bootstrap attempt"
+        );
+        match client.get(url).send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    match resp.bytes().await {
+                        Ok(body) => {
+                            if !body.is_empty() {
+                                return Ok((body.to_vec(), url.clone()));
+                            }
+                            errors.push(format!("{url}: empty body"));
+                        }
+                        Err(e) => errors.push(format!("{url}: {e}")),
+                    }
+                } else {
+                    errors.push(format!("{url}: http {}", resp.status()));
+                }
+            }
+            Err(e) => errors.push(format!("{url}: {e}")),
+        }
+    }
+    Err(EngineError::Config(format!(
+        "all packet bypass bootstrap mirrors failed for '{name}': {}",
+        errors.join(" | ")
+    )))
+}
+
+fn ensure_dir_writable(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)?;
+    let probe = path.join(".prime-write-test");
+    std::fs::write(&probe, b"ok").map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            EngineError::Config(format!(
+                "permission denied for '{}'; administrator rights may be required",
+                path.display()
+            ))
+        } else {
+            EngineError::Io(e)
+        }
+    })?;
+    let _ = std::fs::remove_file(probe);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_elevated() -> bool {
+    std::process::Command::new("net")
+        .args(["session"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}

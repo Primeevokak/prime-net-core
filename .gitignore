@@ -1,0 +1,10 @@
+/target
+/.cargo-local
+/.cargo-local-test
+/.cargo-home-test
+/.home-tmp
+/.cargo/config.local.toml
+
+# OS junk
+.DS_Store
+Thumbs.db

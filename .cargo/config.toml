@@ -1,0 +1,4 @@
+# Intentionally left minimal for public repository safety.
+# Local mirrors/overrides must be configured in untracked local files.
+# See .cargo/config.example.toml for optional internal setup examples.
+

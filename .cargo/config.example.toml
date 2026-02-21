@@ -1,0 +1,7 @@
+[build]
+# CI-only fallback for low-memory builders (do not commit this as a global default):
+# jobs = 1
+
+# Optional internal mirror example:
+# [source.local-proxy]
+# registry = "sparse+https://rsproxy.cn/index/"

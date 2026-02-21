@@ -1,0 +1,375 @@
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+
+use serde::{Deserialize, Serialize};
+use windows_sys::Win32::Networking::WinInet::{
+    InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+};
+use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
+use winreg::RegKey;
+
+use crate::error::{EngineError, Result};
+use crate::platform::{ProxyManager, ProxyMode, ProxyStatus};
+
+const INTERNET_SETTINGS: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WindowsProxyBackup {
+    proxy_enable: u32,
+    proxy_server: Option<String>,
+    auto_config_url: Option<String>,
+    proxy_override: Option<String>,
+}
+
+pub struct WindowsProxyManager;
+
+impl WindowsProxyManager {
+    const DEFAULT_PROXY_BYPASS: &'static str =
+        "localhost;127.*;10.*;192.168.*;172.16.*;*.local;<local>";
+
+    fn backup_path() -> PathBuf {
+        if let Some(dir) = dirs::config_dir() {
+            return dir
+                .join("prime-net-engine")
+                .join("proxy-backup-windows.json");
+        }
+        PathBuf::from("proxy-backup-windows.json")
+    }
+
+    fn save_backup(backup: &WindowsProxyBackup) -> Result<()> {
+        let path = Self::backup_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let data = serde_json::to_vec_pretty(backup)
+            .map_err(|e| EngineError::Internal(format!("backup encode failed: {e}")))?;
+        fs::write(path, data)?;
+        Ok(())
+    }
+
+    fn clear_backup() -> Result<()> {
+        let path = Self::backup_path();
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(EngineError::Io(e)),
+        }
+    }
+
+    fn load_backup() -> Result<Option<WindowsProxyBackup>> {
+        let path = Self::backup_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read(path)?;
+        let parsed: WindowsProxyBackup = serde_json::from_slice(&raw)
+            .map_err(|e| EngineError::Internal(format!("backup decode failed: {e}")))?;
+        Ok(Some(parsed))
+    }
+
+    fn save_backup_if_missing(&self) -> Result<()> {
+        if Self::load_backup()?.is_none() {
+            let backup = self.backup_current_settings()?;
+            Self::save_backup(&backup)?;
+        }
+        Ok(())
+    }
+
+    fn open_settings_read() -> Result<RegKey> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        hkcu.open_subkey_with_flags(INTERNET_SETTINGS, KEY_READ)
+            .map_err(EngineError::Io)
+    }
+
+    fn open_settings_write() -> Result<RegKey> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        hkcu.open_subkey_with_flags(INTERNET_SETTINGS, KEY_SET_VALUE | KEY_READ)
+            .map_err(EngineError::Io)
+    }
+
+    fn broadcast_settings_change() {
+        let mut param = "Internet Settings\0".encode_utf16().collect::<Vec<u16>>();
+        if param.is_empty() || *param.last().unwrap_or(&0) != 0 {
+            param.push(0);
+        }
+        unsafe {
+            let _ = SendMessageTimeoutW(
+                HWND_BROADCAST,
+                WM_SETTINGCHANGE,
+                0,
+                param.as_ptr() as isize,
+                SMTO_ABORTIFHUNG,
+                2000,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
+    pub fn requires_elevation(&self) -> bool {
+        Command::new("net")
+            .args(["session"])
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+    }
+
+    pub fn request_elevation(&self) -> Result<()> {
+        if self.requires_elevation() {
+            return Err(EngineError::Internal(
+                "administrator privileges may be required for some proxy operations".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn refresh_internet_settings(&self) -> Result<()> {
+        unsafe {
+            let ok_changed = InternetSetOptionW(
+                std::ptr::null_mut(),
+                INTERNET_OPTION_SETTINGS_CHANGED,
+                std::ptr::null_mut(),
+                0,
+            ) != 0;
+            let ok_refresh = InternetSetOptionW(
+                std::ptr::null_mut(),
+                INTERNET_OPTION_REFRESH,
+                std::ptr::null_mut(),
+                0,
+            ) != 0;
+            if !ok_changed || !ok_refresh {
+                return Err(EngineError::Internal(
+                    "failed to refresh internet settings".to_owned(),
+                ));
+            }
+        }
+        Self::broadcast_settings_change();
+        Ok(())
+    }
+
+    pub fn get_active_adapters(&self) -> Result<Vec<String>> {
+        let out = Command::new("netsh")
+            .args(["interface", "show", "interface"])
+            .output()?;
+        if !out.status.success() {
+            return Err(EngineError::Internal(
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            ));
+        }
+        let mut adapters = Vec::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with("Admin State")
+                || trimmed.starts_with("---")
+            {
+                continue;
+            }
+            let cols = trimmed.split_whitespace().collect::<Vec<_>>();
+            if cols.len() < 4 {
+                continue;
+            }
+            let state = cols[1].to_ascii_lowercase();
+            if state != "connected" {
+                continue;
+            }
+            let name = cols[3..].join(" ");
+            if !name.is_empty() {
+                adapters.push(name);
+            }
+        }
+        Ok(adapters)
+    }
+
+    pub fn enable_per_adapter(&self, adapter: &str, endpoint: &str) -> Result<()> {
+        let _ = self.request_elevation();
+        let proxy_value = Self::composite_proxy_server(endpoint);
+        let settings = format!(
+            "{{\"Proxy\":\"{proxy_value}\",\"ProxyBypass\":\"{}\"}}",
+            Self::DEFAULT_PROXY_BYPASS
+        );
+        let out = Command::new("netsh")
+            .args([
+                "winhttp",
+                "set",
+                "advproxy",
+                "setting-scope=user",
+                &format!("settings={settings}"),
+            ])
+            .output()?;
+        if !out.status.success() {
+            return Err(EngineError::Internal(format!(
+                "failed to set adapter proxy for {adapter}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn set_proxy_bypass(&self, bypass: &str) -> Result<()> {
+        let key_w = Self::open_settings_write()?;
+        let value = if bypass.trim().is_empty() {
+            Self::DEFAULT_PROXY_BYPASS
+        } else {
+            bypass
+        };
+        key_w.set_value("ProxyOverride", &value)?;
+        Ok(())
+    }
+
+    fn backup_current_settings(&self) -> Result<WindowsProxyBackup> {
+        let key_r = Self::open_settings_read()?;
+        Ok(WindowsProxyBackup {
+            proxy_enable: key_r.get_value("ProxyEnable").unwrap_or(0_u32),
+            proxy_server: key_r.get_value("ProxyServer").ok(),
+            auto_config_url: key_r.get_value("AutoConfigURL").ok(),
+            proxy_override: key_r.get_value("ProxyOverride").ok(),
+        })
+    }
+
+    fn restore_from_backup(&self, backup: &WindowsProxyBackup) -> Result<()> {
+        let key_w = Self::open_settings_write()?;
+        key_w.set_value("ProxyEnable", &backup.proxy_enable)?;
+        match &backup.proxy_server {
+            Some(v) => key_w.set_value("ProxyServer", v)?,
+            None => {
+                let _ = key_w.delete_value("ProxyServer");
+            }
+        }
+        match &backup.auto_config_url {
+            Some(v) => key_w.set_value("AutoConfigURL", v)?,
+            None => {
+                let _ = key_w.delete_value("AutoConfigURL");
+            }
+        }
+        match &backup.proxy_override {
+            Some(v) => key_w.set_value("ProxyOverride", v)?,
+            None => {
+                let _ = key_w.delete_value("ProxyOverride");
+            }
+        }
+        self.refresh_internet_settings()?;
+        Ok(())
+    }
+
+    fn extract_socks_endpoint(proxy_server: &str) -> Option<String> {
+        let raw = proxy_server.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        if !raw.contains('=') {
+            return Some(raw.to_owned());
+        }
+
+        for part in raw.split(';') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some((scheme, value)) = part.split_once('=') {
+                let scheme = scheme.trim().to_ascii_lowercase();
+                let value = value.trim();
+                if (scheme == "socks" || scheme == "socks5") && !value.is_empty() {
+                    return Some(value.to_owned());
+                }
+                if (scheme == "http" || scheme == "https") && !value.is_empty() {
+                    return Some(value.to_owned());
+                }
+            }
+        }
+        None
+    }
+
+    fn include_socks_proxy_entry() -> bool {
+        std::env::var("PRIME_WINDOWS_PROXY_INCLUDE_SOCKS")
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off"
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    fn composite_proxy_server(endpoint: &str) -> String {
+        // On Windows many apps downgrade SOCKS to v4 (IP-literal requests), which harms
+        // anti-censorship effectiveness. Prefer HTTP/HTTPS CONNECT by default.
+        if Self::include_socks_proxy_entry() {
+            return format!("http={endpoint};https={endpoint};socks={endpoint}");
+        }
+        format!("http={endpoint};https={endpoint}")
+    }
+}
+
+impl ProxyManager for WindowsProxyManager {
+    fn enable(&self, socks_endpoint: &str) -> Result<()> {
+        self.save_backup_if_missing()?;
+
+        let key_w = Self::open_settings_write()?;
+        key_w.set_value("ProxyEnable", &1_u32)?;
+        key_w.set_value("ProxyServer", &Self::composite_proxy_server(socks_endpoint))?;
+        let _ = key_w.delete_value("AutoConfigURL");
+        self.set_proxy_bypass("")?;
+
+        if let Ok(adapters) = self.get_active_adapters() {
+            for adapter in adapters {
+                let _ = self.enable_per_adapter(&adapter, socks_endpoint);
+            }
+        }
+
+        self.refresh_internet_settings()?;
+        Ok(())
+    }
+
+    fn enable_pac(&self, pac_url: &str) -> Result<()> {
+        self.save_backup_if_missing()?;
+
+        let key_w = Self::open_settings_write()?;
+        key_w.set_value("ProxyEnable", &0_u32)?;
+        key_w.set_value("AutoConfigURL", &pac_url)?;
+        self.set_proxy_bypass("")?;
+
+        self.refresh_internet_settings()?;
+        Ok(())
+    }
+
+    fn disable(&self) -> Result<()> {
+        if let Some(b) = Self::load_backup()? {
+            self.restore_from_backup(&b)?;
+            Self::clear_backup()?;
+        } else {
+            let key_w = Self::open_settings_write()?;
+            key_w.set_value("ProxyEnable", &0_u32)?;
+            let _ = key_w.delete_value("ProxyServer");
+            let _ = key_w.delete_value("AutoConfigURL");
+            let _ = key_w.delete_value("ProxyOverride");
+            self.refresh_internet_settings()?;
+        }
+        Ok(())
+    }
+
+    fn status(&self) -> Result<ProxyStatus> {
+        let key = Self::open_settings_read()?;
+        let enabled = key.get_value("ProxyEnable").unwrap_or(0_u32) != 0;
+        let server: Option<String> = key.get_value("ProxyServer").ok();
+        let pac: Option<String> = key.get_value("AutoConfigURL").ok();
+        let socks_endpoint = server.as_deref().and_then(Self::extract_socks_endpoint);
+        let mode = if pac.as_deref().is_some() {
+            ProxyMode::Pac
+        } else if enabled {
+            ProxyMode::All
+        } else {
+            ProxyMode::Off
+        };
+
+        Ok(ProxyStatus {
+            enabled: enabled || pac.is_some(),
+            mode,
+            socks_endpoint,
+            pac_url: pac,
+        })
+    }
+}
