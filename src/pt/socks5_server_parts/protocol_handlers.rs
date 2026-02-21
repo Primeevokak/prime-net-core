@@ -1,0 +1,819 @@
+async fn handle_http_proxy(
+    conn_id: u64,
+    mut tcp: TcpStream,
+    peer: SocketAddr,
+    client: String,
+    outbound: DynOutbound,
+    first_two: [u8; 2],
+    relay_opts: RelayOptions,
+) -> Result<()> {
+    let mut buf = Vec::with_capacity(2048);
+    buf.extend_from_slice(&first_two);
+    let mut tmp = [0u8; 512];
+    loop {
+        if find_http_header_end(&buf).is_some() {
+            break;
+        }
+        if buf.len() > 16 * 1024 {
+            return Err(EngineError::InvalidInput(
+                "HTTP proxy request header too large".to_owned(),
+            ));
+        }
+        let n = tcp.read(&mut tmp).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+
+    let Some(header_end) = find_http_header_end(&buf) else {
+        return Err(EngineError::InvalidInput(
+            "HTTP proxy request header terminator is missing".to_owned(),
+        ));
+    };
+    let header_bytes = &buf[..header_end];
+    let buffered_body = &buf[header_end..];
+
+    let request = String::from_utf8_lossy(header_bytes);
+    let Some(first_line) = request.lines().next() else {
+        return Err(EngineError::InvalidInput(
+            "HTTP proxy request is empty".to_owned(),
+        ));
+    };
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_ascii_uppercase();
+    let target = parts.next().unwrap_or_default();
+    let version = parts.next().unwrap_or("HTTP/1.1");
+
+    if method == "CONNECT" {
+        let Some((host, port)) = split_host_port_for_connect(target) else {
+            warn!(target: "socks5", conn_id, peer = %peer, client = %client, target = %target, "HTTP CONNECT target is invalid");
+            let _ = tcp
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                .await;
+            let _ = tcp.shutdown().await;
+            return Ok(());
+        };
+
+        let target_addr = if let Some(ip) = parse_ip_literal(&host) {
+            TargetAddr::Ip(ip)
+        } else {
+            TargetAddr::Domain(host.clone())
+        };
+        let destination = format!("{host}:{port}");
+        let target_endpoint = TargetEndpoint {
+            addr: target_addr,
+            port,
+        };
+        info!(target: "socks5", conn_id, peer = %peer, client = %client, destination = %destination, "HTTP CONNECT requested");
+
+        let mut connected = match connect_via_best_route(
+            conn_id,
+            outbound.clone(),
+            &relay_opts,
+            &target_endpoint,
+            &destination,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(target: "socks5", conn_id, peer = %peer, client = %client, destination = %destination, error = %e, "HTTP CONNECT upstream failed");
+                let _ = tcp
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                    .await;
+                let _ = tcp.shutdown().await;
+                return Ok(());
+            }
+        };
+        if connected.candidate.kind == RouteKind::Bypass {
+            info!(
+                target: "socks5",
+                conn_id,
+                peer = %peer,
+                client = %client,
+                destination = %destination,
+                route = connected.candidate.route_label(),
+                source = connected.candidate.source,
+                bypass = ?connected.candidate.bypass_addr,
+                bypass_profile = connected.candidate.bypass_profile_idx + 1,
+                bypass_profiles = connected.candidate.bypass_profile_total,
+                raced = connected.raced,
+                "HTTP CONNECT route selected"
+            );
+        } else {
+            info!(
+                target: "socks5",
+                conn_id,
+                peer = %peer,
+                client = %client,
+                destination = %destination,
+                route = connected.candidate.route_label(),
+                source = connected.candidate.source,
+                raced = connected.raced,
+                "HTTP CONNECT route selected"
+            );
+        }
+
+        tcp.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
+
+        if connected.candidate.kind == RouteKind::Bypass {
+            info!(
+                target: "socks5",
+                conn_id,
+                destination = %destination,
+                bypass = ?connected.candidate.bypass_addr,
+                bypass_profile = connected.candidate.bypass_profile_idx + 1,
+                bypass_profiles = connected.candidate.bypass_profile_total,
+                "bypass tunnel established"
+            );
+            match tokio::io::copy_bidirectional(&mut tcp, &mut connected.stream).await {
+                Ok((c2u, u2c)) => {
+                    info!(
+                        target: "socks5",
+                        conn_id,
+                        destination = %destination,
+                        bytes_client_to_bypass = c2u,
+                        bytes_bypass_to_client = u2c,
+                        bypass_profile = connected.candidate.bypass_profile_idx + 1,
+                        bypass_profiles = connected.candidate.bypass_profile_total,
+                        "bypass tunnel closed"
+                    );
+                    if should_skip_empty_session_scoring(c2u, u2c) {
+                        info!(
+                            target: "socks5.route",
+                            conn_id,
+                            route_key = %connected.route_key,
+                            route = connected.candidate.route_label(),
+                            destination = %destination,
+                            "adaptive route skipped scoring for empty bypass session"
+                        );
+                    } else if should_mark_bypass_profile_failure(
+                        port,
+                        c2u,
+                        u2c,
+                        relay_opts.suspicious_zero_reply_min_c2u as u64,
+                    ) {
+                        record_bypass_profile_failure(
+                            &destination,
+                            connected.candidate.bypass_profile_idx,
+                            connected.candidate.bypass_profile_total,
+                            "suspicious-zero-reply",
+                        );
+                        record_route_failure(
+                            &connected.route_key,
+                            &connected.candidate,
+                            "suspicious-zero-reply",
+                        );
+                        warn!(
+                            target: "socks5",
+                            conn_id,
+                            destination = %destination,
+                            bytes_client_to_bypass = c2u,
+                            bytes_bypass_to_client = u2c,
+                            bypass_profile = connected.candidate.bypass_profile_idx + 1,
+                            bypass_profiles = connected.candidate.bypass_profile_total,
+                            "bypass profile marked as weak for destination"
+                        );
+                    } else if should_mark_bypass_zero_reply_soft(port, c2u, u2c) {
+                        record_route_failure(
+                            &connected.route_key,
+                            &connected.candidate,
+                            "zero-reply-soft",
+                        );
+                        warn!(
+                            target: "socks5.route",
+                            conn_id,
+                            route_key = %connected.route_key,
+                            route = connected.candidate.route_label(),
+                            destination = %destination,
+                            bytes_client_to_bypass = c2u,
+                            bytes_bypass_to_client = u2c,
+                            "adaptive route observed soft zero-reply; winner confidence reduced"
+                        );
+                    } else {
+                        record_bypass_profile_success(
+                            &destination,
+                            connected.candidate.bypass_profile_idx,
+                        );
+                        record_route_success(&connected.route_key, &connected.candidate);
+                    }
+                }
+                Err(e) if is_expected_disconnect(&e) => {
+                    let _ = e;
+                }
+                Err(e) => {
+                    warn!(
+                        target: "socks5",
+                        conn_id,
+                        destination = %destination,
+                        error = %e,
+                        "bypass tunnel error"
+                    );
+                    record_bypass_profile_failure(
+                        &destination,
+                        connected.candidate.bypass_profile_idx,
+                        connected.candidate.bypass_profile_total,
+                        "io-error",
+                    );
+                    record_route_failure(&connected.route_key, &connected.candidate, "io-error");
+                }
+            }
+            return Ok(());
+        }
+
+        let tuned = tune_relay_for_target(relay_opts, port, &destination, false);
+        match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options.clone()).await {
+            Ok((bytes_client_to_upstream, bytes_upstream_to_client)) => {
+                if should_skip_empty_session_scoring(bytes_client_to_upstream, bytes_upstream_to_client)
+                {
+                    info!(
+                        target: "socks5.route",
+                        conn_id,
+                        route_key = %connected.route_key,
+                        route = connected.candidate.route_label(),
+                        destination = %destination,
+                        "adaptive route skipped scoring for empty direct session"
+                    );
+                } else if should_mark_suspicious_zero_reply(
+                    port,
+                    bytes_client_to_upstream,
+                    bytes_upstream_to_client,
+                    tuned.options.suspicious_zero_reply_min_c2u,
+                ) {
+                    record_destination_failure(
+                        &destination,
+                        BlockingSignal::SuspiciousZeroReply,
+                        tuned.options.classifier_emit_interval_secs,
+                        tuned.stage,
+                    );
+                    warn!(
+                        target: "socks5",
+                        conn_id,
+                        peer = %peer,
+                        client = %client,
+                        destination = %destination,
+                        bytes_client_to_upstream,
+                        bytes_upstream_to_client,
+                        "HTTP CONNECT suspicious early close (no upstream bytes) classified as potential blocking"
+                    );
+                    record_route_failure(
+                        &connected.route_key,
+                        &connected.candidate,
+                        "suspicious-zero-reply",
+                    );
+                } else if should_mark_route_soft_zero_reply(
+                    port,
+                    bytes_client_to_upstream,
+                    bytes_upstream_to_client,
+                ) {
+                    record_route_failure(
+                        &connected.route_key,
+                        &connected.candidate,
+                        "zero-reply-soft",
+                    );
+                    warn!(
+                        target: "socks5.route",
+                        conn_id,
+                        route_key = %connected.route_key,
+                        route = connected.candidate.route_label(),
+                        destination = %destination,
+                        bytes_client_to_upstream,
+                        bytes_upstream_to_client,
+                        "adaptive route observed soft zero-reply; winner confidence reduced"
+                    );
+                } else {
+                    record_destination_success(&destination, tuned.stage, tuned.source);
+                    record_route_success(&connected.route_key, &connected.candidate);
+                }
+                info!(
+                    target: "socks5",
+                    conn_id,
+                    peer = %peer,
+                    client = %client,
+                    destination = %destination,
+                    bytes_client_to_upstream,
+                    bytes_upstream_to_client,
+                    "HTTP CONNECT session closed"
+                );
+            }
+            Err(e) => {
+                let signal = classify_io_error(&e);
+                record_destination_failure(
+                    &destination,
+                    signal,
+                    tuned.options.classifier_emit_interval_secs,
+                    tuned.stage,
+                );
+                record_route_failure(
+                    &connected.route_key,
+                    &connected.candidate,
+                    blocking_signal_label(signal),
+                );
+                if is_expected_disconnect(&e) {
+                    info!(
+                        target: "socks5",
+                        conn_id,
+                        peer = %peer,
+                        client = %client,
+                        destination = %destination,
+                        error = %e,
+                        "HTTP CONNECT relay closed by peer"
+                    );
+                } else {
+                    warn!(
+                        target: "socks5",
+                        conn_id,
+                        peer = %peer,
+                        client = %client,
+                        destination = %destination,
+                        error = %e,
+                        "HTTP CONNECT relay interrupted"
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let Some(parsed) = parse_http_forward_target(target, request.as_ref()) else {
+        warn!(target: "socks5", conn_id, peer = %peer, client = %client, method = %method, target = %target, "HTTP proxy target is invalid");
+        let _ = tcp
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+            .await;
+        let _ = tcp.shutdown().await;
+        return Ok(());
+    };
+    let destination = format!("{}:{}", parsed.host, parsed.port);
+    info!(target: "socks5", conn_id, peer = %peer, client = %client, method = %method, destination = %destination, "HTTP proxy forward requested");
+    info!(
+        target: "socks5",
+        conn_id,
+        peer = %peer,
+        client = %client,
+        method = %method,
+        destination = %destination,
+        route = "direct",
+        "HTTP proxy forward route selected"
+    );
+
+    let target_addr = if let Some(ip) = parse_ip_literal(&parsed.host) {
+        TargetAddr::Ip(ip)
+    } else {
+        TargetAddr::Domain(parsed.host.clone())
+    };
+    let mut out = match outbound
+        .connect(TargetEndpoint {
+            addr: target_addr,
+            port: parsed.port,
+        })
+        .await
+    {
+        Ok(stream) => stream,
+        Err(e) => {
+            warn!(target: "socks5", conn_id, peer = %peer, client = %client, method = %method, destination = %destination, error = %e, "HTTP proxy forward upstream failed");
+            let _ = tcp
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                .await;
+            let _ = tcp.shutdown().await;
+            return Ok(());
+        }
+    };
+
+    let upstream_head = rewrite_http_forward_head(
+        &method,
+        version,
+        &parsed.request_uri,
+        request.as_ref(),
+        &parsed.host,
+        parsed.port,
+    );
+    out.write_all(upstream_head.as_bytes()).await?;
+    if !buffered_body.is_empty() {
+        out.write_all(buffered_body).await?;
+    }
+
+    let tuned = tune_relay_for_target(relay_opts, parsed.port, &destination, false);
+    match relay_bidirectional(&mut tcp, &mut out, tuned.options.clone()).await {
+        Ok((bytes_client_to_upstream, bytes_upstream_to_client)) => {
+            if should_skip_empty_session_scoring(bytes_client_to_upstream, bytes_upstream_to_client)
+            {
+                info!(
+                    target: "socks5",
+                    conn_id,
+                    peer = %peer,
+                    client = %client,
+                    destination = %destination,
+                    "HTTP proxy forward classifier update skipped for empty session"
+                );
+            } else if should_mark_suspicious_zero_reply(
+                parsed.port,
+                bytes_client_to_upstream,
+                bytes_upstream_to_client,
+                tuned.options.suspicious_zero_reply_min_c2u,
+            ) {
+                record_destination_failure(
+                    &destination,
+                    BlockingSignal::SuspiciousZeroReply,
+                    tuned.options.classifier_emit_interval_secs,
+                    tuned.stage,
+                );
+                warn!(
+                    target: "socks5",
+                    conn_id,
+                    peer = %peer,
+                    client = %client,
+                    destination = %destination,
+                    bytes_client_to_upstream,
+                    bytes_upstream_to_client,
+                    "HTTP proxy forward suspicious early close (no upstream bytes) classified as potential blocking"
+                );
+            } else {
+                record_destination_success(&destination, tuned.stage, tuned.source);
+            }
+            info!(
+                target: "socks5",
+                conn_id,
+                peer = %peer,
+                client = %client,
+                destination = %destination,
+                bytes_client_to_upstream,
+                bytes_upstream_to_client,
+                "HTTP proxy forward session closed"
+            );
+        }
+        Err(e) => {
+            let signal = classify_io_error(&e);
+            record_destination_failure(
+                &destination,
+                signal,
+                tuned.options.classifier_emit_interval_secs,
+                tuned.stage,
+            );
+            if is_expected_disconnect(&e) {
+                info!(
+                    target: "socks5",
+                    conn_id,
+                    peer = %peer,
+                    client = %client,
+                    method = %method,
+                    destination = %destination,
+                    error = %e,
+                    "HTTP proxy forward relay closed by peer"
+                );
+            } else {
+                warn!(
+                    target: "socks5",
+                    conn_id,
+                    peer = %peer,
+                    client = %client,
+                    method = %method,
+                    destination = %destination,
+                    error = %e,
+                    "HTTP proxy forward relay interrupted"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_socks4(
+    conn_id: u64,
+    mut tcp: TcpStream,
+    peer: SocketAddr,
+    client: String,
+    outbound: DynOutbound,
+    cmd: u8,
+    silent_drop: bool,
+    relay_opts: RelayOptions,
+) -> Result<()> {
+    if !WARNED_SOCKS4_LIMITATIONS.swap(true, Ordering::Relaxed) {
+        warn!(
+            target: "socks5",
+            "SOCKS4/4a clients detected: requests often use IP literals, reducing anti-censorship effectiveness (prefer SOCKS5/CONNECT clients when possible)"
+        );
+    }
+
+    if cmd != 0x01 {
+        warn!(target: "socks5", conn_id, peer = %peer, client = %client, cmd, "SOCKS4 unsupported command");
+        if !silent_drop {
+            let _ = tcp.write_all(&[0x00, 0x5b, 0, 0, 0, 0, 0, 0]).await;
+        }
+        let _ = tcp.shutdown().await;
+        return Ok(());
+    }
+
+    let mut port_buf = [0u8; 2];
+    tcp.read_exact(&mut port_buf).await?;
+    let port = u16::from_be_bytes(port_buf);
+
+    let mut ip_buf = [0u8; 4];
+    tcp.read_exact(&mut ip_buf).await?;
+
+    let _user_id = read_cstring(&mut tcp, 512).await?;
+
+    let target_addr = if ip_buf[0] == 0 && ip_buf[1] == 0 && ip_buf[2] == 0 && ip_buf[3] != 0 {
+        let host = read_cstring(&mut tcp, 2048).await?;
+        if host.trim().is_empty() {
+            warn!(target: "socks5", conn_id, peer = %peer, client = %client, "SOCKS4a empty host");
+            if !silent_drop {
+                let _ = tcp.write_all(&[0x00, 0x5b, 0, 0, 0, 0, 0, 0]).await;
+            }
+            let _ = tcp.shutdown().await;
+            return Ok(());
+        }
+        TargetAddr::Domain(host)
+    } else {
+        TargetAddr::Ip(std::net::IpAddr::V4(std::net::Ipv4Addr::from(ip_buf)))
+    };
+
+    let destination = format_target(&target_addr, port);
+    info!(target: "socks5", conn_id, peer = %peer, client = %client, destination = %destination, "SOCKS4 CONNECT requested");
+    let mut out = match outbound
+        .connect(TargetEndpoint {
+            addr: target_addr,
+            port,
+        })
+        .await
+    {
+        Ok(stream) => stream,
+        Err(e) => {
+            warn!(target: "socks5", conn_id, peer = %peer, client = %client, destination = %destination, error = %e, "SOCKS4 upstream failed");
+            if !silent_drop {
+                let _ = tcp.write_all(&[0x00, 0x5b, 0, 0, 0, 0, 0, 0]).await;
+            }
+            let _ = tcp.shutdown().await;
+            return Ok(());
+        }
+    };
+
+    tcp.write_all(&[0x00, 0x5a, 0, 0, 0, 0, 0, 0]).await?;
+    let tuned = tune_relay_for_target(relay_opts, port, &destination, true);
+    match relay_bidirectional(&mut tcp, &mut out, tuned.options.clone()).await {
+        Ok((bytes_client_to_upstream, bytes_upstream_to_client)) => {
+            if should_skip_empty_session_scoring(bytes_client_to_upstream, bytes_upstream_to_client)
+            {
+                info!(
+                    target: "socks5",
+                    conn_id,
+                    peer = %peer,
+                    client = %client,
+                    destination = %destination,
+                    "SOCKS4 classifier update skipped for empty session"
+                );
+            } else if should_mark_suspicious_zero_reply(
+                port,
+                bytes_client_to_upstream,
+                bytes_upstream_to_client,
+                tuned.options.suspicious_zero_reply_min_c2u,
+            ) {
+                record_destination_failure(
+                    &destination,
+                    BlockingSignal::SuspiciousZeroReply,
+                    tuned.options.classifier_emit_interval_secs,
+                    tuned.stage,
+                );
+                warn!(
+                    target: "socks5",
+                    conn_id,
+                    peer = %peer,
+                    client = %client,
+                    destination = %destination,
+                    bytes_client_to_upstream,
+                    bytes_upstream_to_client,
+                    "SOCKS4 suspicious early close (no upstream bytes) classified as potential blocking"
+                );
+            } else {
+                record_destination_success(&destination, tuned.stage, tuned.source);
+            }
+            info!(
+                target: "socks5",
+                conn_id,
+                peer = %peer,
+                client = %client,
+                destination = %destination,
+                bytes_client_to_upstream,
+                bytes_upstream_to_client,
+                "SOCKS4 session closed"
+            );
+        }
+        Err(e) => {
+            let signal = classify_io_error(&e);
+            record_destination_failure(
+                &destination,
+                signal,
+                tuned.options.classifier_emit_interval_secs,
+                tuned.stage,
+            );
+            if is_expected_disconnect(&e) {
+                info!(
+                    target: "socks5",
+                    conn_id,
+                    peer = %peer,
+                    client = %client,
+                    destination = %destination,
+                    error = %e,
+                    "SOCKS4 relay closed by peer"
+                );
+            } else {
+                warn!(
+                    target: "socks5",
+                    conn_id,
+                    peer = %peer,
+                    client = %client,
+                    destination = %destination,
+                    error = %e,
+                    "SOCKS4 relay interrupted"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn tune_relay_for_target(
+    base: RelayOptions,
+    port: u16,
+    destination: &str,
+    socks4_flow: bool,
+) -> TunedRelay {
+    if !base.fragment_client_hello {
+        return TunedRelay {
+            options: base,
+            stage: 0,
+            source: StageSelectionSource::Adaptive,
+        };
+    }
+    if port != 443 {
+        return TunedRelay {
+            options: base,
+            stage: 0,
+            source: StageSelectionSource::Adaptive,
+        };
+    }
+    let mut stage = if socks4_flow { 1u8 } else { 0u8 };
+    let preferred = destination_preferred_stage(destination);
+    let mut source = StageSelectionSource::Adaptive;
+    if preferred > 0 {
+        stage = stage.max(preferred);
+        source = StageSelectionSource::Cache;
+    }
+    let failures = destination_failures(destination);
+    if preferred == 0 && failures == 0 && base.strategy_race_enabled && !socks4_flow {
+        stage = select_race_probe_stage(destination);
+        source = StageSelectionSource::Probe;
+    }
+    if failures >= base.stage1_failures {
+        stage += 1;
+    }
+    if failures >= base.stage2_failures {
+        stage += 1;
+    }
+    if failures >= base.stage3_failures {
+        stage += 1;
+    }
+    if failures >= base.stage4_failures {
+        stage += 1;
+    }
+    stage = stage.min(4);
+
+    if socks4_flow && !WARNED_SOCKS4_AGGRESSIVE.swap(true, Ordering::Relaxed) {
+        info!(
+            target: "socks5",
+            "SOCKS4 aggressive DPI profile enabled for :443 (adaptive stage escalation is active)"
+        );
+    }
+
+    let tuned = match stage {
+        0 => base,
+        1 => RelayOptions {
+            fragment_client_hello: true,
+            // Более крупные фрагменты с минимальной паузой: безопасный базовый профиль без долгих задержек handshake.
+            fragment_size: base.fragment_size.clamp(1, 24),
+            fragment_sleep_ms: base.fragment_sleep_ms.min(2),
+            fragment_budget_bytes: base.fragment_budget_bytes.clamp(2 * 1024, 6 * 1024),
+            ..base
+        },
+        2 => RelayOptions {
+            fragment_client_hello: true,
+            fragment_size: base.fragment_size.clamp(1, 8),
+            fragment_sleep_ms: base.fragment_sleep_ms.min(1),
+            fragment_budget_bytes: base.fragment_budget_bytes.clamp(4 * 1024, 8 * 1024),
+            client_hello_split_offsets: vec![1, 5, 40],
+            ..base
+        },
+        3 => RelayOptions {
+            fragment_client_hello: true,
+            fragment_size: base.fragment_size.clamp(1, 4),
+            fragment_sleep_ms: 0,
+            fragment_budget_bytes: base.fragment_budget_bytes.clamp(6 * 1024, 12 * 1024),
+            client_hello_split_offsets: vec![1, 5, 40, 64],
+            ..base
+        },
+        _ => RelayOptions {
+            fragment_client_hello: true,
+            fragment_size: base.fragment_size.clamp(1, 2),
+            fragment_sleep_ms: 0,
+            fragment_budget_bytes: base.fragment_budget_bytes.clamp(8 * 1024, 16 * 1024),
+            client_hello_split_offsets: vec![1, 5, 40, 64],
+            ..base
+        },
+    };
+    if stage > 0 {
+        info!(
+            target: "socks5",
+            destination = %destination,
+            stage,
+            source = ?source,
+            fragment_size = tuned.fragment_size,
+            fragment_sleep_ms = tuned.fragment_sleep_ms,
+            fragment_budget_bytes = tuned.fragment_budget_bytes,
+            "adaptive DPI relay profile selected"
+        );
+    }
+    record_stage_source_selected(source);
+    TunedRelay {
+        options: tuned,
+        stage,
+        source,
+    }
+}
+
+fn route_family_for_target(target: &TargetAddr) -> RouteIpFamily {
+    match target {
+        TargetAddr::Ip(std::net::IpAddr::V4(_)) => RouteIpFamily::V4,
+        TargetAddr::Ip(std::net::IpAddr::V6(_)) => RouteIpFamily::V6,
+        TargetAddr::Domain(host) => parse_ip_literal(host)
+            .map(route_family_for_ip)
+            .unwrap_or(RouteIpFamily::Any),
+    }
+}
+
+fn route_family_for_ip(ip: std::net::IpAddr) -> RouteIpFamily {
+    match ip {
+        std::net::IpAddr::V4(_) => RouteIpFamily::V4,
+        std::net::IpAddr::V6(_) => RouteIpFamily::V6,
+    }
+}
+
+fn route_decision_key(destination: &str, target: &TargetAddr) -> String {
+    format!(
+        "{}|{}",
+        route_state_key(destination),
+        route_family_for_target(target).label()
+    )
+}
+
+fn route_destination_key(route_key: &str) -> &str {
+    route_key
+        .split_once('|')
+        .map(|(k, _)| k)
+        .unwrap_or(route_key)
+}
+
+fn route_state_key(destination: &str) -> String {
+    if let Some((host, port)) = split_host_port_for_connect(destination) {
+        let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if normalized_host.is_empty() {
+            return destination.trim().to_ascii_lowercase();
+        }
+        if let Some(ip) = parse_ip_literal(&normalized_host) {
+            return format!("{ip}:{port}");
+        }
+        return format!("{normalized_host}:{port}");
+    }
+    destination.trim().to_ascii_lowercase()
+}
+
+fn route_capability_slot_mut(
+    caps: &mut RouteCapabilities,
+    kind: RouteKind,
+    family: RouteIpFamily,
+) -> Option<&mut u64> {
+    match (kind, family) {
+        (RouteKind::Direct, RouteIpFamily::V4) => Some(&mut caps.direct_v4_weak_until_unix),
+        (RouteKind::Direct, RouteIpFamily::V6) => Some(&mut caps.direct_v6_weak_until_unix),
+        (RouteKind::Bypass, RouteIpFamily::V4) => Some(&mut caps.bypass_v4_weak_until_unix),
+        (RouteKind::Bypass, RouteIpFamily::V6) => Some(&mut caps.bypass_v6_weak_until_unix),
+        (_, RouteIpFamily::Any) => None,
+    }
+}
+
+fn route_capability_is_available(kind: RouteKind, family: RouteIpFamily, now: u64) -> bool {
+    let map = ROUTE_CAPABILITIES.get_or_init(|| Mutex::new(RouteCapabilities::default()));
+    let Ok(guard) = map.lock() else {
+        return true;
+    };
+    let until = match (kind, family) {
+        (RouteKind::Direct, RouteIpFamily::V4) => guard.direct_v4_weak_until_unix,
+        (RouteKind::Direct, RouteIpFamily::V6) => guard.direct_v6_weak_until_unix,
+        (RouteKind::Bypass, RouteIpFamily::V4) => guard.bypass_v4_weak_until_unix,
+        (RouteKind::Bypass, RouteIpFamily::V6) => guard.bypass_v6_weak_until_unix,
+        (_, RouteIpFamily::Any) => 0,
+    };
+    until <= now
+}
+
