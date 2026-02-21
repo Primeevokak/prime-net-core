@@ -10,7 +10,9 @@ use prime_net_engine_core::pt::socks5_server::{start_socks5_server, RelayOptions
 use prime_net_engine_core::{EngineConfig, PrimeEngine};
 use tracing::{info, warn};
 
-use crate::blocklist_builtin;
+use crate::blocklist_runtime::{
+    initialize_runtime_blocklist, is_bypass_domain_runtime, log_runtime_blocklist_stats,
+};
 use crate::packet_bypass::maybe_start_packet_bypass;
 
 #[derive(Debug, Clone)]
@@ -83,6 +85,9 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
         target: "socks_cmd",
         "pt is disabled: running direct SOCKS proxy (no pluggable transport; blocked destinations may remain blocked)"
     );
+    let blocklist_stats = initialize_runtime_blocklist(&cfg.blocklist).await?;
+    log_runtime_blocklist_stats(&blocklist_stats);
+
     let packet_bypass = match maybe_start_packet_bypass(cfg.evasion.packet_bypass_enabled).await {
         Ok(g) => g,
         Err(e) => {
@@ -103,7 +108,7 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
         let addr = addrs[0];
         relay_opts.bypass_socks5 = Some(addr);
         relay_opts.bypass_socks5_pool = addrs.clone();
-        relay_opts.bypass_domain_check = Some(blocklist_builtin::is_bypass_domain);
+        relay_opts.bypass_domain_check = Some(is_bypass_domain_runtime);
         info!(
             target: "socks_cmd",
             bypass = %addr,

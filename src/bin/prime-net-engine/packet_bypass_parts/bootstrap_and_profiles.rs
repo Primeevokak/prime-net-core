@@ -260,6 +260,27 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                     "4".to_owned(),
                 ],
             },
+            PacketBypassProfile {
+                name: "discord-strong".to_owned(),
+                args: vec![
+                    "--port".to_owned(),
+                    find_free_port().to_string(),
+                    "--split".to_owned(),
+                    "1+s".to_owned(),
+                    "--disorder".to_owned(),
+                    "3+s".to_owned(),
+                    "--tlsrec".to_owned(),
+                    "1+s".to_owned(),
+                    "--auto".to_owned(),
+                    "torst,ssl_err".to_owned(),
+                    "--auto-mode".to_owned(),
+                    "3".to_owned(),
+                    "--cache-ttl".to_owned(),
+                    "3600".to_owned(),
+                    "--timeout".to_owned(),
+                    "7".to_owned(),
+                ],
+            },
         ]
     }
     #[cfg(target_os = "linux")]

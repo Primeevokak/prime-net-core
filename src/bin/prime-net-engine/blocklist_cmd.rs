@@ -5,6 +5,8 @@ use prime_net_engine_core::blocklist::{expand_tilde, update_blocklist, Blocklist
 use prime_net_engine_core::config::BlocklistConfig;
 use prime_net_engine_core::error::Result;
 
+use crate::blocklist_runtime::sync_domains_to_pt_tools;
+
 #[derive(Debug, Clone)]
 pub enum BlocklistAction {
     Update,
@@ -23,11 +25,15 @@ pub async fn run_blocklist(opts: &BlocklistOpts, cfg: &BlocklistConfig) -> Resul
             let source = opts.source_override.as_deref().unwrap_or(&cfg.source);
             let path = cache_path(&cfg.cache_path);
             let cache = update_blocklist(source, &path).await?;
+            let pt_sync = sync_domains_to_pt_tools(&cache.domains).ok().flatten();
             println!(
                 "blocklist updated: {} domains cached at {}",
                 cache.domains.len(),
                 path.display()
             );
+            if let Some(pt_path) = pt_sync {
+                println!("pt-tools domains synced: {}", pt_path.display());
+            }
         }
         BlocklistAction::Status => {
             let path = cache_path(&cfg.cache_path);

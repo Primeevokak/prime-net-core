@@ -624,6 +624,13 @@ fn should_mark_bypass_zero_reply_soft(
     port == 443 && bytes_client_to_bypass > 0 && bytes_bypass_to_client == 0
 }
 
+fn should_mark_empty_bypass_session_as_soft_failure(candidate: &RouteCandidate, port: u16) -> bool {
+    if port != 443 || candidate.kind != RouteKind::Bypass {
+        return false;
+    }
+    matches!(candidate.source, "builtin" | "learned-domain" | "learned-ip")
+}
+
 fn record_bypass_profile_failure(
     destination: &str,
     current_idx: u8,

@@ -322,14 +322,31 @@ async fn handle_client(
                     "bypass tunnel closed"
                 );
                 if should_skip_empty_session_scoring(c2u, u2c) {
-                    info!(
-                        target: "socks5.route",
-                        conn_id,
-                        route_key = %connected.route_key,
-                        route = connected.candidate.route_label(),
-                        destination = %target,
-                        "adaptive route skipped scoring for empty bypass session"
-                    );
+                    if should_mark_empty_bypass_session_as_soft_failure(&connected.candidate, port)
+                    {
+                        record_route_failure(
+                            &connected.route_key,
+                            &connected.candidate,
+                            "zero-reply-soft",
+                        );
+                        warn!(
+                            target: "socks5.route",
+                            conn_id,
+                            route_key = %connected.route_key,
+                            route = connected.candidate.route_label(),
+                            destination = %target,
+                            "adaptive route marked empty bypass session as soft failure"
+                        );
+                    } else {
+                        info!(
+                            target: "socks5.route",
+                            conn_id,
+                            route_key = %connected.route_key,
+                            route = connected.candidate.route_label(),
+                            destination = %target,
+                            "adaptive route skipped scoring for empty bypass session"
+                        );
+                    }
                 } else if should_mark_bypass_profile_failure(
                     port,
                     c2u,

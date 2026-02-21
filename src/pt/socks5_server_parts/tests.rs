@@ -144,6 +144,38 @@ mod tests {
     }
 
     #[test]
+    fn empty_bypass_soft_failure_is_limited_to_blocking_sensitive_sources() {
+        let builtin =
+            RouteCandidate::bypass("builtin", "127.0.0.1:19080".parse().expect("addr"), 0, 3);
+        let learned = RouteCandidate::bypass(
+            "learned-domain",
+            "127.0.0.1:19081".parse().expect("addr"),
+            1,
+            3,
+        );
+        let adaptive = RouteCandidate::bypass(
+            "adaptive-race",
+            "127.0.0.1:19082".parse().expect("addr"),
+            2,
+            3,
+        );
+        let direct = RouteCandidate::direct("adaptive");
+        assert!(should_mark_empty_bypass_session_as_soft_failure(
+            &builtin, 443
+        ));
+        assert!(should_mark_empty_bypass_session_as_soft_failure(
+            &learned, 443
+        ));
+        assert!(!should_mark_empty_bypass_session_as_soft_failure(
+            &adaptive, 443
+        ));
+        assert!(!should_mark_empty_bypass_session_as_soft_failure(&direct, 443));
+        assert!(!should_mark_empty_bypass_session_as_soft_failure(
+            &builtin, 80
+        ));
+    }
+
+    #[test]
     fn empty_session_scoring_is_skipped_only_for_zero_zero_traffic() {
         assert!(should_skip_empty_session_scoring(0, 0));
         assert!(!should_skip_empty_session_scoring(1, 0));

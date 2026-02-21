@@ -30,6 +30,8 @@ pub fn is_bypass_domain(host: &str) -> bool {
         "discordapp.com",
         "discordapp.net",
         "discordcdn.com",
+        "discord.media",
+        "discord.dev",
     ];
     let host = host.trim_end_matches('.');
     for &blocked in BLOCKED {
@@ -63,6 +65,7 @@ mod tests {
         assert!(is_bypass_domain("www.youtube.com"));
         assert!(is_bypass_domain("rr3---sn-ab5l6ne7.googlevideo.com"));
         assert!(is_bypass_domain("gateway.discord.gg"));
+        assert!(is_bypass_domain("cdn.discord.media"));
     }
 
     #[test]

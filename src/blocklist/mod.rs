@@ -113,6 +113,9 @@ fn looks_like_domain(s: &str) -> bool {
         return false;
     }
     let s = s.trim_start_matches("*.");
+    if s.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
     s.contains('.')
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
@@ -220,5 +223,12 @@ mod tests {
         let body = "example.com\nbad_token\napi.example.org";
         let domains = parse_domains_from_text(body);
         assert_eq!(domains, vec!["example.com", "api.example.org"]);
+    }
+
+    #[test]
+    fn parse_domains_ignores_ip_literals() {
+        let body = "1.1.1.1,org\nexample.com,org\n8.8.8.8,org";
+        let domains = parse_domains_from_text(body);
+        assert_eq!(domains, vec!["example.com"]);
     }
 }

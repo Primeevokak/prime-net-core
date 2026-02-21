@@ -1,5 +1,6 @@
 mod blocklist_builtin;
 mod blocklist_cmd;
+mod blocklist_runtime;
 mod config_check;
 mod http_cmd;
 mod logging;
