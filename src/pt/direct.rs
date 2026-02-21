@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -62,15 +63,30 @@ impl DirectOutbound {
                 self.connect_addr_with_timeout(&target_label, addr).await
             }
             TargetAddr::Domain(host) => {
-                let ips = self.resolver.resolve(&host).await?;
-                if ips.is_empty() {
+                let resolved_ips = self.resolver.resolve(&host).await?;
+                if resolved_ips.is_empty() {
                     return Err(EngineError::Internal(format!(
                         "dns resolver returned no IPs for '{}'",
                         host
                     )));
                 }
-
-                let ordered = happy_eyeballs_order(ips);
+                let (ips, dropped_sinkhole) = filter_sinkhole_ips(resolved_ips);
+                if dropped_sinkhole > 0 {
+                    warn!(
+                        target: "outbound.direct",
+                        host = %host,
+                        dropped = dropped_sinkhole,
+                        "Dropped unspecified DNS sinkhole IPs before connect"
+                    );
+                }
+                if ips.is_empty() {
+                    return Err(EngineError::InvalidInput(format!(
+                        "dns resolver returned only unspecified/sinkhole IPs for '{}'",
+                        host
+                    )));
+                }
+                let deduped = dedup_ips_preserve_order(ips);
+                let ordered = happy_eyeballs_order(deduped);
                 let attempts = ordered.len().min(Self::MAX_DOMAIN_IP_ATTEMPTS);
                 let has_v4 = ordered.iter().any(IpAddr::is_ipv4);
                 let has_v6 = ordered.iter().any(IpAddr::is_ipv6);
@@ -162,6 +178,11 @@ impl DirectOutbound {
         target_label: &str,
         addr: std::net::SocketAddr,
     ) -> Result<BoxStream> {
+        if is_unspecified_ip(addr.ip()) {
+            return Err(EngineError::InvalidInput(format!(
+                "direct connect target is unspecified/sinkhole IP: {addr}"
+            )));
+        }
         info!(target: "outbound.direct", destination = %target_label, upstream = %addr, "Direct outbound connect");
         let connect = tokio::time::timeout(Self::CONNECT_TIMEOUT, TcpStream::connect(addr)).await;
         let tcp = match connect {
@@ -367,6 +388,37 @@ fn happy_eyeballs_order(ips: Vec<IpAddr>) -> Vec<IpAddr> {
     out
 }
 
+fn filter_sinkhole_ips(ips: Vec<IpAddr>) -> (Vec<IpAddr>, usize) {
+    let mut out = Vec::with_capacity(ips.len());
+    let mut dropped = 0usize;
+    for ip in ips {
+        if is_unspecified_ip(ip) {
+            dropped += 1;
+            continue;
+        }
+        out.push(ip);
+    }
+    (out, dropped)
+}
+
+fn dedup_ips_preserve_order(ips: Vec<IpAddr>) -> Vec<IpAddr> {
+    let mut seen = HashSet::with_capacity(ips.len());
+    let mut out = Vec::with_capacity(ips.len());
+    for ip in ips {
+        if seen.insert(ip) {
+            out.push(ip);
+        }
+    }
+    out
+}
+
+fn is_unspecified_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_unspecified(),
+        IpAddr::V6(v6) => v6.is_unspecified(),
+    }
+}
+
 impl OutboundConnector for DirectOutbound {
     fn connect<'a>(
         &'a self,
@@ -406,5 +458,36 @@ mod tests {
         assert!(ordered.iter().all(IpAddr::is_ipv4));
         assert_eq!(ordered[0].to_string(), "8.8.8.8");
         assert_eq!(ordered[1].to_string(), "1.1.1.1");
+    }
+
+    #[test]
+    fn filter_sinkhole_ips_drops_unspecified_v4_and_v6() {
+        let ips = vec![
+            "0.0.0.0".parse().expect("v4-unspecified"),
+            "1.1.1.1".parse().expect("v4"),
+            "::".parse().expect("v6-unspecified"),
+            "2001:4860:4860::8888".parse().expect("v6"),
+        ];
+        let (filtered, dropped) = filter_sinkhole_ips(ips);
+        assert_eq!(dropped, 2);
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].to_string(), "1.1.1.1");
+        assert_eq!(filtered[1].to_string(), "2001:4860:4860::8888");
+    }
+
+    #[test]
+    fn dedup_ips_preserve_order_removes_duplicates() {
+        let ips = vec![
+            "1.1.1.1".parse().expect("v4"),
+            "2001:db8::1".parse().expect("v6"),
+            "1.1.1.1".parse().expect("v4-dup"),
+            "2001:db8::1".parse().expect("v6-dup"),
+            "8.8.8.8".parse().expect("v4-second"),
+        ];
+        let deduped = dedup_ips_preserve_order(ips);
+        assert_eq!(deduped.len(), 3);
+        assert_eq!(deduped[0].to_string(), "1.1.1.1");
+        assert_eq!(deduped[1].to_string(), "2001:db8::1");
+        assert_eq!(deduped[2].to_string(), "8.8.8.8");
     }
 }

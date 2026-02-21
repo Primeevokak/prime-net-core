@@ -58,6 +58,11 @@ const ROUTE_SOFT_ZERO_REPLY_MIN_C2U: u64 = 256;
 const ROUTE_CAPABILITY_NET_UNREACHABLE_SECS: u64 = 3 * 60;
 const ROUTE_CAPABILITY_BYPASS_REP03_SECS: u64 = 10 * 60;
 const ROUTE_CAPABILITY_BYPASS_REP_OTHER_SECS: u64 = 4 * 60;
+const GLOBAL_BYPASS_HARD_WEAK_SCORE: i64 = -80;
+const ROUTE_RACE_BASE_DELAY_MS: u64 = 60;
+const ROUTE_RACE_BYPASS_EXTRA_DELAY_MS: u64 = 120;
+const ROUTE_RACE_BYPASS_EXTRA_DELAY_BUILTIN_MS: u64 = 40;
+const ROUTE_RACE_BYPASS_EXTRA_DELAY_LEARNED_MS: u64 = 20;
 
 #[derive(Debug, Clone)]
 pub struct RelayOptions {
@@ -503,9 +508,25 @@ async fn connect_bypass_upstream(
     };
     let _ = bypass.set_nodelay(true);
 
-    bypass.write_all(&[0x05, 0x01, 0x00]).await?;
+    if let Err(e) = bypass.write_all(&[0x05, 0x01, 0x00]).await {
+        record_bypass_profile_failure(
+            target_label,
+            bypass_profile_idx,
+            bypass_profile_total,
+            "handshake-io",
+        );
+        return Err(e.into());
+    }
     let mut method = [0u8; 2];
-    bypass.read_exact(&mut method).await?;
+    if let Err(e) = bypass.read_exact(&mut method).await {
+        record_bypass_profile_failure(
+            target_label,
+            bypass_profile_idx,
+            bypass_profile_total,
+            "handshake-io",
+        );
+        return Err(e.into());
+    }
     if method[0] != 0x05 || method[1] != 0x00 {
         record_bypass_profile_failure(
             target_label,
@@ -540,10 +561,26 @@ async fn connect_bypass_upstream(
         }
     }
     req.extend_from_slice(&target.port.to_be_bytes());
-    bypass.write_all(&req).await?;
+    if let Err(e) = bypass.write_all(&req).await {
+        record_bypass_profile_failure(
+            target_label,
+            bypass_profile_idx,
+            bypass_profile_total,
+            "handshake-io",
+        );
+        return Err(e.into());
+    }
 
     let mut reply_hdr = [0u8; 4];
-    bypass.read_exact(&mut reply_hdr).await?;
+    if let Err(e) = bypass.read_exact(&mut reply_hdr).await {
+        record_bypass_profile_failure(
+            target_label,
+            bypass_profile_idx,
+            bypass_profile_total,
+            "handshake-io",
+        );
+        return Err(e.into());
+    }
     if reply_hdr[0] != 0x05 {
         record_bypass_profile_failure(
             target_label,
@@ -571,19 +608,57 @@ async fn connect_bypass_upstream(
     match reply_hdr[3] {
         0x01 => {
             let mut b = [0u8; 4 + 2];
-            bypass.read_exact(&mut b).await?;
+            if let Err(e) = bypass.read_exact(&mut b).await {
+                record_bypass_profile_failure(
+                    target_label,
+                    bypass_profile_idx,
+                    bypass_profile_total,
+                    "handshake-io",
+                );
+                return Err(e.into());
+            }
         }
         0x03 => {
             let mut l = [0u8; 1];
-            bypass.read_exact(&mut l).await?;
+            if let Err(e) = bypass.read_exact(&mut l).await {
+                record_bypass_profile_failure(
+                    target_label,
+                    bypass_profile_idx,
+                    bypass_profile_total,
+                    "handshake-io",
+                );
+                return Err(e.into());
+            }
             let mut b = vec![0u8; l[0] as usize + 2];
-            bypass.read_exact(&mut b).await?;
+            if let Err(e) = bypass.read_exact(&mut b).await {
+                record_bypass_profile_failure(
+                    target_label,
+                    bypass_profile_idx,
+                    bypass_profile_total,
+                    "handshake-io",
+                );
+                return Err(e.into());
+            }
         }
         0x04 => {
             let mut b = [0u8; 16 + 2];
-            bypass.read_exact(&mut b).await?;
+            if let Err(e) = bypass.read_exact(&mut b).await {
+                record_bypass_profile_failure(
+                    target_label,
+                    bypass_profile_idx,
+                    bypass_profile_total,
+                    "handshake-io",
+                );
+                return Err(e.into());
+            }
         }
         other => {
+            record_bypass_profile_failure(
+                target_label,
+                bypass_profile_idx,
+                bypass_profile_total,
+                "invalid-addr-type",
+            );
             return Err(EngineError::Internal(format!(
                 "bypass invalid addr type: 0x{other:02x}"
             )));
@@ -639,6 +714,19 @@ fn engine_error_bypass_rep_code(err: &EngineError) -> Option<u8> {
     let idx = msg.find(marker)?;
     let hex = msg.get(idx + marker.len()..idx + marker.len() + 2)?;
     u8::from_str_radix(hex, 16).ok()
+}
+
+fn engine_error_is_dns_sinkhole(err: &EngineError) -> bool {
+    let msg = match err {
+        EngineError::InvalidInput(msg) => msg.as_str(),
+        EngineError::Internal(msg) => msg.as_str(),
+        _ => return false,
+    };
+    msg.contains("unspecified/sinkhole IPs")
+}
+
+fn should_ignore_route_failure(candidate: &RouteCandidate, err: &EngineError) -> bool {
+    candidate.kind == RouteKind::Direct && engine_error_is_dns_sinkhole(err)
 }
 
 fn maybe_mark_route_capability_failure(candidate: &RouteCandidate, err: &EngineError) {
@@ -700,14 +788,16 @@ async fn connect_via_best_route(
             reason = route_race_reason_label(race_reason),
             "adaptive route race started"
         );
+        let has_direct = ordered.iter().any(|c| c.kind == RouteKind::Direct);
         let mut set = JoinSet::new();
         for (idx, candidate) in ordered.iter().cloned().enumerate() {
             let outbound = outbound.clone();
             let target = target_endpoint.clone();
             let destination = destination.to_owned();
+            let launch_delay_ms = route_race_candidate_delay_ms(idx, &candidate, has_direct);
             set.spawn(async move {
-                if idx > 0 {
-                    tokio::time::sleep(Duration::from_millis((idx as u64) * 75)).await;
+                if launch_delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(launch_delay_ms)).await;
                 }
                 let started = Instant::now();
                 let res = connect_route_candidate(
@@ -745,7 +835,17 @@ async fn connect_via_best_route(
                 }
                 Ok((candidate, _, Err(e))) => {
                     maybe_mark_route_capability_failure(&candidate, &e);
-                    record_route_failure(&route_key, &candidate, "connect-failed");
+                    if should_ignore_route_failure(&candidate, &e) {
+                        info!(
+                            target: "socks5.route",
+                            route_key = %route_key,
+                            route = %candidate.route_id(),
+                            error = %e,
+                            "route failure ignored due to DNS sinkhole resolution"
+                        );
+                    } else {
+                        record_route_failure(&route_key, &candidate, "connect-failed");
+                    }
                     last_error = Some(e);
                 }
                 Err(e) => {
@@ -782,7 +882,17 @@ async fn connect_via_best_route(
             }
             Err(e) => {
                 maybe_mark_route_capability_failure(&candidate, &e);
-                record_route_failure(&route_key, &candidate, "connect-failed");
+                if should_ignore_route_failure(&candidate, &e) {
+                    info!(
+                        target: "socks5.route",
+                        route_key = %route_key,
+                        route = %candidate.route_id(),
+                        error = %e,
+                        "route failure ignored due to DNS sinkhole resolution"
+                    );
+                } else {
+                    record_route_failure(&route_key, &candidate, "connect-failed");
+                }
                 last_error = Some(e);
             }
         }
@@ -790,6 +900,23 @@ async fn connect_via_best_route(
     Err(last_error.unwrap_or_else(|| {
         EngineError::Internal("failed to connect via all route candidates".to_owned())
     }))
+}
+
+fn route_race_candidate_delay_ms(idx: usize, candidate: &RouteCandidate, has_direct: bool) -> u64 {
+    let base = ROUTE_RACE_BASE_DELAY_MS.saturating_mul(idx as u64);
+    if has_direct && candidate.kind == RouteKind::Bypass {
+        base.saturating_add(route_race_bypass_extra_delay_ms(candidate.source))
+    } else {
+        base
+    }
+}
+
+fn route_race_bypass_extra_delay_ms(source: &str) -> u64 {
+    match source {
+        "builtin" => ROUTE_RACE_BYPASS_EXTRA_DELAY_BUILTIN_MS,
+        "learned-domain" | "learned-ip" => ROUTE_RACE_BYPASS_EXTRA_DELAY_LEARNED_MS,
+        _ => ROUTE_RACE_BYPASS_EXTRA_DELAY_MS,
+    }
 }
 
 async fn handle_client(
@@ -1866,7 +1993,7 @@ fn route_family_for_ip(ip: std::net::IpAddr) -> RouteIpFamily {
 fn route_decision_key(destination: &str, target: &TargetAddr) -> String {
     format!(
         "{}|{}",
-        bypass_profile_key(destination),
+        route_state_key(destination),
         route_family_for_target(target).label()
     )
 }
@@ -1876,6 +2003,20 @@ fn route_destination_key(route_key: &str) -> &str {
         .split_once('|')
         .map(|(k, _)| k)
         .unwrap_or(route_key)
+}
+
+fn route_state_key(destination: &str) -> String {
+    if let Some((host, port)) = split_host_port_for_connect(destination) {
+        let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if normalized_host.is_empty() {
+            return destination.trim().to_ascii_lowercase();
+        }
+        if let Some(ip) = parse_ip_literal(&normalized_host) {
+            return format!("{ip}:{port}");
+        }
+        return format!("{normalized_host}:{port}");
+    }
+    destination.trim().to_ascii_lowercase()
 }
 
 fn route_capability_slot_mut(
@@ -2157,6 +2298,18 @@ fn ordered_route_candidates(
         .collect();
     if filtered.is_empty() {
         filtered = candidates;
+    }
+    let has_healthy_bypass = filtered.iter().any(|candidate| {
+        candidate.kind == RouteKind::Bypass
+            && global_bypass_profile_score(candidate, now) > GLOBAL_BYPASS_HARD_WEAK_SCORE
+    });
+    if has_healthy_bypass {
+        filtered.retain(|candidate| {
+            if candidate.kind != RouteKind::Bypass {
+                return true;
+            }
+            global_bypass_profile_score(candidate, now) > GLOBAL_BYPASS_HARD_WEAK_SCORE
+        });
     }
     filtered.sort_by(|a, b| {
         let a_id = a.route_id();
@@ -2470,10 +2623,18 @@ fn destination_bypass_profile_idx(destination: &str, total: u8) -> u8 {
         return 0;
     }
     let key = bypass_profile_key(destination);
+    let legacy_key = bypass_profile_legacy_service_key(destination);
     let map = DEST_BYPASS_PROFILE_IDX.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(guard) = map.lock() {
+    if let Ok(mut guard) = map.lock() {
         if let Some(v) = guard.get(&key).copied() {
             return v.min(total.saturating_sub(1));
+        }
+        if legacy_key != key {
+            if let Some(v) = guard.get(&legacy_key).copied() {
+                let normalized = v.min(total.saturating_sub(1));
+                guard.insert(key, normalized);
+                return normalized;
+            }
         }
     }
     0
@@ -2566,6 +2727,10 @@ fn record_bypass_profile_success(destination: &str, idx: u8) {
 }
 
 fn bypass_profile_key(destination: &str) -> String {
+    route_state_key(destination)
+}
+
+fn bypass_profile_legacy_service_key(destination: &str) -> String {
     if let Some((host, port)) = split_host_port_for_connect(destination) {
         let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
         if !normalized_host.is_empty() {
@@ -3392,6 +3557,7 @@ async fn relay_bidirectional(
         let mut buf = [0u8; 16 * 1024];
         let mut maybe_tls = None;
 
+        let aggressive_fragment_profile = relay_opts.fragment_size <= 4;
         let fragment_cfg = FragmentConfig {
             first_write_max: relay_opts.fragment_size.clamp(1, 64),
             first_write_plan: if relay_opts.client_hello_split_offsets.is_empty() {
@@ -3401,8 +3567,12 @@ async fn relay_bidirectional(
             },
             fragment_size: relay_opts.fragment_size.max(1),
             sleep_ms: relay_opts.fragment_sleep_ms,
-            jitter_ms: None,
-            randomize_fragment_size: false,
+            jitter_ms: if aggressive_fragment_profile && relay_opts.fragment_sleep_ms == 0 {
+                Some((0, 3))
+            } else {
+                None
+            },
+            randomize_fragment_size: aggressive_fragment_profile,
             split_at_sni: relay_opts.split_at_sni,
         };
         let (mut frag_upstream_w, frag_handle) =
@@ -4148,6 +4318,21 @@ mod tests {
         }
     }
 
+    fn clear_bypass_profile_state_for_test() {
+        if let Ok(mut guard) = DEST_BYPASS_PROFILE_IDX
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+        {
+            guard.clear();
+        }
+        if let Ok(mut guard) = DEST_BYPASS_PROFILE_FAILURES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+        {
+            guard.clear();
+        }
+    }
+
     fn clear_route_capabilities_for_test() {
         if let Ok(mut guard) = ROUTE_CAPABILITIES
             .get_or_init(|| Mutex::new(RouteCapabilities::default()))
@@ -4227,6 +4412,21 @@ mod tests {
     }
 
     #[test]
+    fn route_decision_key_is_host_specific_for_domains() {
+        let key_api = route_decision_key(
+            "api.github.com:443",
+            &TargetAddr::Domain("api.github.com".to_owned()),
+        );
+        let key_collector = route_decision_key(
+            "collector.github.com:443",
+            &TargetAddr::Domain("collector.github.com".to_owned()),
+        );
+        assert_ne!(key_api, key_collector);
+        assert!(key_api.starts_with("api.github.com:443|"));
+        assert!(key_collector.starts_with("collector.github.com:443|"));
+    }
+
+    #[test]
     fn bypass_zero_reply_soft_marks_tls_zero_reply_after_any_payload() {
         assert!(should_mark_bypass_zero_reply_soft(443, 1, 0));
         assert!(should_mark_bypass_zero_reply_soft(443, 120, 0));
@@ -4285,6 +4485,35 @@ mod tests {
             guard.remove(&pub_key);
             guard.remove(&loopback_key);
         }
+    }
+
+    #[test]
+    fn bypass_profile_rotation_is_host_specific() {
+        clear_bypass_profile_state_for_test();
+        record_bypass_profile_failure("api.github.com:443", 0, 3, "unit-test");
+        assert_eq!(destination_bypass_profile_idx("api.github.com:443", 3), 1);
+        assert_eq!(
+            destination_bypass_profile_idx("collector.github.com:443", 3),
+            0
+        );
+        clear_bypass_profile_state_for_test();
+    }
+
+    #[test]
+    fn bypass_profile_index_uses_legacy_service_key_fallback() {
+        clear_bypass_profile_state_for_test();
+        let service_key = bypass_profile_legacy_service_key("api.github.com:443");
+        if let Ok(mut guard) = DEST_BYPASS_PROFILE_IDX
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+        {
+            guard.insert(service_key, 2);
+        }
+        assert_eq!(
+            destination_bypass_profile_idx("collector.github.com:443", 3),
+            2
+        );
+        clear_bypass_profile_state_for_test();
     }
 
     #[test]
@@ -4501,21 +4730,23 @@ mod tests {
                 },
             );
         }
-        let relay_opts = RelayOptions {
-            bypass_socks5_pool: vec![
-                "127.0.0.1:19080".parse().expect("addr"),
-                "127.0.0.1:19081".parse().expect("addr"),
-            ],
-            ..RelayOptions::default()
-        };
         let route_key = "global-bypass-health:443";
         clear_route_state_for_test(route_key);
-        let candidates = select_route_candidates(
-            &relay_opts,
-            &TargetAddr::Domain("example.org".to_owned()),
-            443,
-            "example.org:443",
-        );
+        let candidates = vec![
+            RouteCandidate::direct("adaptive"),
+            RouteCandidate::bypass(
+                "adaptive-race",
+                "127.0.0.1:19080".parse().expect("addr"),
+                0,
+                2,
+            ),
+            RouteCandidate::bypass(
+                "adaptive-race",
+                "127.0.0.1:19081".parse().expect("addr"),
+                1,
+                2,
+            ),
+        ];
         let ordered = ordered_route_candidates(route_key, candidates);
         let pos1 = ordered
             .iter()
@@ -4544,6 +4775,90 @@ mod tests {
             ordered.first().map(|c| c.route_id()),
             Some("direct".to_owned())
         );
+        clear_route_state_for_test(route_key);
+    }
+
+    #[test]
+    fn route_race_delays_bypass_when_direct_is_present() {
+        let direct = RouteCandidate::direct("adaptive");
+        let bypass =
+            RouteCandidate::bypass("builtin", "127.0.0.1:19080".parse().expect("addr"), 0, 1);
+        let bypass_adaptive = RouteCandidate::bypass(
+            "adaptive-race",
+            "127.0.0.1:19081".parse().expect("addr"),
+            0,
+            1,
+        );
+        assert_eq!(route_race_candidate_delay_ms(0, &direct, true), 0);
+        assert_eq!(
+            route_race_candidate_delay_ms(1, &bypass, true),
+            ROUTE_RACE_BASE_DELAY_MS + ROUTE_RACE_BYPASS_EXTRA_DELAY_BUILTIN_MS
+        );
+        assert_eq!(
+            route_race_candidate_delay_ms(1, &bypass_adaptive, true),
+            ROUTE_RACE_BASE_DELAY_MS + ROUTE_RACE_BYPASS_EXTRA_DELAY_MS
+        );
+        assert_eq!(
+            route_race_candidate_delay_ms(1, &bypass, false),
+            ROUTE_RACE_BASE_DELAY_MS
+        );
+    }
+
+    #[test]
+    fn hard_weak_global_bypass_profiles_are_pruned_when_healthier_exists() {
+        clear_global_bypass_health_for_test();
+        let now = now_unix_secs();
+        if let Ok(mut guard) = GLOBAL_BYPASS_PROFILE_HEALTH
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+        {
+            guard.insert(
+                "bypass:1".to_owned(),
+                BypassProfileHealth {
+                    successes: 5,
+                    last_success_unix: now,
+                    ..BypassProfileHealth::default()
+                },
+            );
+            guard.insert(
+                "bypass:2".to_owned(),
+                BypassProfileHealth {
+                    failures: 40,
+                    connect_failures: 20,
+                    soft_zero_replies: 20,
+                    last_failure_unix: now,
+                    ..BypassProfileHealth::default()
+                },
+            );
+        }
+        let route_key = "hard-weak-prune:443";
+        clear_route_state_for_test(route_key);
+        let candidates = vec![
+            RouteCandidate::direct("test"),
+            RouteCandidate::bypass("test", "127.0.0.1:19080".parse().expect("addr"), 0, 2),
+            RouteCandidate::bypass("test", "127.0.0.1:19081".parse().expect("addr"), 1, 2),
+        ];
+        let ordered = ordered_route_candidates(route_key, candidates);
+        assert!(ordered.iter().any(|c| c.route_id() == "bypass:1"));
+        assert!(!ordered.iter().any(|c| c.route_id() == "bypass:2"));
+        clear_route_state_for_test(route_key);
+        clear_global_bypass_health_for_test();
+    }
+
+    #[test]
+    fn direct_sinkhole_dns_errors_do_not_penalize_route_health() {
+        let route_key = "direct-sinkhole-ignore:443";
+        clear_route_state_for_test(route_key);
+        let candidate = RouteCandidate::direct("test");
+        let err = EngineError::InvalidInput(
+            "dns resolver returned only unspecified/sinkhole IPs for 'blocked.example'".to_owned(),
+        );
+        assert!(should_ignore_route_failure(&candidate, &err));
+        assert!(!route_is_temporarily_weak(
+            route_key,
+            &candidate.route_id(),
+            now_unix_secs()
+        ));
         clear_route_state_for_test(route_key);
     }
 }
