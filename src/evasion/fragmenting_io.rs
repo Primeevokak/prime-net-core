@@ -175,40 +175,85 @@ impl<T> FragmentingIo<T> {
 
 fn find_sni_offset(client_hello: &[u8]) -> Option<usize> {
     let b = client_hello;
-    if b.len() < 5 + 4 + 2 + 32 + 1 {
+    if b.len() < 5 {
         return None;
     }
-    if b[0] != 0x16 || b[1] != 0x03 {
+    if b[0] != 0x16 {
+        return None;
+    }
+    let record_len = read_u16(b, 3)? as usize;
+    let record_end = 5usize.checked_add(record_len)?;
+    if record_end > b.len() {
         return None;
     }
 
-    let mut pos = 5 + 4 + 2 + 32;
-    if pos >= b.len() {
+    let mut pos = 5usize;
+    if pos + 4 > record_end || b[pos] != 0x01 {
         return None;
     }
+    let hs_len = read_u24(b, pos + 1)? as usize;
+    pos = pos.checked_add(4)?;
+    let hs_end = pos.checked_add(hs_len)?;
+    if hs_end > record_end {
+        return None;
+    }
+
+    if pos + 2 + 32 > hs_end {
+        return None;
+    }
+    pos = pos.checked_add(2 + 32)?;
 
     let session_id_len = *b.get(pos)? as usize;
     pos = pos.checked_add(1 + session_id_len)?;
+    if pos > hs_end {
+        return None;
+    }
 
-    let cs_len = u16::from_be_bytes([*b.get(pos)?, *b.get(pos + 1)?]) as usize;
+    let cs_len = read_u16(b, pos)? as usize;
     pos = pos.checked_add(2 + cs_len)?;
+    if pos > hs_end {
+        return None;
+    }
 
     let cm_len = *b.get(pos)? as usize;
     pos = pos.checked_add(1 + cm_len)?;
+    if pos > hs_end {
+        return None;
+    }
 
-    let ext_total = u16::from_be_bytes([*b.get(pos)?, *b.get(pos + 1)?]) as usize;
+    let ext_total = read_u16(b, pos)? as usize;
     pos = pos.checked_add(2)?;
-    let ext_end = pos.checked_add(ext_total)?.min(b.len());
+    let ext_end = pos.checked_add(ext_total)?;
+    if ext_end > hs_end {
+        return None;
+    }
 
     while pos + 4 <= ext_end {
-        let ext_type = u16::from_be_bytes([b[pos], b[pos + 1]]);
-        let ext_len = u16::from_be_bytes([b[pos + 2], b[pos + 3]]) as usize;
+        let ext_type = read_u16(b, pos)?;
+        let ext_len = read_u16(b, pos + 2)? as usize;
+        let next = pos.checked_add(4 + ext_len)?;
+        if next > ext_end {
+            return None;
+        }
         if ext_type == 0x0000 {
             return Some(pos);
         }
-        pos = pos.checked_add(4 + ext_len)?;
+        pos = next;
     }
     None
+}
+
+fn read_u16(buf: &[u8], pos: usize) -> Option<u16> {
+    let b0 = *buf.get(pos)?;
+    let b1 = *buf.get(pos + 1)?;
+    Some(u16::from_be_bytes([b0, b1]))
+}
+
+fn read_u24(buf: &[u8], pos: usize) -> Option<u32> {
+    let b0 = *buf.get(pos)? as u32;
+    let b1 = *buf.get(pos + 1)? as u32;
+    let b2 = *buf.get(pos + 2)? as u32;
+    Some((b0 << 16) | (b1 << 8) | b2)
 }
 
 impl<T: AsyncRead + Unpin> AsyncRead for FragmentingIo<T> {
@@ -298,5 +343,78 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for FragmentingIo<T> {
             }
         }
         Poll::Ready(Ok(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_client_hello(host: &str, include_padding_extension: bool) -> Vec<u8> {
+        let host = host.as_bytes();
+        let sni_name_len = host.len() as u16;
+        let sni_list_len = 1 + 2 + sni_name_len;
+        let sni_ext_len = 2 + sni_list_len;
+
+        let mut exts = Vec::new();
+        if include_padding_extension {
+            exts.extend_from_slice(&0x0015u16.to_be_bytes());
+            exts.extend_from_slice(&2u16.to_be_bytes());
+            exts.extend_from_slice(&[0x00, 0x00]);
+        }
+        exts.extend_from_slice(&0x0000u16.to_be_bytes());
+        exts.extend_from_slice(&sni_ext_len.to_be_bytes());
+        exts.extend_from_slice(&sni_list_len.to_be_bytes());
+        exts.push(0x00);
+        exts.extend_from_slice(&sni_name_len.to_be_bytes());
+        exts.extend_from_slice(host);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0u8; 32]);
+        body.push(0x00);
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&[0x13, 0x01]);
+        body.push(0x01);
+        body.push(0x00);
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+
+        let mut hs = Vec::new();
+        hs.push(0x01);
+        let hs_len = body.len() as u32;
+        hs.extend_from_slice(&[(hs_len >> 16) as u8, (hs_len >> 8) as u8, hs_len as u8]);
+        hs.extend_from_slice(&body);
+
+        let mut record = Vec::new();
+        record.push(0x16);
+        record.extend_from_slice(&[0x03, 0x01]);
+        record.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        record.extend_from_slice(&hs);
+        record
+    }
+
+    #[test]
+    fn find_sni_offset_basic_client_hello() {
+        let ch = build_client_hello("example.com", false);
+        assert_eq!(find_sni_offset(&ch), Some(52));
+    }
+
+    #[test]
+    fn find_sni_offset_with_padding_extension() {
+        let ch = build_client_hello("example.com", true);
+        assert_eq!(find_sni_offset(&ch), Some(58));
+    }
+
+    #[test]
+    fn split_at_sni_gracefully_falls_back_when_parse_fails() {
+        let cfg = FragmentConfig {
+            split_at_sni: true,
+            first_write_max: 7,
+            ..FragmentConfig::default()
+        };
+        let (mut io, _handle) = FragmentingIo::new(tokio::io::sink(), cfg);
+        let first = io.next_write_limit(b"not a tls client hello");
+        assert_eq!(first, 7);
     }
 }

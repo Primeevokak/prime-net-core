@@ -112,27 +112,31 @@ const PRIME_ERR_RUNTIME: i32 = 4;
 
 #[no_mangle]
 pub extern "C" fn prime_engine_new(config_path: *const c_char) -> *mut PrimeEngine {
-    let result = create_engine(config_path);
-    match result {
-        Ok(handle) => Box::into_raw(Box::new(handle)) as *mut PrimeEngine,
-        Err(err) => {
-            set_last_error(err);
-            ptr::null_mut()
+    ffi_guard("prime_engine_new", ptr::null_mut, || {
+        let result = create_engine(config_path);
+        match result {
+            Ok(handle) => Box::into_raw(Box::new(handle)) as *mut PrimeEngine,
+            Err(err) => {
+                set_last_error(err);
+                ptr::null_mut()
+            }
         }
-    }
+    })
 }
 
 #[no_mangle]
 /// # Safety
 /// `engine` must be a pointer previously returned by `prime_engine_new`, not yet freed.
 pub unsafe extern "C" fn prime_engine_free(engine: *mut PrimeEngine) {
-    if engine.is_null() {
-        return;
-    }
-    // SAFETY: pointer was created by prime_engine_new and is unique here.
-    unsafe {
-        let _ = Box::from_raw(engine as *mut PrimeEngineHandle);
-    }
+    ffi_guard("prime_engine_free", || (), || {
+        if engine.is_null() {
+            return;
+        }
+        // SAFETY: pointer was created by prime_engine_new and is unique here.
+        unsafe {
+            let _ = Box::from_raw(engine as *mut PrimeEngineHandle);
+        }
+    });
 }
 
 #[no_mangle]
@@ -145,51 +149,57 @@ pub unsafe extern "C" fn prime_engine_fetch(
     callback: ProgressCallback,
     user_data: *mut c_void,
 ) -> *mut PrimeResponse {
-    if engine.is_null() {
-        return pack_error(PRIME_ERR_NULL_PTR, "engine pointer is null");
-    }
-    if request.is_null() {
-        return pack_error(PRIME_ERR_NULL_PTR, "request pointer is null");
-    }
+    ffi_guard(
+        "prime_engine_fetch",
+        || pack_error(PRIME_ERR_RUNTIME, "Rust panic occurred in prime_engine_fetch"),
+        || {
+            if engine.is_null() {
+                return pack_error(PRIME_ERR_NULL_PTR, "engine pointer is null");
+            }
+            if request.is_null() {
+                return pack_error(PRIME_ERR_NULL_PTR, "request pointer is null");
+            }
 
-    let parsed_request = match parse_request(unsafe { &*request }) {
-        Ok(req) => req,
-        Err(err) => return pack_error(error_code_from(&err), &err.to_string()),
-    };
+            let parsed_request = match parse_request(unsafe { &*request }) {
+                Ok(req) => req,
+                Err(err) => return pack_error(error_code_from(&err), &err.to_string()),
+            };
 
-    let progress_context = FfiProgressContext {
-        callback,
-        user_data_bits: user_data as usize,
-    };
-    let progress_hook: Option<ProgressHook> = if callback.is_some() {
-        let ctx = progress_context;
-        Some(Arc::new(move |downloaded, total, speed_mbps| {
-            ctx.emit(downloaded, total, speed_mbps);
-        }))
-    } else {
-        None
-    };
+            let progress_context = FfiProgressContext {
+                callback,
+                user_data_bits: user_data as usize,
+            };
+            let progress_hook: Option<ProgressHook> = if callback.is_some() {
+                let ctx = progress_context;
+                Some(Arc::new(move |downloaded, total, speed_mbps| {
+                    ctx.emit(downloaded, total, speed_mbps);
+                }))
+            } else {
+                None
+            };
 
-    let eng = unsafe { &*(engine as *mut PrimeEngineHandle) };
-    let (tx, rx) = std::sync::mpsc::channel();
-    let (abort_tx, _abort_rx) = std::sync::mpsc::channel::<AbortHandle>();
-    let status = Arc::new(AtomicU8::new(PrimeRequestStatus::PENDING as u8));
-    let task = FfiTask {
-        request: parsed_request,
-        progress: progress_hook,
-        result_tx: tx,
-        status,
-        abort_tx,
-    };
-    if eng.msg_tx.send(EngineMsg::Task(task)).is_err() {
-        return pack_error(PRIME_ERR_RUNTIME, "engine runtime thread is not running");
-    }
+            let eng = unsafe { &*(engine as *mut PrimeEngineHandle) };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (abort_tx, _abort_rx) = std::sync::mpsc::channel::<AbortHandle>();
+            let status = Arc::new(AtomicU8::new(PrimeRequestStatus::PENDING as u8));
+            let task = FfiTask {
+                request: parsed_request,
+                progress: progress_hook,
+                result_tx: tx,
+                status,
+                abort_tx,
+            };
+            if eng.msg_tx.send(EngineMsg::Task(task)).is_err() {
+                return pack_error(PRIME_ERR_RUNTIME, "engine runtime thread is not running");
+            }
 
-    match rx.recv() {
-        Ok(Ok(response)) => pack_ok(response),
-        Ok(Err(err)) => pack_error(error_code_from(&err), &err.to_string()),
-        Err(_) => pack_error(PRIME_ERR_RUNTIME, "request was cancelled (engine dropped)"),
-    }
+            match rx.recv() {
+                Ok(Ok(response)) => pack_ok(response),
+                Ok(Err(err)) => pack_error(error_code_from(&err), &err.to_string()),
+                Err(_) => pack_error(PRIME_ERR_RUNTIME, "request was cancelled (engine dropped)"),
+            }
+        },
+    )
 }
 
 #[no_mangle]
@@ -202,72 +212,74 @@ pub unsafe extern "C" fn prime_engine_fetch_async(
     callback: ProgressCallback,
     user_data: *mut c_void,
 ) -> *mut PrimeRequestHandle {
-    if engine.is_null() {
-        set_last_error(EngineError::NullPointer("engine"));
-        return ptr::null_mut();
-    }
-    if request.is_null() {
-        set_last_error(EngineError::NullPointer("request"));
-        return ptr::null_mut();
-    }
-
-    let parsed_request = match parse_request(unsafe { &*request }) {
-        Ok(req) => req,
-        Err(err) => {
-            set_last_error(err);
+    ffi_guard("prime_engine_fetch_async", ptr::null_mut, || {
+        if engine.is_null() {
+            set_last_error(EngineError::NullPointer("engine"));
             return ptr::null_mut();
         }
-    };
+        if request.is_null() {
+            set_last_error(EngineError::NullPointer("request"));
+            return ptr::null_mut();
+        }
 
-    let progress_context = FfiProgressContext {
-        callback,
-        user_data_bits: user_data as usize,
-    };
-    let progress_hook: Option<ProgressHook> = if callback.is_some() {
-        let ctx = progress_context;
-        Some(Arc::new(move |downloaded, total, speed_mbps| {
-            ctx.emit(downloaded, total, speed_mbps);
-        }))
-    } else {
-        None
-    };
+        let parsed_request = match parse_request(unsafe { &*request }) {
+            Ok(req) => req,
+            Err(err) => {
+                set_last_error(err);
+                return ptr::null_mut();
+            }
+        };
 
-    // SAFETY: validated non-null pointer created by prime_engine_new.
-    let eng = unsafe { &*(engine as *mut PrimeEngineHandle) };
+        let progress_context = FfiProgressContext {
+            callback,
+            user_data_bits: user_data as usize,
+        };
+        let progress_hook: Option<ProgressHook> = if callback.is_some() {
+            let ctx = progress_context;
+            Some(Arc::new(move |downloaded, total, speed_mbps| {
+                ctx.emit(downloaded, total, speed_mbps);
+            }))
+        } else {
+            None
+        };
 
-    let (tx, rx) = std::sync::mpsc::channel();
-    let (abort_tx, abort_rx) = std::sync::mpsc::channel::<AbortHandle>();
-    let status = Arc::new(AtomicU8::new(PrimeRequestStatus::PENDING as u8));
-    let task = FfiTask {
-        request: parsed_request,
-        progress: progress_hook,
-        result_tx: tx.clone(),
-        status: status.clone(),
-        abort_tx,
-    };
-    if eng.msg_tx.send(EngineMsg::Task(task)).is_err() {
-        set_last_error(EngineError::Internal(
-            "engine runtime thread is not running".to_owned(),
-        ));
-        return ptr::null_mut();
-    }
+        // SAFETY: validated non-null pointer created by prime_engine_new.
+        let eng = unsafe { &*(engine as *mut PrimeEngineHandle) };
 
-    let abort = match abort_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(v) => v,
-        Err(_) => {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (abort_tx, abort_rx) = std::sync::mpsc::channel::<AbortHandle>();
+        let status = Arc::new(AtomicU8::new(PrimeRequestStatus::PENDING as u8));
+        let task = FfiTask {
+            request: parsed_request,
+            progress: progress_hook,
+            result_tx: tx.clone(),
+            status: status.clone(),
+            abort_tx,
+        };
+        if eng.msg_tx.send(EngineMsg::Task(task)).is_err() {
             set_last_error(EngineError::Internal(
-                "engine did not acknowledge async request (abort handle missing)".to_owned(),
+                "engine runtime thread is not running".to_owned(),
             ));
             return ptr::null_mut();
         }
-    };
 
-    Box::into_raw(Box::new(PrimeRequestHandleInner {
-        rx: parking_lot::Mutex::new(rx),
-        tx,
-        status,
-        abort: parking_lot::Mutex::new(Some(abort)),
-    })) as *mut PrimeRequestHandle
+        let abort = match abort_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(v) => v,
+            Err(_) => {
+                set_last_error(EngineError::Internal(
+                    "engine did not acknowledge async request (abort handle missing)".to_owned(),
+                ));
+                return ptr::null_mut();
+            }
+        };
+
+        Box::into_raw(Box::new(PrimeRequestHandleInner {
+            rx: parking_lot::Mutex::new(rx),
+            tx,
+            status,
+            abort: parking_lot::Mutex::new(Some(abort)),
+        })) as *mut PrimeRequestHandle
+    })
 }
 
 #[no_mangle]
@@ -278,100 +290,107 @@ pub unsafe extern "C" fn prime_request_wait(
     handle: *mut PrimeRequestHandle,
     timeout_ms: u64,
 ) -> *mut PrimeResponse {
-    if handle.is_null() {
-        return pack_error(PRIME_ERR_NULL_PTR, "request handle pointer is null");
-    }
-    // SAFETY: pointer was allocated by prime_engine_fetch_async.
-    let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
+    ffi_guard(
+        "prime_request_wait",
+        || pack_error(PRIME_ERR_RUNTIME, "Rust panic occurred in prime_request_wait"),
+        || {
+            if handle.is_null() {
+                return pack_error(PRIME_ERR_NULL_PTR, "request handle pointer is null");
+            }
+            // SAFETY: pointer was allocated by prime_engine_fetch_async.
+            let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
 
-    // Best-effort: if already cancelled, return immediately.
-    if inner.status.load(Ordering::SeqCst) == PrimeRequestStatus::CANCELLED as u8 {
-        unsafe { drop(Box::from_raw(handle as *mut PrimeRequestHandleInner)) };
-        return pack_error(PRIME_ERR_RUNTIME, "cancelled");
-    }
+            // Best-effort: if already cancelled, return immediately.
+            if inner.status.load(Ordering::SeqCst) == PrimeRequestStatus::CANCELLED as u8 {
+                unsafe { drop(Box::from_raw(handle as *mut PrimeRequestHandleInner)) };
+                return pack_error(PRIME_ERR_RUNTIME, "cancelled");
+            }
 
-    let res =
-        if timeout_ms == 0 {
-            inner.rx.lock().recv().map_err(|_| {
-                EngineError::Internal("request was cancelled (engine dropped)".to_owned())
-            })
-        } else {
-            inner
-                .rx
-                .lock()
-                .recv_timeout(Duration::from_millis(timeout_ms))
-                .map_err(|e| match e {
-                    std::sync::mpsc::RecvTimeoutError::Timeout => {
-                        EngineError::Internal("timeout".to_owned())
-                    }
-                    std::sync::mpsc::RecvTimeoutError::Disconnected => {
-                        EngineError::Internal("request was cancelled (engine dropped)".to_owned())
-                    }
+            let res = if timeout_ms == 0 {
+                inner.rx.lock().recv().map_err(|_| {
+                    EngineError::Internal("request was cancelled (engine dropped)".to_owned())
                 })
-        };
+            } else {
+                inner
+                    .rx
+                    .lock()
+                    .recv_timeout(Duration::from_millis(timeout_ms))
+                    .map_err(|e| match e {
+                        std::sync::mpsc::RecvTimeoutError::Timeout => {
+                            EngineError::Internal("timeout".to_owned())
+                        }
+                        std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                            EngineError::Internal("request was cancelled (engine dropped)".to_owned())
+                        }
+                    })
+            };
 
-    match res {
-        Ok(Ok(response)) => {
-            inner
-                .status
-                .store(PrimeRequestStatus::COMPLETED as u8, Ordering::SeqCst);
-            // SAFETY: we are done with the handle; free it.
-            unsafe { drop(Box::from_raw(handle as *mut PrimeRequestHandleInner)) };
-            pack_ok(response)
-        }
-        Ok(Err(err)) => {
-            inner
-                .status
-                .store(PrimeRequestStatus::FAILED as u8, Ordering::SeqCst);
-            unsafe { drop(Box::from_raw(handle as *mut PrimeRequestHandleInner)) };
-            pack_error(error_code_from(&err), &err.to_string())
-        }
-        Err(EngineError::Internal(msg)) if msg == "timeout" => {
-            // Keep handle alive so caller can wait again later.
-            pack_error(PRIME_ERR_RUNTIME, "timeout")
-        }
-        Err(err) => {
-            inner
-                .status
-                .store(PrimeRequestStatus::FAILED as u8, Ordering::SeqCst);
-            unsafe { drop(Box::from_raw(handle as *mut PrimeRequestHandleInner)) };
-            pack_error(error_code_from(&err), &err.to_string())
-        }
-    }
+            match res {
+                Ok(Ok(response)) => {
+                    inner
+                        .status
+                        .store(PrimeRequestStatus::COMPLETED as u8, Ordering::SeqCst);
+                    // SAFETY: we are done with the handle; free it.
+                    unsafe { drop(Box::from_raw(handle as *mut PrimeRequestHandleInner)) };
+                    pack_ok(response)
+                }
+                Ok(Err(err)) => {
+                    inner
+                        .status
+                        .store(PrimeRequestStatus::FAILED as u8, Ordering::SeqCst);
+                    unsafe { drop(Box::from_raw(handle as *mut PrimeRequestHandleInner)) };
+                    pack_error(error_code_from(&err), &err.to_string())
+                }
+                Err(EngineError::Internal(msg)) if msg == "timeout" => {
+                    // Keep handle alive so caller can wait again later.
+                    pack_error(PRIME_ERR_RUNTIME, "timeout")
+                }
+                Err(err) => {
+                    inner
+                        .status
+                        .store(PrimeRequestStatus::FAILED as u8, Ordering::SeqCst);
+                    unsafe { drop(Box::from_raw(handle as *mut PrimeRequestHandleInner)) };
+                    pack_error(error_code_from(&err), &err.to_string())
+                }
+            }
+        },
+    )
 }
 
 #[no_mangle]
 /// # Safety
 /// `handle` must be a valid pointer returned by `prime_engine_fetch_async`.
 pub unsafe extern "C" fn prime_request_cancel(handle: *mut PrimeRequestHandle) -> i32 {
-    if handle.is_null() {
-        return PRIME_ERR_NULL_PTR;
-    }
-    // SAFETY: pointer was allocated by prime_engine_fetch_async.
-    let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
+    ffi_guard("prime_request_cancel", || PRIME_ERR_RUNTIME, || {
+        if handle.is_null() {
+            return PRIME_ERR_NULL_PTR;
+        }
+        // SAFETY: pointer was allocated by prime_engine_fetch_async.
+        let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
 
-    let cur = inner.status.load(Ordering::SeqCst);
-    if cur == PrimeRequestStatus::COMPLETED as u8 || cur == PrimeRequestStatus::FAILED as u8 {
-        return PRIME_OK;
-    }
-    if cur == PrimeRequestStatus::CANCELLED as u8 {
-        return PRIME_OK;
-    }
+        let cur = inner.status.load(Ordering::SeqCst);
+        if cur == PrimeRequestStatus::COMPLETED as u8 || cur == PrimeRequestStatus::FAILED as u8 {
+            return PRIME_OK;
+        }
+        if cur == PrimeRequestStatus::CANCELLED as u8 {
+            return PRIME_OK;
+        }
 
-    inner
-        .status
-        .store(PrimeRequestStatus::CANCELLED as u8, Ordering::SeqCst);
+        inner
+            .status
+            .store(PrimeRequestStatus::CANCELLED as u8, Ordering::SeqCst);
 
-    if let Some(abort) = inner.abort.lock().as_ref() {
-        abort.abort();
-    }
+        if let Some(abort) = inner.abort.lock().as_ref() {
+            abort.abort();
+        }
 
-    // Wake any waiter (best-effort). The runtime task may still deliver a result if it already finished.
-    let _ = inner
-        .tx
-        .send(Err(EngineError::Internal("cancelled".to_owned())));
+        // Wake any waiter (best-effort). The runtime task may still deliver a result if it already finished.
+        let _ = inner
+            .tx
+            .send(Err(EngineError::Internal("cancelled".to_owned())));
 
-    PRIME_OK
+        PRIME_OK
+    })
 }
 
 #[no_mangle]
@@ -380,32 +399,36 @@ pub unsafe extern "C" fn prime_request_cancel(handle: *mut PrimeRequestHandle) -
 pub unsafe extern "C" fn prime_request_status(
     handle: *mut PrimeRequestHandle,
 ) -> PrimeRequestStatus {
-    if handle.is_null() {
-        return PrimeRequestStatus::FAILED;
-    }
-    // SAFETY: pointer was allocated by prime_engine_fetch_async.
-    let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
-    match inner.status.load(Ordering::SeqCst) {
-        0 => PrimeRequestStatus::PENDING,
-        1 => PrimeRequestStatus::RUNNING,
-        2 => PrimeRequestStatus::COMPLETED,
-        3 => PrimeRequestStatus::CANCELLED,
-        _ => PrimeRequestStatus::FAILED,
-    }
+    ffi_guard("prime_request_status", || PrimeRequestStatus::FAILED, || {
+        if handle.is_null() {
+            return PrimeRequestStatus::FAILED;
+        }
+        // SAFETY: pointer was allocated by prime_engine_fetch_async.
+        let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
+        match inner.status.load(Ordering::SeqCst) {
+            0 => PrimeRequestStatus::PENDING,
+            1 => PrimeRequestStatus::RUNNING,
+            2 => PrimeRequestStatus::COMPLETED,
+            3 => PrimeRequestStatus::CANCELLED,
+            _ => PrimeRequestStatus::FAILED,
+        }
+    })
 }
 
 #[no_mangle]
 /// # Safety
 /// `handle` must be a valid pointer returned by `prime_engine_fetch_async` and not already freed.
 pub unsafe extern "C" fn prime_request_free(handle: *mut PrimeRequestHandle) {
-    if handle.is_null() {
-        return;
-    }
-    // Best-effort: cancel underlying task to avoid background network activity after handle free.
-    let _ = unsafe { prime_request_cancel(handle) };
-    unsafe {
-        drop(Box::from_raw(handle as *mut PrimeRequestHandleInner));
-    }
+    ffi_guard("prime_request_free", || (), || {
+        if handle.is_null() {
+            return;
+        }
+        // Best-effort: cancel underlying task to avoid background network activity after handle free.
+        let _ = unsafe { prime_request_cancel(handle) };
+        unsafe {
+            drop(Box::from_raw(handle as *mut PrimeRequestHandleInner));
+        }
+    });
 }
 
 #[no_mangle]
@@ -413,22 +436,26 @@ pub unsafe extern "C" fn prime_request_free(handle: *mut PrimeRequestHandle) {
 /// `response` must be a pointer previously returned by `prime_engine_fetch` or `prime_request_wait`
 /// and not already freed via `prime_response_free`.
 pub unsafe extern "C" fn prime_response_free(response: *mut PrimeResponse) {
-    if response.is_null() {
-        return;
-    }
-    // SAFETY: response pointer was allocated in pack_response.
-    unsafe {
-        let boxed = Box::from_raw(response);
-        if !boxed.owner.is_null() {
-            let _ = Box::from_raw(boxed.owner as *mut OwnedPrimeResponse);
+    ffi_guard("prime_response_free", || (), || {
+        if response.is_null() {
+            return;
         }
-    }
+        // SAFETY: response pointer was allocated in pack_response.
+        unsafe {
+            let boxed = Box::from_raw(response);
+            if !boxed.owner.is_null() {
+                let _ = Box::from_raw(boxed.owner as *mut OwnedPrimeResponse);
+            }
+        }
+    });
 }
 
 #[no_mangle]
 pub extern "C" fn prime_last_error_message() -> *const c_char {
-    let guard = LAST_ERROR.lock();
-    guard.as_ref().map_or(ptr::null(), |msg| msg.as_ptr())
+    ffi_guard("prime_last_error_message", ptr::null, || {
+        let guard = LAST_ERROR.lock();
+        guard.as_ref().map_or(ptr::null(), |msg| msg.as_ptr())
+    })
 }
 
 fn create_engine(config_path: *const c_char) -> Result<PrimeEngineHandle, EngineError> {
@@ -624,9 +651,27 @@ fn pack_response(
 }
 
 fn set_last_error(err: EngineError) {
-    let message = to_cstring(&err.to_string());
+    set_last_error_text(&err.to_string());
+}
+
+fn set_last_error_text(message: &str) {
+    let message = to_cstring(message);
     let mut guard = LAST_ERROR.lock();
     *guard = message;
+}
+
+fn ffi_guard<T, F, P>(fn_name: &'static str, on_panic: P, f: F) -> T
+where
+    P: FnOnce() -> T,
+    F: FnOnce() -> T,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(_) => {
+            set_last_error_text(&format!("Rust panic occurred in {fn_name}"));
+            on_panic()
+        }
+    }
 }
 
 fn to_cstring(value: &str) -> Option<CString> {

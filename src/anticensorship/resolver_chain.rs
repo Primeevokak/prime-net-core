@@ -554,6 +554,7 @@ fn parse_socket_addr(value: &str, default_port: u16) -> Result<std::net::SocketA
 mod tests {
     use super::*;
     use crate::config::EngineConfig;
+    use std::net::{IpAddr, Ipv4Addr};
 
     #[tokio::test]
     async fn chain_with_only_system_resolves_localhost() {
@@ -566,5 +567,44 @@ mod tests {
         let chain = ResolverChain::from_config(&cfg.anticensorship).expect("build chain");
         let ips = chain.resolve("localhost").await.expect("resolve localhost");
         assert!(!ips.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fallback_chain_reports_last_error_when_all_resolvers_fail() {
+        let mut cfg = EngineConfig::default();
+        cfg.anticensorship.doh_enabled = false;
+        cfg.anticensorship.dot_enabled = false;
+        cfg.anticensorship.doq_enabled = false;
+        cfg.anticensorship.system_dns_enabled = false;
+        cfg.anticensorship.dns_fallback_chain = vec![DnsResolverKind::Doh, DnsResolverKind::System];
+        let chain = ResolverChain::from_config(&cfg.anticensorship).expect("build chain");
+
+        let err = chain.resolve("example.com").await.expect_err("must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("system_dns_enabled=false"), "unexpected error: {msg}");
+    }
+
+    #[tokio::test]
+    async fn empty_chain_returns_config_error() {
+        let mut cfg = EngineConfig::default();
+        cfg.anticensorship.dns_fallback_chain.clear();
+        let chain = ResolverChain::from_config(&cfg.anticensorship).expect("build chain");
+
+        let err = chain.resolve("example.com").await.expect_err("must fail");
+        assert!(err.to_string().contains("dns_fallback_chain is empty"));
+    }
+
+    #[tokio::test]
+    async fn ip_literal_bypasses_chain_and_network() {
+        let mut cfg = EngineConfig::default();
+        cfg.anticensorship.doh_enabled = false;
+        cfg.anticensorship.dot_enabled = false;
+        cfg.anticensorship.doq_enabled = false;
+        cfg.anticensorship.system_dns_enabled = false;
+        cfg.anticensorship.dns_fallback_chain.clear();
+        let chain = ResolverChain::from_config(&cfg.anticensorship).expect("build chain");
+
+        let ips = chain.resolve("1.2.3.4").await.expect("ip literal");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
     }
 }
