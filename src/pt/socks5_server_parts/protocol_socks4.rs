@@ -69,7 +69,21 @@ async fn handle_socks4(
         }
     };
 
-    tcp.write_all(&[0x00, 0x5a, 0, 0, 0, 0, 0, 0]).await?;
+    if let Err(e) = tcp.write_all(&[0x00, 0x5a, 0, 0, 0, 0, 0, 0]).await {
+        if is_expected_disconnect(&e) {
+            info!(
+                target: "socks5",
+                conn_id,
+                peer = %peer,
+                client = %client,
+                destination = %destination,
+                error = %e,
+                "SOCKS4 client disconnected before connect reply"
+            );
+            return Ok(());
+        }
+        return Err(e.into());
+    }
     let tuned = tune_relay_for_target(relay_opts, port, &destination, true);
     match relay_bidirectional(&mut tcp, &mut out, tuned.options.clone()).await {
         Ok((bytes_client_to_upstream, bytes_upstream_to_client)) => {
@@ -119,6 +133,17 @@ async fn handle_socks4(
                 "SOCKS4 session closed"
             );
         }
+        Err(e) if is_expected_disconnect(&e) => {
+            info!(
+                target: "socks5",
+                conn_id,
+                peer = %peer,
+                client = %client,
+                destination = %destination,
+                error = %e,
+                "SOCKS4 relay closed by peer"
+            );
+        }
         Err(e) => {
             let signal = classify_io_error(&e);
             record_destination_failure(
@@ -127,27 +152,15 @@ async fn handle_socks4(
                 tuned.options.classifier_emit_interval_secs,
                 tuned.stage,
             );
-            if is_expected_disconnect(&e) {
-                info!(
-                    target: "socks5",
-                    conn_id,
-                    peer = %peer,
-                    client = %client,
-                    destination = %destination,
-                    error = %e,
-                    "SOCKS4 relay closed by peer"
-                );
-            } else {
-                warn!(
-                    target: "socks5",
-                    conn_id,
-                    peer = %peer,
-                    client = %client,
-                    destination = %destination,
-                    error = %e,
-                    "SOCKS4 relay interrupted"
-                );
-            }
+            warn!(
+                target: "socks5",
+                conn_id,
+                peer = %peer,
+                client = %client,
+                destination = %destination,
+                error = %e,
+                "SOCKS4 relay interrupted"
+            );
         }
     }
     Ok(())

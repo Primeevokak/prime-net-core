@@ -89,10 +89,19 @@ struct App {
     log_selected_line: usize,
     last_diag_refresh: Instant,
     help_overlay: Option<String>,
+    classifier_cache_clear_prompt: Option<ClassifierCacheClearPrompt>,
     user_mode: UserMode,
     core_process: Option<Child>,
     proxy_managed_by_tui: bool,
     core_start_pending: Option<(String, Instant)>,
+}
+
+#[derive(Debug, Clone)]
+struct ClassifierCacheClearPrompt {
+    path: PathBuf,
+    exists: bool,
+    size_bytes: u64,
+    modified_unix: Option<u64>,
 }
 
 impl App {
@@ -123,6 +132,7 @@ impl App {
             log_selected_line: 0,
             last_diag_refresh: Instant::now() - Duration::from_secs(60),
             help_overlay: None,
+            classifier_cache_clear_prompt: None,
             user_mode: UserMode::Simple,
             core_process: None,
             proxy_managed_by_tui: false,
@@ -349,6 +359,37 @@ fn render(frame: &mut Frame, app: &mut App) {
                 .block(Block::default().title("Справка").borders(Borders::ALL)),
             popup,
         );
+    } else if let Some(prompt) = &app.classifier_cache_clear_prompt {
+        let popup = centered_rect(85, 70, area);
+        let modified_label = prompt
+            .modified_unix
+            .map(|ts| ts.to_string())
+            .unwrap_or_else(|| "н/д".to_owned());
+        let exists_label = if prompt.exists { "да" } else { "нет" };
+        let text = format!(
+            "Очистить кэш relay-классификатора?\n\n\
+Путь: {}\n\
+Файл существует: {exists_label}\n\
+Размер: {} байт\n\
+Изменён (unix): {modified_label}\n\n\
+Плюсы:\n\
+  + удаляются устаревшие обученные решения маршрутизации\n\
+  + проще исправлять некорректные состояния adaptive-маршрутов\n\
+  + следующие сессии обучаются на актуальных условиях сети\n\n\
+Минусы:\n\
+  - первые запросы могут быть медленнее (холодный старт обучения)\n\
+  - временно могут участиться route race/fallback\n\
+  - будет потеряна история удачных обученных профилей\n\n\
+Нажмите [y]/[Enter] для подтверждения, [n]/[Esc] для отмены.",
+            prompt.path.display(),
+            prompt.size_bytes
+        );
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(text)
+                .block(Block::default().title("Подтверждение очистки кэша").borders(Borders::ALL)),
+            popup,
+        );
     } else if let Some((endpoint, started)) = &app.core_start_pending {
         let popup = centered_rect(75, 45, area);
         let text = format!(
@@ -554,9 +595,13 @@ fn render_proxy(frame: &mut Frame, area: Rect, app: &App) {
     ));
 
     lines.push(Line::from(""));
-    lines.push(Line::from("Author links:"));
+    lines.push(Line::from(
+        "[d] очистить кэш relay-классификатора (с подтверждением)",
+    ));
+    lines.push(Line::from(""));
+    lines.push(Line::from("Ссылки автора:"));
     lines.push(Line::from(format!(
-        "  [Enter] Open Telegram channel: {}",
+        "  [Enter] Открыть Telegram-канал: {}",
         AUTHOR_TELEGRAM_URL
     )));
 
@@ -571,6 +616,33 @@ fn render_proxy(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    if let Some(prompt) = app.classifier_cache_clear_prompt.clone() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                app.classifier_cache_clear_prompt = None;
+                match clear_classifier_cache_file(&prompt.path)? {
+                    ClassifierCacheClearResult::Removed => {
+                        app.status_line = format!(
+                            "Кэш relay-классификатора очищен: {} (перезапустите ядро, чтобы применить изменения в памяти)",
+                            prompt.path.display()
+                        );
+                    }
+                    ClassifierCacheClearResult::Missing => {
+                        app.status_line = format!(
+                            "Файл кэша relay-классификатора уже отсутствует: {}",
+                            prompt.path.display()
+                        );
+                    }
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.classifier_cache_clear_prompt = None;
+                app.status_line = "Очистка кэша relay-классификатора отменена".to_owned();
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
     if app.help_overlay.is_some() {
         app.help_overlay = None;
         return Ok(false);
@@ -715,6 +787,11 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                 app.refresh_proxy_diagnostics().await;
                 app.status_line = "Диагностика обновлена".to_owned();
             }
+            KeyCode::Char('d') => {
+                app.classifier_cache_clear_prompt =
+                    Some(build_classifier_cache_clear_prompt(&app.config_editor.config));
+                app.status_line = "Подтвердите очистку кэша relay-классификатора".to_owned();
+            }
             KeyCode::Char('a') => {
                 activate_core(app)?;
             }
@@ -724,7 +801,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
             }
             KeyCode::Enter => {
                 open_author_telegram_channel()?;
-                app.status_line = format!("Opening Telegram channel: {AUTHOR_TELEGRAM_URL}");
+                app.status_line = format!("Открываю Telegram-канал: {AUTHOR_TELEGRAM_URL}");
             }
             _ => {}
         },
@@ -766,6 +843,58 @@ fn tabs_for_mode(mode: UserMode) -> Vec<Tab> {
             Tab::Logs,
             Tab::Proxy,
         ],
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClassifierCacheClearResult {
+    Removed,
+    Missing,
+}
+
+fn classifier_cache_path_for(cfg: &EngineConfig) -> PathBuf {
+    let configured = cfg.evasion.classifier_cache_path.trim();
+    if !configured.is_empty() {
+        return expand_tilde(configured);
+    }
+    if let Some(dir) = dirs::cache_dir() {
+        return dir.join("prime-net-engine").join("relay-classifier.json");
+    }
+    expand_tilde("~/.cache/prime-net-engine/relay-classifier.json")
+}
+
+fn build_classifier_cache_clear_prompt(cfg: &EngineConfig) -> ClassifierCacheClearPrompt {
+    let path = classifier_cache_path_for(cfg);
+    let mut exists = false;
+    let mut size_bytes = 0u64;
+    let mut modified_unix = None;
+    if let Ok(meta) = fs::metadata(&path) {
+        exists = true;
+        size_bytes = meta.len();
+        modified_unix = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+    }
+    ClassifierCacheClearPrompt {
+        path,
+        exists,
+        size_bytes,
+        modified_unix,
+    }
+}
+
+fn clear_classifier_cache_file(path: &Path) -> Result<ClassifierCacheClearResult> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(ClassifierCacheClearResult::Removed),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ClassifierCacheClearResult::Missing)
+        }
+        Err(e) => Err(EngineError::Internal(format!(
+            "не удалось очистить кэш relay-классификатора {}: {e}",
+            path.display()
+        ))),
     }
 }
 

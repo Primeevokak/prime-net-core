@@ -17,17 +17,19 @@ async fn connect_via_best_route(
     record_route_race_decision(race, race_reason);
 
     if race {
+        let has_direct = ordered.iter().any(|c| c.kind == RouteKind::Direct);
+        let launch_order = route_race_launch_candidates(&ordered);
         info!(
             target: "socks5.route",
             destination = %destination,
             route_key = %route_key,
             candidates = ordered.len(),
+            launched = launch_order.len(),
             reason = route_race_reason_label(race_reason),
             "adaptive route race started"
         );
-        let has_direct = ordered.iter().any(|c| c.kind == RouteKind::Direct);
         let mut set = JoinSet::new();
-        for (idx, candidate) in ordered.iter().cloned().enumerate() {
+        for (idx, candidate) in launch_order.into_iter().enumerate() {
             let outbound = outbound.clone();
             let target = target_endpoint.clone();
             let destination = destination.to_owned();
@@ -142,10 +144,37 @@ async fn connect_via_best_route(
 fn route_race_candidate_delay_ms(idx: usize, candidate: &RouteCandidate, has_direct: bool) -> u64 {
     let base = ROUTE_RACE_BASE_DELAY_MS.saturating_mul(idx as u64);
     if has_direct && candidate.kind == RouteKind::Bypass {
-        base.saturating_add(route_race_bypass_extra_delay_ms(candidate.source))
+        base.saturating_add(ROUTE_RACE_DIRECT_HEADSTART_MS)
+            .saturating_add(route_race_bypass_extra_delay_ms(candidate.source))
     } else {
         base
     }
+}
+
+fn route_race_launch_candidates(ordered: &[RouteCandidate]) -> Vec<RouteCandidate> {
+    if !ordered.iter().any(|c| c.kind == RouteKind::Direct) {
+        return ordered
+            .iter()
+            .take(ROUTE_RACE_MAX_CANDIDATES)
+            .cloned()
+            .collect();
+    }
+
+    let mut launch = Vec::with_capacity(ordered.len().min(ROUTE_RACE_MAX_CANDIDATES));
+    launch.extend(
+        ordered
+            .iter()
+            .filter(|candidate| candidate.kind == RouteKind::Direct)
+            .cloned(),
+    );
+    launch.extend(
+        ordered
+            .iter()
+            .filter(|candidate| candidate.kind == RouteKind::Bypass)
+            .take(ROUTE_RACE_MAX_CANDIDATES.saturating_sub(launch.len()))
+            .cloned(),
+    );
+    launch
 }
 
 fn route_race_bypass_extra_delay_ms(source: &str) -> u64 {
@@ -296,8 +325,24 @@ async fn handle_client(
     }
 
     // Ответ SOCKS5: успех, BND=0.0.0.0:0
-    tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await?;
+    if let Err(e) = tcp
+        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+    {
+        if is_expected_disconnect(&e) {
+            info!(
+                target: "socks5",
+                conn_id,
+                peer = %peer,
+                client = %client,
+                destination = %target,
+                error = %e,
+                "SOCKS5 client disconnected before connect reply"
+            );
+            return Ok(());
+        }
+        return Err(e.into());
+    }
 
     if connected.candidate.kind == RouteKind::Bypass {
         info!(
@@ -493,6 +538,17 @@ async fn handle_client(
                 "SOCKS5 session closed"
             );
         }
+        Err(e) if is_expected_disconnect(&e) => {
+            info!(
+                target: "socks5",
+                conn_id,
+                peer = %peer,
+                client = %client,
+                destination = %target,
+                error = %e,
+                "SOCKS5 relay closed by peer"
+            );
+        }
         Err(e) => {
             let signal = classify_io_error(&e);
             record_destination_failure(
@@ -506,27 +562,15 @@ async fn handle_client(
                 &connected.candidate,
                 blocking_signal_label(signal),
             );
-            if is_expected_disconnect(&e) {
-                info!(
-                    target: "socks5",
-                    conn_id,
-                    peer = %peer,
-                    client = %client,
-                    destination = %target,
-                    error = %e,
-                    "SOCKS5 relay closed by peer"
-                );
-            } else {
-                warn!(
-                    target: "socks5",
-                    conn_id,
-                    peer = %peer,
-                    client = %client,
-                    destination = %target,
-                    error = %e,
-                    "SOCKS5 relay interrupted"
-                );
-            }
+            warn!(
+                target: "socks5",
+                conn_id,
+                peer = %peer,
+                client = %client,
+                destination = %target,
+                error = %e,
+                "SOCKS5 relay interrupted"
+            );
         }
     }
     Ok(())

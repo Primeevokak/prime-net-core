@@ -63,6 +63,8 @@ async fn download_best_binary(install_dir: &Path) -> Result<PathBuf> {
         );
         match download_from_mirrors(name, &urls).await {
             Ok((bytes, source_url)) => {
+                verify_downloaded_payload_integrity(name, &source_url, &bytes).await?;
+
                 let final_bytes = if source_url.ends_with(".zip") {
                     match extract_from_zip(&bytes, name) {
                         Ok(extracted) => extracted,
@@ -79,6 +81,8 @@ async fn download_best_binary(install_dir: &Path) -> Result<PathBuf> {
                 } else {
                     bytes
                 };
+
+                verify_final_binary_integrity_if_configured(name, &final_bytes)?;
 
                 let path = install_dir.join(name);
                 std::fs::write(&path, &final_bytes).map_err(EngineError::Io)?;
@@ -175,6 +179,182 @@ async fn download_from_mirrors(name: &str, urls: &[String]) -> Result<(Vec<u8>, 
         "all packet bypass bootstrap mirrors failed for '{name}': {}",
         errors.join(" | ")
     )))
+}
+
+async fn verify_downloaded_payload_integrity(
+    binary_name: &str,
+    source_url: &str,
+    payload: &[u8],
+) -> Result<()> {
+    let expected = if let Some(hex) = std::env::var("PRIME_PACKET_BYPASS_PAYLOAD_SHA256")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+    {
+        parse_sha256_hex(&hex).ok_or_else(|| {
+            EngineError::Config(
+                "PRIME_PACKET_BYPASS_PAYLOAD_SHA256 must contain a 64-hex sha256 digest".to_owned(),
+            )
+        })?
+    } else {
+        match resolve_sha256_from_sidecar(source_url).await? {
+            Some(v) => v,
+            None => {
+                if allow_unverified_packet_bypass_bootstrap() {
+                    warn!(
+                        target: "packet_bypass",
+                        binary = binary_name,
+                        source = source_url,
+                        "packet bypass integrity sidecar not found; continuing because PRIME_PACKET_BYPASS_ALLOW_UNVERIFIED=1"
+                    );
+                    return Ok(());
+                }
+                return Err(EngineError::Config(format!(
+                    "packet bypass integrity check failed: no sha256 sidecar for '{source_url}'. set PRIME_PACKET_BYPASS_PAYLOAD_SHA256 or PRIME_PACKET_BYPASS_ALLOW_UNVERIFIED=1"
+                )));
+            }
+        }
+    };
+
+    let got = sha256_bytes(payload);
+    if got != expected {
+        return Err(EngineError::Config(format!(
+            "packet bypass integrity check failed for '{binary_name}': sha256 mismatch (source: {source_url})"
+        )));
+    }
+    info!(
+        target: "packet_bypass",
+        binary = binary_name,
+        source = source_url,
+        "packet bypass payload sha256 verified"
+    );
+    Ok(())
+}
+
+fn verify_final_binary_integrity_if_configured(binary_name: &str, bytes: &[u8]) -> Result<()> {
+    let Some(expected_hex) = std::env::var("PRIME_PACKET_BYPASS_BINARY_SHA256")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(());
+    };
+
+    let expected = parse_sha256_hex(&expected_hex).ok_or_else(|| {
+        EngineError::Config(
+            "PRIME_PACKET_BYPASS_BINARY_SHA256 must contain a 64-hex sha256 digest".to_owned(),
+        )
+    })?;
+    let got = sha256_bytes(bytes);
+    if got != expected {
+        return Err(EngineError::Config(format!(
+            "packet bypass final binary integrity check failed for '{binary_name}': sha256 mismatch"
+        )));
+    }
+    info!(
+        target: "packet_bypass",
+        binary = binary_name,
+        "packet bypass final binary sha256 verified"
+    );
+    Ok(())
+}
+
+async fn resolve_sha256_from_sidecar(source_url: &str) -> Result<Option<[u8; 32]>> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .user_agent("prime-net-engine/packet-bypass-bootstrap")
+        .build()
+        .map_err(|e| EngineError::Config(format!("failed to build integrity-check client: {e}")))?;
+
+    let candidates = [format!("{source_url}.sha256"), format!("{source_url}.sha256sum")];
+    for url in candidates {
+        let resp = match client.get(&url).send().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let text = match resp.text().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let Some(hex) = extract_sha256_from_text(&text) else {
+            continue;
+        };
+        if let Some(parsed) = parse_sha256_hex(&hex) {
+            info!(
+                target: "packet_bypass",
+                sidecar_url = url.as_str(),
+                "resolved packet bypass sha256 sidecar"
+            );
+            return Ok(Some(parsed));
+        }
+    }
+    Ok(None)
+}
+
+fn allow_unverified_packet_bypass_bootstrap() -> bool {
+    std::env::var("PRIME_PACKET_BYPASS_ALLOW_UNVERIFIED")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+fn parse_sha256_hex(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    fn nibble(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let mut out = [0u8; 32];
+    let bytes = s.as_bytes();
+    for i in 0..32 {
+        let hi = nibble(bytes[i * 2])?;
+        let lo = nibble(bytes[i * 2 + 1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn extract_sha256_from_text(s: &str) -> Option<String> {
+    for token in s.split_whitespace() {
+        if token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Some(token.to_ascii_lowercase());
+        }
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() < 64 {
+        return None;
+    }
+    for i in 0..=(bytes.len() - 64) {
+        let sub = &bytes[i..i + 64];
+        if sub.iter().all(|b| b.is_ascii_hexdigit()) {
+            return Some(String::from_utf8_lossy(sub).to_ascii_lowercase());
+        }
+    }
+    None
 }
 
 fn ensure_dir_writable(path: &Path) -> Result<()> {

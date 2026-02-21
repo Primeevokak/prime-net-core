@@ -129,6 +129,17 @@ impl AutoUpdater {
         self.fetch_release(&api).await
     }
 
+    async fn fetch_release_by_tag(&self, tag: &str) -> Result<ReleaseInfo> {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            return Err(EngineError::InvalidInput(
+                "update tag must not be empty".to_owned(),
+            ));
+        }
+        let api = format!("{}/repos/{}/releases/tags/{}", self.api_base(), self.repo, tag);
+        self.fetch_release(&api).await
+    }
+
     async fn fetch_all_releases(&self) -> Result<Vec<ReleaseInfo>> {
         let api = format!("{}/repos/{}/releases", self.api_base(), self.repo);
         self.fetch_releases(&api).await
@@ -181,52 +192,11 @@ impl AutoUpdater {
     }
 
     pub async fn download_and_install(&self, update: UpdateInfo) -> Result<()> {
-        let rollback_mgr = RollbackManager::new()?;
-        let backup = rollback_mgr.backup_current_binary()?;
-
-        let repo = self.repo.clone();
-        let bin_name = self.bin_name.clone();
-        let current_version = self.current_version.clone();
-        let tag = update.tag.clone();
-        let install_result = tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut parts = repo.split('/');
-            let owner = parts
-                .next()
-                .ok_or_else(|| EngineError::InvalidInput("invalid updater repo".to_owned()))?;
-            let name = parts
-                .next()
-                .ok_or_else(|| EngineError::InvalidInput("invalid updater repo".to_owned()))?;
-
-            let status = self_update::backends::github::Update::configure()
-                .repo_owner(owner)
-                .repo_name(name)
-                .bin_name(&bin_name)
-                .target_version_tag(&tag)
-                .show_download_progress(true)
-                .current_version(&current_version)
-                .build()
-                .map_err(|e| EngineError::Internal(format!("updater build failed: {e}")))?
-                .update()
-                .map_err(|e| EngineError::Internal(format!("update install failed: {e}")))?;
-            if status.version() == current_version {
-                return Err(EngineError::Internal(
-                    "update did not change binary version".to_owned(),
-                ));
-            }
-            Ok(())
-        })
-        .await?;
-
-        match install_result {
-            Ok(()) => {
-                rollback_mgr.cleanup_old_backups(3)?;
-                Ok(())
-            }
-            Err(e) => {
-                rollback_mgr.restore_backup(&backup)?;
-                Err(e)
-            }
-        }
+        let release = self.fetch_release_by_tag(&update.tag).await?;
+        let new_binary = self.download_and_verify(&release).await?;
+        let result = self.install_with_rollback(&new_binary).await;
+        let _ = std::fs::remove_file(&new_binary);
+        result
     }
 
     pub fn rollback(&self) -> Result<()> {
@@ -240,18 +210,16 @@ impl AutoUpdater {
             .ok_or_else(|| EngineError::Internal("no suitable binary asset found".to_owned()))?;
         let binary = self.download_file(&binary_url).await?;
         let sig_url = format!("{binary_url}.sig");
-        let signature = self.download_file(&sig_url).await.ok();
+        let signature = self.download_file(&sig_url).await.map_err(|e| {
+            EngineError::Internal(format!(
+                "update signature not found or failed to download ('{sig_url}'): {e}"
+            ))
+        })?;
 
-        if let Some(sig) = signature {
-            let verifier = SignatureVerifier::new();
-            if !verifier.verify_release(&binary, &sig)? {
-                return Err(EngineError::Internal(
-                    "signature verification failed - update rejected".to_owned(),
-                ));
-            }
-        } else if cfg!(feature = "require-signatures") {
+        let verifier = SignatureVerifier::new();
+        if !verifier.verify_release(&binary, &signature)? {
             return Err(EngineError::Internal(
-                "signature verification required but .sig not found".to_owned(),
+                "signature verification failed - update rejected".to_owned(),
             ));
         }
 
@@ -272,18 +240,19 @@ impl AutoUpdater {
     fn find_binary_asset(&self, release: &ReleaseInfo) -> Option<String> {
         let os = std::env::consts::OS;
         let arch = std::env::consts::ARCH;
+        let wanted_bin = self.bin_name.to_ascii_lowercase();
         release
             .assets
             .iter()
             .find(|a| {
                 let n = a.name.to_ascii_lowercase();
-                n.contains("prime-net-engine") && n.contains(os) && n.contains(arch)
+                n.contains(&wanted_bin) && n.contains(os) && n.contains(arch)
             })
             .or_else(|| {
                 release
                     .assets
                     .iter()
-                    .find(|a| a.name.contains("prime-net-engine"))
+                    .find(|a| a.name.to_ascii_lowercase().contains(&wanted_bin))
             })
             .map(|a| a.browser_download_url.clone())
     }

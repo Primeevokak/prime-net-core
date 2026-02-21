@@ -540,16 +540,67 @@ mod tests {
         assert_eq!(route_race_candidate_delay_ms(0, &direct, true), 0);
         assert_eq!(
             route_race_candidate_delay_ms(1, &bypass, true),
-            ROUTE_RACE_BASE_DELAY_MS + ROUTE_RACE_BYPASS_EXTRA_DELAY_BUILTIN_MS
+            ROUTE_RACE_BASE_DELAY_MS
+                + ROUTE_RACE_DIRECT_HEADSTART_MS
+                + ROUTE_RACE_BYPASS_EXTRA_DELAY_BUILTIN_MS
         );
         assert_eq!(
             route_race_candidate_delay_ms(1, &bypass_adaptive, true),
-            ROUTE_RACE_BASE_DELAY_MS + ROUTE_RACE_BYPASS_EXTRA_DELAY_MS
+            ROUTE_RACE_BASE_DELAY_MS
+                + ROUTE_RACE_DIRECT_HEADSTART_MS
+                + ROUTE_RACE_BYPASS_EXTRA_DELAY_MS
         );
         assert_eq!(
             route_race_candidate_delay_ms(1, &bypass, false),
             ROUTE_RACE_BASE_DELAY_MS
         );
+    }
+
+    #[test]
+    fn route_race_launch_order_prioritizes_direct_candidates() {
+        let bypass_first =
+            RouteCandidate::bypass("builtin", "127.0.0.1:19080".parse().expect("addr"), 0, 2);
+        let direct = RouteCandidate::direct("adaptive");
+        let bypass_second = RouteCandidate::bypass(
+            "adaptive-race",
+            "127.0.0.1:19081".parse().expect("addr"),
+            1,
+            2,
+        );
+        let ordered = vec![bypass_first.clone(), direct.clone(), bypass_second.clone()];
+
+        let launch = route_race_launch_candidates(&ordered);
+        assert_eq!(launch[0].route_id(), direct.route_id());
+        assert_eq!(launch[1].route_id(), bypass_first.route_id());
+        assert_eq!(launch[2].route_id(), bypass_second.route_id());
+    }
+
+    #[test]
+    fn route_race_launch_candidates_are_capped() {
+        let direct = RouteCandidate::direct("adaptive");
+        let bypass_1 =
+            RouteCandidate::bypass("builtin", "127.0.0.1:19080".parse().expect("addr"), 0, 4);
+        let bypass_2 = RouteCandidate::bypass(
+            "adaptive-race",
+            "127.0.0.1:19081".parse().expect("addr"),
+            1,
+            4,
+        );
+        let bypass_3 =
+            RouteCandidate::bypass("builtin", "127.0.0.1:19082".parse().expect("addr"), 2, 4);
+        let bypass_4 = RouteCandidate::bypass(
+            "learned-domain",
+            "127.0.0.1:19083".parse().expect("addr"),
+            3,
+            4,
+        );
+        let ordered = vec![direct.clone(), bypass_1.clone(), bypass_2.clone(), bypass_3, bypass_4];
+
+        let launch = route_race_launch_candidates(&ordered);
+        assert_eq!(launch.len(), ROUTE_RACE_MAX_CANDIDATES);
+        assert_eq!(launch[0].route_id(), direct.route_id());
+        assert_eq!(launch[1].route_id(), bypass_1.route_id());
+        assert_eq!(launch[2].route_id(), bypass_2.route_id());
     }
 
     #[test]

@@ -95,18 +95,16 @@ impl PrimeHttpClient {
             return Ok((0, false));
         }
 
-        let concurrency = self
-            .config
-            .download
-            .initial_concurrency
-            .min(self.config.download.max_concurrency)
+        let mut target_concurrency = self
+            .chunk_manager
+            .current_concurrency()
+            .min(self.config.download.max_concurrency.max(1))
             .max(1);
 
-        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
         let downloaded = std::sync::Arc::new(AtomicU64::new(0));
         let started_at = Instant::now();
 
-        let mut join_set = tokio::task::JoinSet::new();
+        let mut pending_parts: Vec<(ChunkRange, PathBuf, u64)> = Vec::new();
         for (index, chunk) in chunks.iter().copied().enumerate() {
             let part_path = parts_dir.join(format!("{index:08}.part"));
             let expected_len = (chunk.end - chunk.start) + 1;
@@ -118,115 +116,72 @@ impl PrimeHttpClient {
                     continue;
                 }
             }
-
-            let permit = semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| EngineError::Internal("semaphore closed".to_owned()))?;
-
-            let client = client.clone();
-            let url = request.url.clone();
-            let base_headers = headers.clone();
-            let downloaded = downloaded.clone();
-            let progress = progress.clone();
-            let max_retries = self.config.download.max_retries;
-            join_set.spawn(async move {
-                let _permit = permit;
-
-                // (Re)download this part into its own file.
-                let mut file = tokio::fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(true)
-                    .write(true)
-                    .open(&part_path)
-                    .await?;
-
-                let range_value = format!("bytes={}-{}", chunk.start, chunk.end);
-                let mut h = base_headers.clone();
-                h.insert(RANGE, HeaderValue::from_str(&range_value)?);
-
-                // Retry the whole part download on transient failures.
-                let mut last_err: Option<EngineError> = None;
-                for attempt in 0..=max_retries {
-                    let mut attempt_written: u64 = 0;
-                    let resp = client.get(&url).headers(h.clone()).send().await;
-                    match resp {
-                        Ok(r) => {
-                            if r.status().as_u16() != 206 {
-                                last_err = Some(EngineError::Internal(format!(
-                                    "server did not return Partial Content (expected 206, got {})",
-                                    r.status().as_u16()
-                                )));
-                            } else {
-                                let mut r = r;
-                                let mut ok = true;
-                                loop {
-                                    match r.chunk().await {
-                                        Ok(Some(buf)) => {
-                                            file.write_all(&buf).await?;
-                                            attempt_written += buf.len() as u64;
-                                            let total_downloaded = downloaded
-                                                .fetch_add(buf.len() as u64, Ordering::Relaxed)
-                                                + (buf.len() as u64);
-                                            if let Some(cb) = &progress {
-                                                let elapsed =
-                                                    started_at.elapsed().as_secs_f64().max(0.001);
-                                                let speed_mbps = (total_downloaded as f64 * 8.0
-                                                    / 1_000_000.0)
-                                                    / elapsed;
-                                                cb(total_downloaded, content_length, speed_mbps);
-                                            }
-                                        }
-                                        Ok(None) => break,
-                                        Err(e) => {
-                                            last_err = Some(EngineError::Http(e));
-                                            ok = false;
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                if ok {
-                                    file.flush().await?;
-                                    let size = file.metadata().await?.len();
-                                    if size == expected_len {
-                                        return Ok::<(), EngineError>(());
-                                    }
-                                    last_err = Some(EngineError::Internal(format!(
-                                        "downloaded part size mismatch (expected {expected_len}, got {size})"
-                                    )));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            last_err = Some(EngineError::Http(e));
-                        }
-                    }
-
-                    if attempt < max_retries {
-                        // Roll back progress for bytes written during this attempt since we will re-download it.
-                        if attempt_written > 0 {
-                            downloaded.fetch_sub(attempt_written, Ordering::Relaxed);
-                        }
-                        tokio::time::sleep(retry_delay(attempt)).await;
-                        // Reset file to overwrite from scratch.
-                        file = tokio::fs::OpenOptions::new()
-                            .create(true)
-                            .truncate(true)
-                            .write(true)
-                            .open(&part_path)
-                            .await?;
-                        continue;
-                    }
-                }
-
-                Err(last_err.unwrap_or_else(|| EngineError::Internal("part download failed".to_owned())))
-            });
+            pending_parts.push((chunk, part_path, expected_len));
         }
 
-        while let Some(result) = join_set.join_next().await {
+        let max_retries = self.config.download.max_retries;
+        let max_concurrency = self.config.download.max_concurrency.max(1);
+        let mut next_pending = 0usize;
+        let mut in_flight = 0usize;
+        let mut join_set: tokio::task::JoinSet<std::result::Result<(), EngineError>> =
+            tokio::task::JoinSet::new();
+
+        while next_pending < pending_parts.len() && in_flight < target_concurrency {
+            let (chunk, part_path, expected_len) = pending_parts[next_pending].clone();
+            next_pending += 1;
+            in_flight += 1;
+
+            join_set.spawn(download_part_to_file(
+                client.clone(),
+                request.url.clone(),
+                headers.clone(),
+                chunk,
+                part_path,
+                expected_len,
+                content_length,
+                max_retries,
+                downloaded.clone(),
+                started_at,
+                progress.clone(),
+            ));
+        }
+
+        while in_flight > 0 {
+            let result = join_set.join_next().await.ok_or_else(|| {
+                EngineError::Internal("part worker join set unexpectedly empty".to_owned())
+            })?;
+            in_flight = in_flight.saturating_sub(1);
             result??;
+
+            let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
+            let speed_mbps = (downloaded.load(Ordering::Relaxed) as f64 * 8.0 / 1_000_000.0)
+                / elapsed;
+            self.chunk_manager.adjust_concurrency(speed_mbps);
+            target_concurrency = self
+                .chunk_manager
+                .current_concurrency()
+                .min(max_concurrency)
+                .max(1);
+
+            while next_pending < pending_parts.len() && in_flight < target_concurrency {
+                let (chunk, part_path, expected_len) = pending_parts[next_pending].clone();
+                next_pending += 1;
+                in_flight += 1;
+
+                join_set.spawn(download_part_to_file(
+                    client.clone(),
+                    request.url.clone(),
+                    headers.clone(),
+                    chunk,
+                    part_path,
+                    expected_len,
+                    content_length,
+                    max_retries,
+                    downloaded.clone(),
+                    started_at,
+                    progress.clone(),
+                ));
+            }
         }
 
         // Merge parts sequentially into a temp file, then rename into place.
@@ -310,9 +265,38 @@ impl PrimeHttpClient {
 
         // Validate status before writing any bytes to disk.
         let status = resp.status();
+        let expected_total_from_range = parse_total_length_from_content_range(resp.headers());
         if offset > 0 {
             match status.as_u16() {
-                206 => {}
+                206 => {
+                    let bounds = parse_content_range_bounds(resp.headers()).ok_or_else(|| {
+                        EngineError::Internal(
+                            "download failed: missing or invalid Content-Range for resume request"
+                                .to_owned(),
+                        )
+                    })?;
+                    if bounds.start != offset {
+                        return Err(EngineError::Internal(format!(
+                            "download failed: resume Content-Range start mismatch (expected {offset}, got {})",
+                            bounds.start
+                        )));
+                    }
+                    if bounds.end < bounds.start {
+                        return Err(EngineError::Internal(
+                            "download failed: invalid Content-Range bounds for resume request"
+                                .to_owned(),
+                        ));
+                    }
+                    if let (Some(expected_total), Some(actual_total)) =
+                        (content_length, bounds.total)
+                    {
+                        if expected_total != actual_total {
+                            return Err(EngineError::Internal(format!(
+                                "download failed: Content-Range total mismatch (expected {expected_total}, got {actual_total})"
+                            )));
+                        }
+                    }
+                }
                 416 => {
                     // Range Not Satisfiable. Only treat as "already complete" if local size exactly
                     // matches server's total size. If local is larger, it is corrupted/stale and must
@@ -425,6 +409,15 @@ impl PrimeHttpClient {
         }
         file.flush().await?;
         let final_len = file.metadata().await?.len();
+        if offset > 0 {
+            if let Some(total) = expected_total_from_range.or(content_length) {
+                if final_len != total {
+                    return Err(EngineError::Internal(format!(
+                        "download failed: resumed file length mismatch (expected {total}, got {final_len})"
+                    )));
+                }
+            }
+        }
         Ok((final_len, resumed))
     }
 
@@ -491,4 +484,128 @@ impl PrimeHttpClient {
         }
         Ok(())
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_part_to_file(
+    client: reqwest::Client,
+    url: String,
+    base_headers: HeaderMap,
+    chunk: ChunkRange,
+    part_path: PathBuf,
+    expected_len: u64,
+    content_length: u64,
+    max_retries: usize,
+    downloaded: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    started_at: Instant,
+    progress: Option<ProgressHook>,
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&part_path)
+        .await?;
+
+    let range_value = format!("bytes={}-{}", chunk.start, chunk.end);
+    let mut h = base_headers.clone();
+    h.insert(RANGE, HeaderValue::from_str(&range_value)?);
+
+    let mut last_err: Option<EngineError> = None;
+    for attempt in 0..=max_retries {
+        last_err = None;
+        let mut attempt_written: u64 = 0;
+        let resp = client.get(&url).headers(h.clone()).send().await;
+        match resp {
+            Ok(r) => {
+                if r.status().as_u16() != 206 {
+                    last_err = Some(EngineError::Internal(format!(
+                        "server did not return Partial Content (expected 206, got {})",
+                        r.status().as_u16()
+                    )));
+                } else if let Some(bounds) = parse_content_range_bounds(r.headers()) {
+                    if bounds.start != chunk.start || bounds.end != chunk.end {
+                        last_err = Some(EngineError::Internal(format!(
+                            "part Content-Range mismatch: requested {}-{}, got {}-{}",
+                            chunk.start, chunk.end, bounds.start, bounds.end
+                        )));
+                    } else if let Some(total) = bounds.total {
+                        if total != content_length {
+                            last_err = Some(EngineError::Internal(format!(
+                                "part Content-Range total mismatch: expected {}, got {}",
+                                content_length, total
+                            )));
+                        }
+                    }
+
+                    if last_err.is_none() {
+                        let mut r = r;
+                        let mut ok = true;
+                        loop {
+                            match r.chunk().await {
+                                Ok(Some(buf)) => {
+                                    file.write_all(&buf).await?;
+                                    attempt_written += buf.len() as u64;
+                                    let total_downloaded =
+                                        downloaded.fetch_add(buf.len() as u64, Ordering::Relaxed)
+                                            + (buf.len() as u64);
+                                    if let Some(cb) = &progress {
+                                        let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
+                                        let speed_mbps =
+                                            (total_downloaded as f64 * 8.0 / 1_000_000.0) / elapsed;
+                                        cb(total_downloaded, content_length, speed_mbps);
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    last_err = Some(EngineError::Http(e));
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if ok {
+                            file.flush().await?;
+                            let size = file.metadata().await?.len();
+                            if size == expected_len {
+                                return Ok(());
+                            }
+                            last_err = Some(EngineError::Internal(format!(
+                                "downloaded part size mismatch (expected {expected_len}, got {size})"
+                            )));
+                        }
+                    }
+                } else {
+                    last_err = Some(EngineError::Internal(
+                        "missing or invalid Content-Range for part response".to_owned(),
+                    ));
+                }
+            }
+            Err(e) => {
+                last_err = Some(EngineError::Http(e));
+            }
+        }
+
+        if attempt < max_retries {
+            if attempt_written > 0 {
+                downloaded.fetch_sub(attempt_written, Ordering::Relaxed);
+            }
+            tokio::time::sleep(retry_delay(attempt)).await;
+            file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&part_path)
+                .await?;
+            continue;
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        EngineError::Internal("part download failed".to_owned())
+    }))
 }

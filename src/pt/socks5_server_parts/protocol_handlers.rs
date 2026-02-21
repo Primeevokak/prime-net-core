@@ -115,8 +115,24 @@ async fn handle_http_proxy(
             );
         }
 
-        tcp.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await?;
+        if let Err(e) = tcp
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+        {
+            if is_expected_disconnect(&e) {
+                info!(
+                    target: "socks5",
+                    conn_id,
+                    peer = %peer,
+                    client = %client,
+                    destination = %destination,
+                    error = %e,
+                    "HTTP CONNECT client disconnected before tunnel confirmation"
+                );
+                return Ok(());
+            }
+            return Err(e.into());
+        }
 
         if connected.candidate.kind == RouteKind::Bypass {
             info!(
@@ -315,6 +331,17 @@ async fn handle_http_proxy(
                     "HTTP CONNECT session closed"
                 );
             }
+            Err(e) if is_expected_disconnect(&e) => {
+                info!(
+                    target: "socks5",
+                    conn_id,
+                    peer = %peer,
+                    client = %client,
+                    destination = %destination,
+                    error = %e,
+                    "HTTP CONNECT relay closed by peer"
+                );
+            }
             Err(e) => {
                 let signal = classify_io_error(&e);
                 record_destination_failure(
@@ -328,27 +355,15 @@ async fn handle_http_proxy(
                     &connected.candidate,
                     blocking_signal_label(signal),
                 );
-                if is_expected_disconnect(&e) {
-                    info!(
-                        target: "socks5",
-                        conn_id,
-                        peer = %peer,
-                        client = %client,
-                        destination = %destination,
-                        error = %e,
-                        "HTTP CONNECT relay closed by peer"
-                    );
-                } else {
-                    warn!(
-                        target: "socks5",
-                        conn_id,
-                        peer = %peer,
-                        client = %client,
-                        destination = %destination,
-                        error = %e,
-                        "HTTP CONNECT relay interrupted"
-                    );
-                }
+                warn!(
+                    target: "socks5",
+                    conn_id,
+                    peer = %peer,
+                    client = %client,
+                    destination = %destination,
+                    error = %e,
+                    "HTTP CONNECT relay interrupted"
+                );
             }
         }
         return Ok(());
@@ -460,6 +475,18 @@ async fn handle_http_proxy(
                 "HTTP proxy forward session closed"
             );
         }
+        Err(e) if is_expected_disconnect(&e) => {
+            info!(
+                target: "socks5",
+                conn_id,
+                peer = %peer,
+                client = %client,
+                method = %method,
+                destination = %destination,
+                error = %e,
+                "HTTP proxy forward relay closed by peer"
+            );
+        }
         Err(e) => {
             let signal = classify_io_error(&e);
             record_destination_failure(
@@ -468,29 +495,16 @@ async fn handle_http_proxy(
                 tuned.options.classifier_emit_interval_secs,
                 tuned.stage,
             );
-            if is_expected_disconnect(&e) {
-                info!(
-                    target: "socks5",
-                    conn_id,
-                    peer = %peer,
-                    client = %client,
-                    method = %method,
-                    destination = %destination,
-                    error = %e,
-                    "HTTP proxy forward relay closed by peer"
-                );
-            } else {
-                warn!(
-                    target: "socks5",
-                    conn_id,
-                    peer = %peer,
-                    client = %client,
-                    method = %method,
-                    destination = %destination,
-                    error = %e,
-                    "HTTP proxy forward relay interrupted"
-                );
-            }
+            warn!(
+                target: "socks5",
+                conn_id,
+                peer = %peer,
+                client = %client,
+                method = %method,
+                destination = %destination,
+                error = %e,
+                "HTTP proxy forward relay interrupted"
+            );
         }
     }
     Ok(())

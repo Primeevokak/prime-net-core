@@ -29,7 +29,7 @@ use crate::config::{
     DomainFrontingRule, EchMode, EngineConfig, EvasionStrategy, FrontingProvider,
     TrackerBlockAction,
 };
-use crate::core::chunk_manager::{ChunkManager, DownloadStrategy, ProgressHook};
+use crate::core::chunk_manager::{ChunkManager, ChunkRange, DownloadStrategy, ProgressHook};
 use crate::core::connection_pool::ConnectionPoolConfig;
 use crate::core::{DownloadOutcome, RequestData, ResponseData, ResponseStream};
 use crate::error::{EngineError, Result};
@@ -262,13 +262,49 @@ fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
 }
 
 fn parse_total_length_from_content_range(headers: &HeaderMap) -> Option<u64> {
+    parse_content_range_bounds(headers).and_then(|v| v.total)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ContentRangeBounds {
+    start: u64,
+    end: u64,
+    total: Option<u64>,
+}
+
+fn parse_content_range_bounds(headers: &HeaderMap) -> Option<ContentRangeBounds> {
     // Content-Range: bytes 0-0/12345
-    let v = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
-    let (_unit_and_range, total) = v.split_once('/')?;
-    if total.trim() == "*" {
+    let v = headers
+        .get(reqwest::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .trim();
+    let (unit, rest) = v.split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
         return None;
     }
-    total.trim().parse::<u64>().ok()
+
+    let (range_part, total_part) = rest.split_once('/')?;
+    let (start_s, end_s) = range_part.split_once('-')?;
+    let start = start_s.trim().parse::<u64>().ok()?;
+    let end = end_s.trim().parse::<u64>().ok()?;
+    if end < start {
+        return None;
+    }
+
+    let total = if total_part.trim() == "*" {
+        None
+    } else {
+        Some(total_part.trim().parse::<u64>().ok()?)
+    };
+
+    if let Some(t) = total {
+        if t == 0 || start >= t || end >= t {
+            return None;
+        }
+    }
+
+    Some(ContentRangeBounds { start, end, total })
 }
 
 fn retry_delay(attempt: usize) -> Duration {
@@ -829,5 +865,28 @@ mod tests {
             .position(|v| *v == 0x1303)
             .expect("TLS_CHACHA20_POLY1305_SHA256");
         assert!(i1 < i3 && i3 < i2);
+    }
+
+    #[test]
+    fn parse_content_range_bounds_accepts_valid_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_RANGE,
+            HeaderValue::from_static("bytes 5-10/100"),
+        );
+        let parsed = parse_content_range_bounds(&headers).expect("valid content-range");
+        assert_eq!(parsed.start, 5);
+        assert_eq!(parsed.end, 10);
+        assert_eq!(parsed.total, Some(100));
+    }
+
+    #[test]
+    fn parse_content_range_bounds_rejects_invalid_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_RANGE,
+            HeaderValue::from_static("bytes 10-5/100"),
+        );
+        assert!(parse_content_range_bounds(&headers).is_none());
     }
 }
