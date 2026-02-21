@@ -1,129 +1,91 @@
-# Использование как исходного ядра (встроить в Rust-проект)
+﻿# USAGE SOURCE (Rust)
 
-Этот вариант подходит, если вы хотите:
-
-- встроить движок напрямую в своё Rust-приложение;
-- контролировать фичи сборки (`features`) и конфиг через `EngineConfig`;
-- иметь нативный async API (`PrimeHttpClient::fetch` / `fetch_stream` / `download_to_path`).
-
-## Подключение (path)
+## Подключение
 
 ```toml
 [dependencies]
-prime_net_engine = { path = "../prime-net-engine" }
+prime_net_engine_core = { path = "../coreprime" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
-Если проект — workspace, используйте `path` на каталог с `Cargo.toml` этой библиотеки.
+## Вариант 1: прямой HTTP-клиент
 
-## Фичи
+```rust
+use prime_net_engine_core::{EngineConfig, PrimeHttpClient, RequestData};
 
-По умолчанию включено: `hickory-dns`, `websocket`, `observability`.
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = PrimeHttpClient::new(EngineConfig::default())?;
 
-Если вы хотите минимальную сборку:
+    let req = RequestData::get("https://example.com")
+        .header("Accept", "*/*");
 
-```toml
-[dependencies]
-prime_net_engine = { path = "../prime-net-engine", default-features = false }
+    let resp = client.fetch(req, None).await?;
+    println!("status={}, bytes={}", resp.status_code, resp.body.len());
+    Ok(())
+}
 ```
 
-И затем выборочно включайте:
+## Вариант 2: streaming без буферизации тела
 
-- `features = ["hickory-dns"]` для DNS через Hickory
-- `features = ["websocket"]` для WebSocket клиента
-- `features = ["observability"]` для метрик/логирования
+```rust
+use prime_net_engine_core::{EngineConfig, PrimeHttpClient, RequestData};
 
-## Конфиг
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = PrimeHttpClient::new(EngineConfig::default())?;
+    let mut resp = client.fetch_stream(RequestData::get("https://example.com/large.bin")).await?;
 
-Два основных пути:
+    let mut out = tokio::fs::File::create("large.bin").await?;
+    tokio::io::copy(&mut resp.stream, &mut out).await?;
+    Ok(())
+}
+```
 
-1. Программно: `EngineConfig::default()` или `EngineConfig::builder()`.
-2. Из файла: `EngineConfig::from_file("config.toml")?` (TOML/JSON/YAML).
-
-См. `docs/CONFIG.md` и `config.example.toml`.
-
-Если вы используете `[pt]` (pluggable transports) в конфиге, создавайте клиент через `PrimeEngine::new(config).await?.client()`, чтобы PT-стек поднялся и прокси был настроен автоматически.
-
-## HTTP запрос (пример)
+## Вариант 3: скачивание в файл
 
 ```rust
 use std::sync::Arc;
-
-use prime_net_engine::{EngineConfig, PrimeHttpClient, RequestData};
+use prime_net_engine_core::{EngineConfig, PrimeHttpClient, RequestData};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = EngineConfig::default();
-    let client = PrimeHttpClient::new(config)?;
-
-    let request = RequestData::get("https://example.com")
-        .header("Accept", "*/*");
+    let client = PrimeHttpClient::new(EngineConfig::default())?;
 
     let progress = Arc::new(|downloaded: u64, total: u64, speed_mbps: f64| {
-        eprintln!("progress: {downloaded}/{total} bytes ({speed_mbps:.2} Mbps)");
+        eprintln!("{downloaded}/{total} bytes ({speed_mbps:.2} Mbps)");
     });
 
-    let response = client.fetch(request, Some(progress)).await?;
-    println!("status: {}", response.status_code);
-    println!("body bytes: {}", response.body.len());
+    let out = client
+        .download_to_path(RequestData::get("https://example.com/file.bin"), "file.bin", Some(progress))
+        .await?;
+
+    println!("written={}, resumed={}, chunked={}", out.bytes_written, out.resumed, out.chunked);
     Ok(())
 }
 ```
 
-## Streaming HTTP (без OOM)
+## Когда нужен `PrimeEngine`
 
-`fetch` возвращает тело ответа целиком в память. Для больших ответов используйте `fetch_stream`:
+Если в конфиге включён `[pt]`, используйте:
 
 ```rust
-use prime_net_engine::{EngineConfig, PrimeHttpClient, RequestData};
-use tokio::io::AsyncReadExt;
+use prime_net_engine_core::{EngineConfig, PrimeEngine, RequestData};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = PrimeHttpClient::new(EngineConfig::default())?;
-    let mut resp = client
-        .fetch_stream(RequestData::get("https://example.com/large.bin"))
-        .await?;
+    let cfg = EngineConfig::from_file("prime-net-engine.toml")?;
+    let engine = PrimeEngine::new(cfg).await?;
+    let client = engine.client();
 
-    // Примечание: fetch_stream валидирует HTTP статус (4xx/5xx вернутся как ошибка).
-    // Пример: читаем поток в буфер (для реально больших данных лучше сразу писать в файл).
-    let mut buf = Vec::new();
-    resp.stream.read_to_end(&mut buf).await?;
-    println!("status: {}, bytes: {}", resp.status, buf.len());
+    let resp = client.fetch(RequestData::get("https://example.com"), None).await?;
+    println!("status={}", resp.status_code);
     Ok(())
 }
 ```
 
-## Скачивание в файл (streaming на диск)
+## Дополнительно
 
-`download_to_path` пишет чанки сразу на диск и не держит весь payload в RAM.
-
-Особенности:
-
-- best-effort resume через `Range` (если сервер поддерживает ranges);
-- при сетевых ошибках возможны retry согласно `download.max_retries`;
-- при включённом `download.verify_hash` движок проверит SHA-256 результата и вернёт ошибку при несовпадении.
-
-## Контракт API (важные детали)
-
-- `PrimeHttpClient::fetch` возвращает `ResponseData` целиком в память (может быть OOM на больших ответах).
-- `PrimeHttpClient::fetch_stream` возвращает `ResponseStream` и не буферизует тело.
-- Для скачивания больших файлов без удержания всего payload в памяти используйте `PrimeHttpClient::download_to_path`.
-- Для chunked скачивания используются `HEAD` + `Range: bytes=...` запросы. Если сервер не отдаёт `Content-Length` или не поддерживает range — будет fallback на одиночный `GET`.
-- Anti-censorship DNS:
-  - `PrimeHttpClient` на уровне `reqwest` использует собственный DNS resolver (`PrimeReqwestDnsResolver`), который ходит в `ResolverChain`.
-  - Внутри `fetch` также есть best-effort резолв хоста через chain (для уменьшения утечек/контроля fallback).
-
-## WebSocket без DNS leak
-
-Рекомендуемый способ: создавать WebSocket через `PrimeHttpClient`, чтобы он использовал тот же DNS resolver chain и fronting-правила:
-
-```rust
-use prime_net_engine::{EngineConfig, PrimeHttpClient, WsConfig};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = PrimeHttpClient::new(EngineConfig::default())?;
-    let _ws = client.websocket_client(WsConfig::default());
-    Ok(())
-}
-```
+- примеры в репозитории: `examples/simple_download.rs`, `examples/download_to_file.rs`;
+- WebSocket/SSE API доступны через `PrimeHttpClient`;
+- подробности по конфигу: `docs/CONFIG.md`.

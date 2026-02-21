@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
-  <Package Name="PrimeNetEngine" Manufacturer="PrimeNetEngine" Version="0.1.0" UpgradeCode="7d396058-80ee-4a51-8320-25103e26841d">
+  <Package Name="PrimeNetEngine" Manufacturer="PrimeNetEngine" Version="0.4.5" UpgradeCode="7d396058-80ee-4a51-8320-25103e26841d">
     <MajorUpgrade DowngradeErrorMessage="A newer version of PrimeNetEngine is already installed." />
     <MediaTemplate EmbedCab="yes" />
 

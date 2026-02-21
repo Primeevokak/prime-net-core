@@ -1,92 +1,85 @@
-# Руководство по диагностике
+﻿# TROUBLESHOOTING
 
-## Частые проблемы
+## 1. `SOCKS5 connection refused`
 
-### SOCKS5: `connection refused`
+Проверьте, что сервер реально запущен:
 
-Симптомы:
-- браузер показывает `connection refused`;
-- в TUI видно, что SOCKS5 не запущен.
-
-Решение:
 ```bash
-prime-net-engine socks --bind 127.0.0.1:1080
+prime-net-engine --config prime-net-engine.toml socks --bind 127.0.0.1:1080
 ```
 
-Проверка, что порт реально слушается:
-```bash
-# Linux/macOS
-netstat -an | grep 1080
-lsof -i :1080
+Проверьте системный статус:
 
-# Windows
-netstat -an | findstr 1080
+```bash
+prime-net-engine --config prime-net-engine.toml proxy status
 ```
 
-### Ошибка DNS-резолва
+## 2. `--config-check` падает на DNS/DoH
 
-Симптомы:
-- сайты не открываются;
-- `test` падает на DNS-этапе.
+- запустите локальную проверку без сети:
 
-Что проверить:
-1. Актуальны ли DoH/DoT/DoQ endpoint-ы в конфиге.
-2. Результат ручного теста:
 ```bash
-prime-net-engine test https://example.com
-```
-3. Поведение на более совместимом пресете:
-```bash
-prime-net-engine --preset max-compatibility test https://example.com
+prime-net-engine --config prime-net-engine.toml --config-check --offline
 ```
 
-### Системный прокси не применяется
+- проверьте рабочие провайдеры в `anticensorship.doh_providers`;
+- при необходимости временно используйте более совместимый пресет:
 
-Windows:
-- проверьте `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`;
-- убедитесь, что `ProxyEnable=1` при режиме `all/custom`.
-
-macOS:
-- проверьте `scutil --proxy`;
-- после смены сети повторно включите прокси.
-
-Linux:
-- GNOME: `gsettings get org.gnome.system.proxy mode`;
-- проверьте переменные окружения (`ALL_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY`).
-
-### Низкая скорость
-
-Возможные причины:
-- включен `traffic_shaping_enabled`;
-- медленные DNS endpoint-ы;
-- слишком агрессивный пресет/стратегия evasion для текущей сети.
-
-Что делать:
-1. Отключить shaping в конфиге.
-2. Убрать медленные DNS endpoint-ы.
-3. Сравнить с `max-compatibility`.
-
-### Логи и диагностика
-
-Включить подробные логи:
 ```bash
-prime-net-engine --log-format json --log-level debug test https://example.com
+prime-net-engine --config prime-net-engine.toml --preset max-compatibility test --url https://example.com
 ```
 
-Проверить состояние подсистем:
+## 3. System proxy не включается
+
+Проверьте:
+
+- права пользователя/политики ОС;
+- корректность `system_proxy.socks_endpoint` (`host:port`);
+- что SOCKS endpoint действительно слушает.
+
+Полезные команды:
+
 ```bash
-prime-net-engine proxy status
-prime-net-engine blocklist status
+prime-net-engine --config prime-net-engine.toml proxy enable --mode all
+prime-net-engine --config prime-net-engine.toml proxy status
 ```
 
-Сохранить диагностику в файл:
+## 4. `update install` завершается ошибкой подписи
+
+Это ожидаемо, если:
+
+- сборка без feature `signature-verification`;
+- в коде не заменён публичный ключ-заглушка.
+
+В таком состоянии используйте `update check` только для информирования, а установку делайте вручную через доверенный release pipeline.
+
+## 5. PT (`obfs4`/`snowflake`) не стартует
+
+Проверьте наличие внешних инструментов:
+
+- `tor`
+- `obfs4proxy` (для obfs4)
+- `snowflake-client` (для snowflake)
+
+Также учитывайте env-переключатели авто-bootstrap (`PRIME_PT_AUTO_BOOTSTRAP`, `PRIME_PT_*_URLS`).
+
+## 6. Низкая скорость / нестабильный throughput
+
+Проверьте:
+
+- `evasion.traffic_shaping_enabled`
+- агрессивность `evasion.strategy`
+- таймауты и concurrency в `[download]`
+
+Для сравнения можно быстро переключиться:
+
 ```bash
-prime-net-engine --log-file diagnostics.log --log-level trace test https://example.com
+prime-net-engine --config prime-net-engine.toml --preset max-compatibility test --url https://example.com
 ```
 
-## Что приложить при запросе помощи
+## 7. Что приложить при разборе инцидента
 
-1. ОС и её версия.
-2. Версия `prime-net-engine` (`prime-net-engine --version`).
-3. Используемый пресет.
-4. Сообщения об ошибках и фрагмент логов.
+- ОС и версия;
+- используемый конфиг (без секретов);
+- точная команда запуска;
+- фрагмент логов (`--log-format json --log-level debug`).

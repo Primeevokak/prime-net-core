@@ -1,57 +1,53 @@
-# Архитектура
+﻿# ARCHITECTURE
 
-## Основные подсистемы
+## Верхнеуровневые компоненты
 
-- `PrimeHttpClient` (`src/core/http_client.rs`) - HTTP(S) клиент и orchestration.
-- `ResolverChain` (`src/anticensorship/resolver_chain.rs`) - цепочка DNS резолверов (DoH/DoT/DoQ/System).
-- `PrimeReqwestDnsResolver` (`src/anticensorship/reqwest_dns.rs`) - интеграция `ResolverChain` в `reqwest`.
-- Fronting:
-  - v1: `src/anticensorship/fronting.rs`
-  - v2: выбор front domain с probe/cache в `PrimeHttpClient`.
-- Evasion:
-  - `FragmentingIo` (`src/evasion/fragmenting_io.rs`)
-  - traffic shaping / dpi bypass стратегии.
-- PT stack: `src/pt/*` (trojan/shadowsocks/direct и SOCKS5 bridge).
-- FFI runtime: `src/ffi/mod.rs`.
+- `PrimeHttpClient` (`src/core/http_client.rs` + `http_client_parts/*`): основной HTTP pipeline.
+- `ResolverChain` (`src/anticensorship/resolver_chain.rs`): DNS fallback chain (`doh/dot/doq/system`).
+- `PrimeEngine` (`src/engine.rs`): обвязка `PrimeHttpClient` + PT lifecycle.
+- `PT stack` (`src/pt/*`): trojan, shadowsocks, tor-based obfs4/snowflake, локальный SOCKS5 bridge.
+- `CLI` (`src/bin/prime-net-engine/*`): эксплуатационные команды.
+- `TUI` (`src/bin/prime-tui.rs`, `src/bin/prime_tui_sections/*`): интерактивный shell поверх CLI/конфига.
+- `FFI` (`src/ffi/mod.rs`): C ABI и runtime thread.
 
-## HTTP pipeline (упрощенно)
+## HTTP pipeline
 
-1. Валидация запроса.
-2. Применение default headers.
-3. Применение fronting (если включено).
-4. DNS через `ResolverChain`.
-5. Выбор transport path:
-   - обычный `reqwest`;
-   - fragment/manual path (`TcpStream` + `tokio-rustls` + `hyper`) при evasion.
-6. Возврат:
-   - `fetch` -> `ResponseData` (body в памяти);
-   - `fetch_stream` -> `ResponseStream` (streaming);
-   - `download_to_path` -> streaming в файл (resume/chunk best-effort).
+1. Валидация `RequestData` (`http/https`, обязательные поля).
+2. Инъекция default headers (в т.ч. random User-Agent при `tls_randomization_enabled`).
+3. Privacy middleware (tracker/referer/signals/header overrides).
+4. Domain fronting v2 (при необходимости fallback на v1 map).
+5. Best-effort резолв через `ResolverChain`.
+6. Выбор transport path:
+   - `reqwest` path;
+   - fragment/desync path (`TcpStream + rustls + hyper`) при `evasion.strategy`;
+   - HTTP/3 path при `transport.prefer_http3` и отсутствии proxy.
+7. Возврат результата:
+   - `fetch` -> `ResponseData` (body в памяти)
+   - `fetch_stream` -> `ResponseStream` (streaming)
+   - `download_to_path` -> поток в файл с resume/chunking best-effort
 
-## Fragment path (актуально)
+## Transport/evasion
 
-- Работает для `http://` и `https://`.
-- Для `https://`:
-  - делает TLS handshake через `tokio-rustls`;
-  - ALPN определяет `h2` vs `http/1.1`;
-  - затем handshakes `hyper` как HTTP/2 или HTTP/1.1.
-- Для `http://`:
-  - `hyper` HTTP/1.1 поверх fragmenting IO.
-- Proxy ограничение:
-  - поддерживается только `proxy.kind = "socks5"` для fragment path.
-  - Иные proxy типы в fragment path возвращают config error.
+- Fragment/desync path работает для `http://` и `https://`.
+- При proxy в fragment/desync path поддерживается только `proxy.kind = socks5`.
+- Для HTTPS в fragment path используется отдельный rustls-конфиг, ALPN может выбрать `h2` или `http/1.1`.
+- При `TCP reset` возможен circuit-breaker fallback в fragment path (best-effort).
+
+## PT интеграция
+
+- При включённом `[pt]` `PrimeEngine::new` поднимает локальный SOCKS5 и направляет HTTP через него.
+- `obfs4`/`snowflake` запускаются через внешний Tor client tooling.
+- При отсутствии бинарников возможен auto-bootstrap (см. `tor_client.rs`, env-переменные `PRIME_PT_*`).
 
 ## FFI execution model
 
-- `prime_engine_new` запускает отдельный `tokio` runtime thread.
-- Запросы приходят через thread-safe очередь.
-- Каждая задача исполняется отдельным `tokio::spawn`.
-- Async FFI поддерживает:
-  - cancel (`prime_request_cancel`)
-  - статус (`prime_request_status`)
-  - неблокирующее освобождение handle (`prime_request_free`).
+- `prime_engine_new` создаёт runtime-thread.
+- Задачи запросов передаются через очередь (`tokio mpsc`).
+- Sync и async FFI используют общий движок.
+- Async handle поддерживает `wait`, `cancel`, `status`, `free`.
 
-## Тестовый статус (важно для эксплуатации)
+## Конфигурационный цикл
 
-- Live smoke тесты по сети помечены `ignored` по умолчанию.
-- `http3_local` на Windows помечен `ignored` из-за нестабильного локального QUIC loopback timeout.
+- `EngineConfig::from_file` -> parse -> `apply_compat_repairs` -> `validate`.
+- CLI применяет preset поверх загруженного конфига (`--preset`).
+- `--config-check` использует те же правила валидации плюс сетевые probes.

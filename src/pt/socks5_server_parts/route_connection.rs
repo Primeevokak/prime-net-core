@@ -160,7 +160,10 @@ fn route_race_launch_candidates(ordered: &[RouteCandidate]) -> Vec<RouteCandidat
             .collect();
     }
 
-    let mut launch = Vec::with_capacity(ordered.len().min(ROUTE_RACE_MAX_CANDIDATES));
+    // Keep direct probe first, then race a capped set of bypass profiles.
+    // This avoids dropping all but two bypass candidates when direct exists.
+    let mut launch =
+        Vec::with_capacity(ordered.len().min(ROUTE_RACE_MAX_CANDIDATES.saturating_add(1)));
     launch.extend(
         ordered
             .iter()
@@ -171,7 +174,7 @@ fn route_race_launch_candidates(ordered: &[RouteCandidate]) -> Vec<RouteCandidat
         ordered
             .iter()
             .filter(|candidate| candidate.kind == RouteKind::Bypass)
-            .take(ROUTE_RACE_MAX_CANDIDATES.saturating_sub(launch.len()))
+            .take(ROUTE_RACE_MAX_CANDIDATES)
             .cloned(),
     );
     launch

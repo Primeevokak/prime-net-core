@@ -191,11 +191,7 @@ async fn download_range(
     }
     headers.insert(RANGE, HeaderValue::from_str(&range_value)?);
 
-    let response = client
-        .get(&request.url)
-        .headers(headers)
-        .send()
-        .await?;
+    let response = client.get(&request.url).headers(headers).send().await?;
 
     if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
         return Err(EngineError::Internal(format!(

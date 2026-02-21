@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
@@ -89,9 +89,13 @@ struct App {
     log_selected_line: usize,
     last_diag_refresh: Instant,
     help_overlay: Option<String>,
+    packet_bypass_bootstrap_prompt: Option<PacketBypassBootstrapPrompt>,
+    packet_bypass_unsafe_confirm_prompt: Option<PacketBypassUnsafeConfirmPrompt>,
     classifier_cache_clear_prompt: Option<ClassifierCacheClearPrompt>,
     user_mode: UserMode,
     core_process: Option<Child>,
+    core_event_rx: Option<mpsc::Receiver<CoreUiEvent>>,
+    allow_unverified_packet_bypass_next_start: bool,
     proxy_managed_by_tui: bool,
     core_start_pending: Option<(String, Instant)>,
 }
@@ -102,6 +106,22 @@ struct ClassifierCacheClearPrompt {
     exists: bool,
     size_bytes: u64,
     modified_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct PacketBypassBootstrapPrompt {
+    source_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PacketBypassUnsafeConfirmPrompt {
+    source_url: Option<String>,
+    started_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+enum CoreUiEvent {
+    PacketBypassIntegrityCheckFailed { source_url: Option<String> },
 }
 
 impl App {
@@ -132,9 +152,13 @@ impl App {
             log_selected_line: 0,
             last_diag_refresh: Instant::now() - Duration::from_secs(60),
             help_overlay: None,
+            packet_bypass_bootstrap_prompt: None,
+            packet_bypass_unsafe_confirm_prompt: None,
             classifier_cache_clear_prompt: None,
             user_mode: UserMode::Simple,
             core_process: None,
+            core_event_rx: None,
+            allow_unverified_packet_bypass_next_start: false,
             proxy_managed_by_tui: false,
             core_start_pending: None,
         }
@@ -280,6 +304,7 @@ async fn run_app(
 ) -> Result<()> {
     loop {
         poll_core_startup(app)?;
+        drain_core_events(app);
         app.conn_monitor.tick();
         if app.log_auto_scroll {
             app.log_viewer.jump_to_bottom();
@@ -357,6 +382,55 @@ fn render(frame: &mut Frame, app: &mut App) {
         frame.render_widget(
             Paragraph::new(help.clone())
                 .block(Block::default().title("Справка").borders(Borders::ALL)),
+            popup,
+        );
+    } else if let Some(confirm) = &app.packet_bypass_unsafe_confirm_prompt {
+        let popup = centered_rect(90, 70, area);
+        let source = confirm.source_url.as_deref().unwrap_or("н/д");
+        let remaining = 10u64.saturating_sub(confirm.started_at.elapsed().as_secs());
+        let confirm_hint = if remaining == 0 {
+            "[y]/[Enter] Да, я понимаю риск"
+        } else {
+            "Ожидайте завершения таймера перед подтверждением"
+        };
+        let text = format!(
+            "Режим запуска без проверки SHA256\n\n\
+Источник: {source}\n\
+До разблокировки подтверждения: {remaining} с\n\n\
+Риски:\n\
+  - может быть запущен подменённый бинарный файл\n\
+  - возможны кража данных и перехват трафика\n\
+  - вы обходите защиту целостности загрузки\n\n\
+Действия:\n\
+  {confirm_hint}\n\
+  [n]/[Esc] Нет, я передумал"
+        );
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(text).block(
+                Block::default()
+                    .title("Подтверждение риск-режима")
+                    .borders(Borders::ALL),
+            ),
+            popup,
+        );
+    } else if let Some(prompt) = &app.packet_bypass_bootstrap_prompt {
+        let popup = centered_rect(90, 70, area);
+        let source = prompt.source_url.as_deref().unwrap_or("н/д");
+        let text = format!(
+            "Packet bypass не удалось запустить в безопасном режиме.\n\n\
+Причина: не найден SHA256 sidecar для скачанного пакета.\n\
+Источник: {source}\n\n\
+Что можно сделать:\n\
+  [r]/[Enter] Повторить безопасный запуск (рекомендуется)\n\
+  [u] Запустить без проверки SHA256 (небезопасно)\n\
+  [n]/[Esc] Оставить direct-режим\n\n\
+Режим без проверки включается только вручную и только на один запуск."
+        );
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(text)
+                .block(Block::default().title("Проблема запуска bypass").borders(Borders::ALL)),
             popup,
         );
     } else if let Some(prompt) = &app.classifier_cache_clear_prompt {
@@ -616,6 +690,58 @@ fn render_proxy(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    if let Some(confirm) = app.packet_bypass_unsafe_confirm_prompt.clone() {
+        match key.code {
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.packet_bypass_unsafe_confirm_prompt = None;
+                app.packet_bypass_bootstrap_prompt = None;
+                app.status_line = "Запуск в риск-режиме отменён".to_owned();
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                let remaining = 10u64.saturating_sub(confirm.started_at.elapsed().as_secs());
+                if remaining > 0 {
+                    app.status_line = format!(
+                        "Подтверждение риск-режима станет доступно через {remaining} с"
+                    );
+                } else {
+                    app.packet_bypass_unsafe_confirm_prompt = None;
+                    app.packet_bypass_bootstrap_prompt = None;
+                    restart_core_for_packet_bypass_prompt(app, true)?;
+                    app.status_line = "Запуск риск-режима активирован: проверка SHA256 временно отключена на один запуск".to_owned();
+                }
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+    if app.packet_bypass_bootstrap_prompt.is_some() {
+        match key.code {
+            KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Enter => {
+                app.packet_bypass_bootstrap_prompt = None;
+                restart_core_for_packet_bypass_prompt(app, false)?;
+                app.status_line = "Повтор безопасного запуска packet bypass".to_owned();
+            }
+            KeyCode::Char('u') | KeyCode::Char('U') => {
+                let source_url = app
+                    .packet_bypass_bootstrap_prompt
+                    .as_ref()
+                    .and_then(|p| p.source_url.clone());
+                app.packet_bypass_unsafe_confirm_prompt = Some(PacketBypassUnsafeConfirmPrompt {
+                    source_url,
+                    started_at: Instant::now(),
+                });
+                app.status_line =
+                    "Риск-режим требует отдельного подтверждения через 10 секунд".to_owned();
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.packet_bypass_bootstrap_prompt = None;
+                app.status_line =
+                    "Оставлен direct-режим: запуск packet bypass без проверки отменён".to_owned();
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
     if let Some(prompt) = app.classifier_cache_clear_prompt.clone() {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {

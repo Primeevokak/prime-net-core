@@ -41,6 +41,9 @@ fn mark_route_capability_healthy(kind: RouteKind, family: RouteIpFamily) {
 }
 
 fn should_enable_universal_bypass_domain(host: &str) -> bool {
+    if !universal_bypass_domains_enabled() {
+        return false;
+    }
     let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
     if host.is_empty() || host == "localhost" || host.ends_with(".local") {
         return false;
@@ -49,6 +52,20 @@ fn should_enable_universal_bypass_domain(host: &str) -> bool {
         return false;
     }
     host.contains('.')
+}
+
+fn universal_bypass_domains_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("PRIME_PACKET_BYPASS_UNIVERSAL_DOMAINS")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn select_bypass_source(
@@ -628,7 +645,10 @@ fn should_mark_empty_bypass_session_as_soft_failure(candidate: &RouteCandidate, 
     if port != 443 || candidate.kind != RouteKind::Bypass {
         return false;
     }
-    matches!(candidate.source, "builtin" | "learned-domain" | "learned-ip")
+    matches!(
+        candidate.source,
+        "builtin" | "learned-domain" | "learned-ip"
+    )
 }
 
 fn record_bypass_profile_failure(
@@ -791,4 +811,3 @@ fn learned_bypass_threshold(destination: &str) -> Option<u8> {
     }
     Some(LEARNED_BYPASS_MIN_FAILURES_DOMAIN)
 }
-

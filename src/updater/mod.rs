@@ -136,7 +136,12 @@ impl AutoUpdater {
                 "update tag must not be empty".to_owned(),
             ));
         }
-        let api = format!("{}/repos/{}/releases/tags/{}", self.api_base(), self.repo, tag);
+        let api = format!(
+            "{}/repos/{}/releases/tags/{}",
+            self.api_base(),
+            self.repo,
+            tag
+        );
         self.fetch_release(&api).await
     }
 

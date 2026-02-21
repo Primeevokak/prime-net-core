@@ -702,7 +702,44 @@ fn write_classifier_snapshot(cfg: &ClassifierStoreConfig) -> std::io::Result<()>
     }
     let data =
         serde_json::to_vec_pretty(&snapshot).map_err(|e| std::io::Error::other(e.to_string()))?;
-    fs::write(&cfg.path, data)?;
+    write_snapshot_atomic(&cfg.path, &data)?;
     Ok(())
 }
 
+fn write_snapshot_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("relay-classifier.json");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_name = format!("{file_name}.{}.{}.tmp", std::process::id(), nonce);
+    let tmp_path = path.with_file_name(tmp_name);
+
+    fs::write(&tmp_path, data)?;
+    match fs::rename(&tmp_path, path) {
+        Ok(()) => Ok(()),
+        Err(_rename_err) => {
+            #[cfg(windows)]
+            {
+                if path.exists() {
+                    let _ = fs::remove_file(path);
+                }
+                match fs::rename(&tmp_path, path) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        let _ = fs::remove_file(&tmp_path);
+                        Err(e)
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = fs::remove_file(&tmp_path);
+                Err(_rename_err)
+            }
+        }
+    }
+}

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 #[cfg(unix)]
@@ -160,16 +160,65 @@ fn packet_bypass_enabled(enabled_by_config: bool) -> bool {
 
 fn parse_packet_args_from_env() -> Option<Vec<String>> {
     if let Ok(v) = std::env::var("PRIME_PACKET_BYPASS_ARGS") {
-        let args: Vec<String> = v
-            .split_whitespace()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let args = parse_shell_like_args(&v).unwrap_or_else(|| {
+            v.split_whitespace()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect()
+        });
         if !args.is_empty() {
             return Some(args);
         }
     }
     None
+}
+
+fn parse_shell_like_args(input: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for ch in input.chars() {
+        if escaped {
+            cur.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else {
+                cur.push(ch);
+            }
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        cur.push(ch);
+    }
+    if escaped {
+        cur.push('\\');
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    Some(out)
 }
 
 fn resolve_packet_profiles() -> Vec<PacketBypassProfile> {
@@ -197,10 +246,54 @@ fn find_free_port() -> u16 {
         .unwrap_or(10801)
 }
 
+fn find_free_port_excluding(used: &HashSet<u16>) -> u16 {
+    for _ in 0..64 {
+        let p = find_free_port();
+        if !used.contains(&p) {
+            return p;
+        }
+    }
+    for p in 20000u16..60000u16 {
+        if !used.contains(&p) {
+            return p;
+        }
+    }
+    10801
+}
+
+fn set_port_arg(args: &mut Vec<String>, port: u16) {
+    let port_str = port.to_string();
+    for i in 0..args.len() {
+        if args[i] == "--port" {
+            if i + 1 < args.len() {
+                args[i + 1] = port_str.clone();
+            } else {
+                args.push(port_str.clone());
+            }
+            return;
+        }
+        if args[i].starts_with("--port=") {
+            args[i] = format!("--port={port_str}");
+            return;
+        }
+    }
+    args.push("--port".to_owned());
+    args.push(port_str);
+}
+
+fn assign_unique_profile_ports(profiles: &mut [PacketBypassProfile]) {
+    let mut used = HashSet::new();
+    for profile in profiles {
+        let port = find_free_port_excluding(&used);
+        used.insert(port);
+        set_port_arg(&mut profile.args, port);
+    }
+}
+
 fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
     #[cfg(target_os = "windows")]
     {
-        vec![
+        let mut profiles = vec![
             PacketBypassProfile {
                 name: "balanced".to_owned(),
                 args: vec![
@@ -281,11 +374,13 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                     "7".to_owned(),
                 ],
             },
-        ]
+        ];
+        assign_unique_profile_ports(&mut profiles);
+        profiles
     }
     #[cfg(target_os = "linux")]
     {
-        vec![
+        let mut profiles = vec![
             PacketBypassProfile {
                 name: "balanced".to_owned(),
                 args: vec![
@@ -345,14 +440,18 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                     "4".to_owned(),
                 ],
             },
-        ]
+        ];
+        assign_unique_profile_ports(&mut profiles);
+        profiles
     }
     #[cfg(target_os = "macos")]
     {
-        vec![PacketBypassProfile {
+        let mut profiles = vec![PacketBypassProfile {
             name: "default".to_owned(),
             args: vec!["--port".to_owned(), find_free_port().to_string()],
-        }]
+        }];
+        assign_unique_profile_ports(&mut profiles);
+        profiles
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     {
@@ -763,4 +862,3 @@ async fn build_mirror_urls(filename: &str) -> Vec<String> {
         vec![]
     }
 }
-

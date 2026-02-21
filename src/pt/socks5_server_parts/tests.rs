@@ -597,10 +597,11 @@ mod tests {
         let ordered = vec![direct.clone(), bypass_1.clone(), bypass_2.clone(), bypass_3, bypass_4];
 
         let launch = route_race_launch_candidates(&ordered);
-        assert_eq!(launch.len(), ROUTE_RACE_MAX_CANDIDATES);
+        assert_eq!(launch.len(), ROUTE_RACE_MAX_CANDIDATES + 1);
         assert_eq!(launch[0].route_id(), direct.route_id());
         assert_eq!(launch[1].route_id(), bypass_1.route_id());
         assert_eq!(launch[2].route_id(), bypass_2.route_id());
+        assert_eq!(launch[3].route_id(), "bypass:3");
     }
 
     #[test]

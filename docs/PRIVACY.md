@@ -1,47 +1,71 @@
-﻿# Privacy Layer
+﻿# PRIVACY
 
-## Features
+Privacy layer применяется внутри HTTP pipeline и полностью управляется конфигом секции `[privacy]`.
 
-`prime-net-engine` provides an opt-in privacy layer for HTTP requests.
+## Что делает privacy layer
 
-### 1) Tracker blocker
+### 1. Tracker blocker
 
-- Blocks known tracker hosts and URL patterns before request send.
-- Supports built-in list presets (`easyprivacy`, `easylist`, `ublock`) and custom list files.
-- Modes:
-  - `block`: enforce blocking.
-  - `log_only`: only emit logs.
-- On block action:
-  - `error`: return `BlockedByPrivacyPolicy`.
-  - `empty_200`: return an empty `200` response.
-- `allowlist` can exclude domains from blocking.
+Секция: `[privacy.tracker_blocker]`.
 
-### 2) Referer policy
+- проверяет host и URL-паттерны до отправки запроса;
+- встроенные списки (`easyprivacy`, `easylist`, `ublock`) + кастомные файлы;
+- режимы:
+  - `block`
+  - `log_only`
+- действие при блокировке:
+  - `error`
+  - `empty_200`
+- `allowlist` исключает домены из блокировки.
 
-- Controls outgoing `Referer` leakage for cross-origin requests.
-- Modes:
-  - `strip`
-  - `origin_only`
-  - `pass_through`
-- Search-engine referers can be force-stripped (`strip_from_search_engines=true`).
+### 2. Referer policy
 
-### 3) Privacy signals
+Секция: `[privacy.referer]`.
 
-- Adds request headers:
-  - `DNT: 1`
-  - `Sec-GPC: 1`
+- `strip`
+- `origin_only`
+- `pass_through`
 
-## Legal and practical notes
+Дополнительно: `strip_from_search_engines` и пользовательский список поисковых доменов.
 
-- `DNT` is widely ignored by many sites.
-- `Sec-GPC` has stronger legal meaning in some jurisdictions (for example CCPA contexts) and is increasingly recognized.
-- Privacy features reduce tracking surface, but cannot guarantee full anonymity.
+### 3. Privacy signals
 
-## Logging and observability
+Секция: `[privacy.signals]`.
 
-The engine emits privacy actions into logs using categories:
+- `DNT: 1`
+- `Sec-GPC: 1`
+
+### 4. Privacy headers overrides
+
+Дополнительные секции:
+
+- `[privacy.user_agent]`
+- `[privacy.referer_override]`
+- `[privacy.ip_spoof]`
+- `[privacy.webrtc]`
+- `[privacy.location_api]`
+
+Эти настройки изменяют исходящие заголовки (`User-Agent`, `Referer`, `X-Forwarded-For`, `X-Real-IP`, `Permissions-Policy`).
+
+## Поведение при блокировке
+
+Если tracker blocker сработал:
+
+- при `on_block = error` возвращается `BlockedByPrivacyPolicy`;
+- при `on_block = empty_200` запрос не уходит в сеть, возвращается пустой ответ `200` с заголовком `X-Prime-Privacy: tracker_blocked`.
+
+## Логирование
+
+Privacy-решения маркируются тегами:
+
 - `[BLOCKED]`
 - `[PRIVACY]`
 - `[TRACKER]`
 
-TUI log viewer can filter by these categories.
+Их можно фильтровать в TUI (`Logs`) или в внешнем сборщике логов.
+
+## Ограничения
+
+- Это уровень HTTP клиента, а не системная анонимизация.
+- Не защищает от browser fingerprinting (canvas/fonts/WebGL и т.п.).
+- Не предотвращает корреляцию трафика сильным противником.

@@ -1,146 +1,101 @@
-# prime-net-engine
+﻿# prime-net-engine
 
-Сетевой движок на Rust (crate + FFI) для HTTP(S), WebSocket и вспомогательных anti-censorship сценариев.
+Актуальная версия: `0.4.5`.
 
-Проект ориентирован на:
+`prime-net-engine` это сетевой движок на Rust с двумя основными способами использования:
 
-- безопасный streaming больших ответов и скачивание в файл без OOM;
-- управляемый DNS-резолв (DoH/DoT/DoQ/System через fallback chain);
-- TLS/ECH настройки и TLS fingerprint randomization;
-- domain fronting (v1/v2);
-- DPI-evasion (fragment/auto, userspace path);
-- FFI-интеграцию (sync + async + cancel/status);
-- CLI-утилиту `prime-net-engine` для эксплуатации и диагностики.
+- как библиотека (`prime_net_engine_core`) для HTTP(S), WebSocket, SSE и вспомогательных transport/privacy сценариев;
+- как CLI (`prime-net-engine`) и TUI (`prime-tui`) для запуска локального SOCKS5, проверки конфига, системного прокси, blocklist и диагностики.
 
-Важно: это не браузерный движок. HTML/CSS/JS/DOM рендеринга нет.
+## Что есть в проекте
 
-## Быстрый старт (Rust)
+- HTTP-клиент с `fetch`, `fetch_stream`, `download_to_path`.
+- DNS-цепочка `DoH/DoT/DoQ/System` с контролируемым fallback.
+- Опциональные ECH режимы (`grease|real|auto`) и best-effort TLS fingerprint профили.
+- Domain fronting (правила v1/v2).
+- DPI-evasion (`fragment|desync|auto`) для HTTP/HTTPS path.
+- PT режимы: `trojan`, `shadowsocks`, `obfs4`, `snowflake`.
+- FFI C API (`include/prime_net.h`) с sync/async запросами.
+
+## Быстрый старт (CLI)
+
+Сборка:
+
+```bash
+cargo build --release --bin prime-net-engine --bin prime-tui
+```
+
+Минимальный сценарий:
+
+```bash
+prime-net-engine wizard --out prime-net-engine.toml
+prime-net-engine --config prime-net-engine.toml --config-check
+prime-net-engine --config prime-net-engine.toml socks --bind 127.0.0.1:1080
+prime-net-engine --config prime-net-engine.toml proxy enable --mode all
+prime-net-engine --config prime-net-engine.toml test --url https://example.com
+```
+
+Запуск TUI:
+
+```bash
+prime-net-engine --config prime-net-engine.toml tui
+```
+
+## Быстрый старт (Rust crate)
 
 ```toml
 [dependencies]
-prime_net_engine = { path = "../prime-net-engine" }
+prime_net_engine_core = { path = "../coreprime" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
-Пример streaming fetch:
-
 ```rust
-use prime_net_engine::{EngineConfig, PrimeHttpClient, RequestData};
-use tokio::io::AsyncWriteExt;
+use prime_net_engine_core::{EngineConfig, PrimeHttpClient, RequestData};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = PrimeHttpClient::new(EngineConfig::default())?;
-    let mut resp = client.fetch_stream(RequestData::get("https://example.com")).await?;
-
-    let mut out = tokio::fs::File::create("response.bin").await?;
-    let written = tokio::io::copy(&mut resp.stream, &mut out).await?;
-    out.flush().await?;
-
-    println!("status: {}, bytes: {}", resp.status, written);
+    let resp = client.fetch(RequestData::get("https://example.com"), None).await?;
+    println!("status={}, bytes={}", resp.status_code, resp.body.len());
     Ok(())
 }
 ```
 
-Если используете `[pt]` в конфиге, создавайте клиент через:
-
-- `PrimeEngine::new(config).await?.client()`
-
-а не через `PrimeHttpClient::new(...)`.
+Если в конфиге включён `[pt]`, создавайте клиент через `PrimeEngine::new(config).await?.client()`, а не через `PrimeHttpClient::new(...)`.
 
 ## Быстрый старт (FFI)
-
-Сборка:
 
 ```bash
 cargo build --release
 ```
 
-Артефакты:
+Основные артефакты:
 
-- `target/release/prime_net_engine.{dll|so|dylib}` (`cdylib`)
-- `target/release/prime_net_engine.{lib|a}` (`staticlib`)
-- заголовок: `include/prime_net.h`
-
-Ключевые FFI функции:
-
-- `prime_engine_fetch` (sync)
-- `prime_engine_fetch_async` + `prime_request_wait` (async)
-- `prime_request_cancel`, `prime_request_status`, `prime_request_free`
-- `prime_response_free`, `prime_engine_free`
-
-## CLI
-
-Сборка:
-
-```bash
-cargo build --release --bin prime-net-engine
-```
-
-Примеры:
-
-```bash
-prime-net-engine --config config.example.toml --config-check
-prime-net-engine --config config.example.toml fetch https://example.com/ --print-headers --out -
-prime-net-engine --config config.example.toml download https://example.com/file.bin --out file.bin
-prime-net-engine wizard --out prime-net-engine.toml
-```
-
-Пресеты:
-
-```bash
-prime-net-engine --preset strict-privacy fetch https://example.com/
-prime-net-engine --config prime-net-engine.toml --preset aggressive-evasion fetch https://example.com/
-```
-
-## Текущее состояние тестов
-
-- `cargo test` проходит в актуальном состоянии проекта.
-- `tests/http3_live.rs`, `tests/obfs4_live.rs`, `tests/snowflake_live.rs`, `tests/trojan_live.rs` помечены `ignored` (live smoke).
-- `tests/http3_local.rs` помечен `ignored` на Windows (`cfg_attr(windows, ignore = "...")`) из-за нестабильного локального QUIC loopback timeout.
-- `tests/integration/tui_tests.rs` собирается только на Unix (`cfg(unix)`), так как использует Unix PTY (`rexpect`).
-
-## Cargo features
-
-По умолчанию включено:
-
-- `hickory-dns`
-- `websocket`
-- `observability`
+- `target/release/prime_net_engine_core.dll` (Windows)
+- `target/release/libprime_net_engine_core.so` (Linux)
+- `target/release/libprime_net_engine_core.dylib` (macOS)
+- `target/release/prime_net_engine_core.lib` / `libprime_net_engine_core.a` (staticlib)
+- `include/prime_net.h`
 
 ## Документация
 
 - `docs/README.md` - индекс документации.
+- `docs/QUICKSTART.md` - быстрый старт CLI/TUI.
+- `docs/USER_GUIDE.md` - рабочие сценарии эксплуатации.
+- `docs/EXECUTABLE.md` - полный CLI-референс.
+- `docs/CONFIG.md` - актуальная конфигурация и валидации.
 - `docs/API.md` - публичный Rust/FFI API.
-- `docs/USAGE_SOURCE.md` - интеграция как Rust crate.
-- `docs/USAGE_FFI.md` - использование через C API.
-- `docs/CONFIG.md` - конфиг-референс.
-- `docs/ARCHITECTURE.md` - внутренняя архитектура.
-- `docs/EXECUTABLE.md` - CLI и эксплуатация.
-- `docs/USER_GUIDE.md` - практический гайд по использованию приложения.
-- `docs/PRESETS.md` - встроенные профили конфигурации.
-- `docs/TLS_FINGERPRINTING.md` - ограничения и возможности TLS/JA3 fingerprinting.
-- `docs/SECURITY.md` - модель безопасности и ограничения.
-- `docs/LLM_GUIDE.md` - карта внутренней структуры проекта для LLM/AI-ассистентов.
+- `docs/USAGE_SOURCE.md` - интеграция в Rust-проект.
+- `docs/USAGE_FFI.md` - интеграция через C ABI.
+- `docs/ARCHITECTURE.md` - архитектура и pipeline.
+- `docs/PRESETS.md` - встроенные пресеты.
+- `docs/PRIVACY.md` - приватность и заголовки.
+- `docs/TLS_FINGERPRINTING.md` - TLS fingerprinting в этой реализации.
+- `docs/SECURITY.md` - модель угроз и ограничения.
 - `docs/TROUBLESHOOTING.md` - диагностика типовых проблем.
 
-## Бета-дополнения (v0.3.0)
+## Важные ограничения
 
-- TUI launcher: `prime-net-engine tui`
-- Команды системного прокси:
-  - `prime-net-engine proxy enable --mode all|pac|custom`
-  - `prime-net-engine proxy disable`
-  - `prime-net-engine proxy status`
-  - `prime-net-engine proxy generate-pac --output proxy.pac`
-  - `prime-net-engine proxy serve-pac --port 8888`
-- Команды blocklist:
-  - `prime-net-engine blocklist update`
-  - `prime-net-engine blocklist status`
-- Команды обновления:
-  - `prime-net-engine update check`
-  - `prime-net-engine update install`
-  - `prime-net-engine update rollback`
-- Проверка связности:
-  - `prime-net-engine test --url https://example.com`
-
-Быстрый сценарий запуска: `docs/QUICKSTART.md`.
+- CLI не поддерживает `--version` как отдельный флаг.
+- TLS fingerprinting реализован как best-effort поверх `rustls` (это не uTLS-имперсонация браузера).
+- `update install` требует рабочей подписи релизов; в текущем исходнике публичный ключ-заглушка, поэтому без донастройки обновление не будет установлено.

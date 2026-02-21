@@ -81,7 +81,22 @@ impl PrimeHttpClient {
 
         let mut resumed = false;
         let parts_dir: PathBuf = PathBuf::from(format!("{}.prime.parts", path.to_string_lossy()));
+        let parts_dir_preexists = parts_dir.exists();
         std::fs::create_dir_all(&parts_dir)?;
+        let manifest_path = parts_dir.join("resume.key");
+        let expected_resume_key = build_parts_resume_key(&request.url, content_length);
+        let manifest_matches = std::fs::read_to_string(&manifest_path)
+            .ok()
+            .map(|s| s.trim() == expected_resume_key)
+            .unwrap_or(false);
+        if !manifest_matches {
+            // Existing part files may belong to another URL/version; never reuse them blindly.
+            if parts_dir_preexists {
+                let _ = std::fs::remove_dir_all(&parts_dir);
+                std::fs::create_dir_all(&parts_dir)?;
+            }
+            std::fs::write(&manifest_path, format!("{expected_resume_key}\n"))?;
+        }
 
         let chunks = self.chunk_manager.calculate_chunks(content_length);
         if chunks.is_empty() {
@@ -154,8 +169,8 @@ impl PrimeHttpClient {
             result??;
 
             let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
-            let speed_mbps = (downloaded.load(Ordering::Relaxed) as f64 * 8.0 / 1_000_000.0)
-                / elapsed;
+            let speed_mbps =
+                (downloaded.load(Ordering::Relaxed) as f64 * 8.0 / 1_000_000.0) / elapsed;
             self.chunk_manager.adjust_concurrency(speed_mbps);
             target_concurrency = self
                 .chunk_manager
@@ -549,9 +564,9 @@ async fn download_part_to_file(
                                 Ok(Some(buf)) => {
                                     file.write_all(&buf).await?;
                                     attempt_written += buf.len() as u64;
-                                    let total_downloaded =
-                                        downloaded.fetch_add(buf.len() as u64, Ordering::Relaxed)
-                                            + (buf.len() as u64);
+                                    let total_downloaded = downloaded
+                                        .fetch_add(buf.len() as u64, Ordering::Relaxed)
+                                        + (buf.len() as u64);
                                     if let Some(cb) = &progress {
                                         let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
                                         let speed_mbps =
@@ -605,7 +620,21 @@ async fn download_part_to_file(
         }
     }
 
-    Err(last_err.unwrap_or_else(|| {
-        EngineError::Internal("part download failed".to_owned())
-    }))
+    Err(last_err.unwrap_or_else(|| EngineError::Internal("part download failed".to_owned())))
+}
+
+fn build_parts_resume_key(url: &str, content_length: u64) -> String {
+    use sha2::Digest;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(url.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(content_length.to_le_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
 }

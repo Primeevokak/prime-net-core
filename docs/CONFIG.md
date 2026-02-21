@@ -1,279 +1,253 @@
-# Конфигурация движка (`EngineConfig`)
+﻿# CONFIG
 
-Пример файла: `config.example.toml`.
+Источник истины для структуры: `src/config/config_sections/*`.
 
-Поддерживаемые форматы:
+## Форматы и загрузка
 
-- TOML (`.toml`)
-- JSON (`.json`)
-- YAML (`.yaml` / `.yml`)
+`EngineConfig::from_file(path)` поддерживает:
 
-Загрузка из файла: `EngineConfig::from_file(path)`.
+- `.toml`
+- `.json`
+- `.yaml` / `.yml`
 
-Если расширение неизвестно, движок пытается распарсить по очереди TOML -> JSON -> YAML.
+Если расширение неизвестно, парсинг пробуется последовательно: TOML -> JSON -> YAML.
 
-## `[download]`
+После загрузки автоматически выполняются:
 
-Настройки HTTP-клиента и загрузки на диск.
+1. `apply_compat_repairs()`
+2. `validate()`
 
-- `initial_concurrency` (usize): начальная параллельность чанков для chunked download.
-- `max_concurrency` (usize): верхняя граница параллельности.
-- `chunk_size_mb` (usize): размер чанка в MiB (используется, если включён chunked режим).
-- `max_retries` (usize): число retry на сетевых ошибках (используется для `HEAD`/`GET` и для каждого чанка).
-- `adaptive_enabled` (bool): включить chunked download (best-effort) для больших файлов.
-- `adaptive_threshold_mbps` (f64): порог (Mbps) для адаптации параллельности (chunk manager).
-- `request_timeout_secs` (u64): общий timeout запроса.
-- `connect_timeout_secs` (u64): timeout на TCP connect.
-- `max_idle_per_host` (usize): max idle connections per host.
-- `pool_idle_timeout_secs` (u64): idle timeout для пула.
-- `http2_max_concurrent_reset_streams` (usize, optional): best-effort защита для проблемных серверов при высокой конкуренции.
-  Важно: `reqwest` не даёт прямого доступа к hyper knob; в этой сборке значение используется для ограничения внутренних probe-операций, которые могут приводить к RESET.
-- `verify_hash` (string, optional): опциональная проверка целостности скачанного файла.
+## Compatibility repairs (автоматические починки)
 
-`verify_hash` поддерживает:
+При чтении из файла движок может автоматически исправить старые конфиги:
 
-- `"sha256:<64 hex>"`: проверка результата по заданному SHA-256.
-- `"auto"`: прочитать ожидаемый SHA-256 из файла `"<target>.sha256"` рядом с целевым файлом.
+- выключить `domain_fronting_enabled`, если нет правил;
+- почистить `dns_fallback_chain` от отключённых резолверов;
+- удалить `cloudflare` из `doh_providers`, если нужно - подставить `adguard,google,quad9`;
+- убрать Cloudflare endpoint-ы из `dot_servers`/`doq_servers`, при необходимости подставить безопасные дефолты AdGuard/Google.
 
-Поведение `verify_hash`:
+## Секции
+
+### `[download]`
+
+Дефолты:
+
+- `initial_concurrency = 4`
+- `max_concurrency = 16`
+- `chunk_size_mb = 4`
+- `max_retries = 2`
+- `adaptive_enabled = true`
+- `adaptive_threshold_mbps = 25.0`
+- `request_timeout_secs = 30`
+- `connect_timeout_secs = 10`
+- `max_idle_per_host = 16`
+- `pool_idle_timeout_secs = 30`
+- `http2_max_concurrent_reset_streams = null`
+- `verify_hash = null`
 
-- проверка запускается после успешного скачивания (`download_to_path`) и на fast-path, когда движок считает, что файл уже полностью скачан (например, resume/skip);
-- при несовпадении хеша возвращается ошибка;
-- режим `"auto"` строгий: если `"<target>.sha256"` отсутствует или не содержит digest, возвращается ошибка.
- - проверка читает файл целиком и может быть заметной по времени на больших файлах.
+`verify_hash`:
 
-Форматы `.sha256`, которые поддерживает `"auto"`:
+- `"sha256:<64 hex>"`
+- `"auto"` (ожидает файл `<target>.sha256` рядом с итоговым файлом)
 
-- `<hex>  filename`
-- `SHA256 (filename) = <hex>`
-- любая строка, содержащая 64 hex подряд (движок пытается извлечь digest из текста)
+### `[transport]`
+
+Дефолты:
 
-## `[tls]`
+- `prefer_http3 = false`
+- `http3_only = false`
+- `http3_connect_timeout_ms = 10000`
+- `http3_idle_timeout_ms = 30000`
+- `http3_keep_alive_interval_ms = null`
+- `http3_insecure_skip_verify = false`
 
-TLS-параметры (backend: `rustls`).
+### `[tls]`
 
-- `min_version` / `max_version`: минимальная/максимальная версия TLS.
-  Фактически поддерживаются TLS 1.2 и TLS 1.3.
-- `alpn_protocols`: список ALPN (например `["h2", "http/1.1"]`).
-- `ja3_fingerprint`: best-effort профиль ClientHello.
+Дефолты:
 
-`ja3_fingerprint`:
+- `min_version = "tls1_2"`
+- `max_version = "tls1_3"`
+- `alpn_protocols = ["h2", "http/1.1"]`
+- `ja3_fingerprint = "rustls_default"`
 
-- `"rustls_default"`: дефолтный ClientHello от rustls.
-- `"chrome_120"`: best-effort rustls-профиль, ориентированный на Chrome-подобный fingerprint.
-- `"firefox_121"`: best-effort rustls-профиль, ориентированный на Firefox-подобный fingerprint.
-- `"random"`: рандомизация части параметров (в рамках ограничений rustls).
+Поддерживаемые `ja3_fingerprint`:
 
-Важно: это не full uTLS-impersonation; профили реализованы поверх rustls и могут отличаться от реальных браузеров.
+- `rustls_default`
+- `chrome_120`
+- `firefox_121`
+- `random`
 
-## `[anticensorship]`
+### `[anticensorship]`
 
-Антицензурные компоненты: DNS fallback chain, DoH/DoT/DoQ, ECH, domain fronting.
+Ключевые дефолты:
 
-### DNS fallback chain
+- `doh_enabled = true`
+- `doh_providers = ["adguard", "google", "quad9"]`
+- `doh_cache_ttl_secs = 300`
+- `bootstrap_ips = []`
+- `dnssec_enabled = true`
+- `dns_cache_size = 4096`
+- `dns_query_timeout_secs = 5`
+- `dns_attempts = 2`
+- `dot_enabled = false`
+- `dot_servers = ["94.140.14.14:853", "94.140.15.15:853", "8.8.8.8:853", "8.8.4.4:853"]`
+- `dot_sni = "dns.adguard-dns.com"`
+- `doq_enabled = false`
+- `doq_servers = ["94.140.14.14:784", "94.140.15.15:784"]`
+- `doq_sni = "dns.adguard-dns.com"`
+- `dns_fallback_chain = ["doh", "system"]`
+- `system_dns_enabled = true`
+- `ech_mode = null`
+- `ech_enabled = false` (legacy)
+- `domain_fronting_enabled = false`
+- `domain_fronting_rules = []`
+- `fronting_probe_ttl_secs = 600`
+- `fronting_probe_timeout_secs = 5`
+- `tls_randomization_enabled = true`
 
-- `dns_fallback_chain`: порядок попыток резолва. Возможные значения: `"doh"`, `"dot"`, `"doq"`, `"system"`.
-- `system_dns_enabled` (bool): разрешить/запретить системный DNS как fallback.
+`ech_mode`:
 
-Важно:
+- `grease`
+- `real`
+- `auto`
 
-- DoH/DoT/DoQ требуют cargo feature `hickory-dns`. Без неё `ResolverChain::from_config` вернёт ошибку вида `"DoH requires feature \"hickory-dns\""` и т.п.
-- `bootstrap_ips` позволяет избежать утечки на системный DNS при доступе к DoH endpoint (когда сам upstream домен нужно резолвить).
+### `[evasion]`
 
-### DoH
+Дефолты:
 
-- `doh_enabled` (bool)
-- `doh_providers` (array of string): алиасы провайдеров (см. `config.example.toml`).
-- `doh_cache_ttl_secs` (u64)
-- `bootstrap_ips` (array of IP): IP для bootstrap резолва upstream-ов
+- `prime_mode = true`
+- `strategy = null`
+- `fragment_size = 64`
+- `fragment_sleep_ms = 10`
+- `tls_record_max_fragment_size = null`
+- `rst_retry_max = 2`
+- `traffic_shaping_enabled = false`
+- `timing_jitter_ms_min = 5`
+- `timing_jitter_ms_max = 35`
+- `client_hello_split_offsets = [1, 5, 40]`
+- `split_at_sni = true`
+- `first_packet_ttl = 0`
+- `fragment_budget_bytes = 16384`
+- `packet_bypass_enabled = true`
+- `classifier_persist_enabled = true`
+- `classifier_cache_path = "~/.cache/prime-net-engine/relay-classifier.json"` (или platform cache dir)
+- `classifier_entry_ttl_secs = 604800`
+- `strategy_race_enabled = true`
 
-### DNSSEC/cache (Hickory)
+`strategy`:
 
-- `dnssec_enabled` (bool)
-- `dns_cache_size` (usize)
-- `dns_query_timeout_secs` (u64)
-- `dns_attempts` (usize)
+- `fragment`
+- `desync`
+- `auto`
 
-### DoT
+### `[privacy]`
 
-- `dot_enabled` (bool)
-- `dot_servers` (array of string): `host[:port]` или `ip[:port]`, порт по умолчанию 853
-- `dot_sni` (string): SNI/hostname для TLS
+#### `[privacy.tracker_blocker]`
 
-### DoQ
+Дефолты:
 
-- `doq_enabled` (bool)
-- `doq_servers` (array of string): порт по умолчанию 784
-- `doq_sni` (string): SNI/hostname для TLS
+- `enabled = false`
+- `lists = ["easyprivacy", "easylist"]`
+- `custom_lists = []`
+- `mode = "block"`
+- `on_block = "error"`
+- `allowlist = []`
 
-### ECH
+#### `[privacy.referer]`
 
-- `ech_mode` (string, optional): `"grease" | "real" | "auto"`
-- `ech_enabled` (bool): legacy switch, эквивалент `"grease"`. Предпочитайте `ech_mode`.
+Дефолты:
 
-Поведение:
+- `enabled = false`
+- `mode = "origin_only"`
+- `strip_from_search_engines = true`
+- `search_engine_domains = []`
 
-- `ech_mode="grease"`: включает ECH GREASE (placeholder).
-- `ech_mode="real"`: пытается включить реальный ECH через ECHConfigList из DNS HTTPS RR (best-effort).
-- `ech_mode="auto"`: сначала пытается `real`, затем fallback на `grease`.
+#### `[privacy.signals]`
 
-Ограничения:
+Дефолты:
 
-- Любой включённый ECH (через `ech_mode` или `ech_enabled`) требует, чтобы TLS 1.3 был разрешён в `tls.min_version`/`tls.max_version`.
-- Для IP-литералов (когда host это IP) ECH `real` не применяется, а `auto` может использовать `grease`.
+- `send_dnt = true`
+- `send_gpc = true`
 
-### Domain fronting (v1/v2)
+#### Дополнительные privacy-поля
 
-- `domain_fronting_enabled` (bool)
-- `domain_fronting_rules` (array): правила fronting
-- `fronting_probe_ttl_secs` (u64): TTL кэша результатов probe (v2)
-- `fronting_probe_timeout_secs` (u64): timeout probe (v2)
+- `[privacy.user_agent]`: `enabled=false`, `preset=custom`, `custom_value=""`
+- `[privacy.referer_override]`: `enabled=false`, `value="https://primeevolution.com"`
+- `[privacy.ip_spoof]`: `enabled=false`, `spoofed_ip="77.88.21.10"`
+- `[privacy.webrtc]`: `block_enabled=false`
+- `[privacy.location_api]`: `block_enabled=false`
 
-Поля правила (`domain_fronting_rules[*]`):
+### `[proxy]` (опционально)
 
-- `target_host` (string): какой hostname считать "таргетом" (матч по host из URL, case-insensitive).
-- `front_domain` (string): legacy v1 front domain.
-- `front_domains` (array of string): v2 кандидаты front domain (если не пусто, имеет приоритет над `front_domain`).
-- `real_host` (string): значение для `Host:` header (то, что "на самом деле" запрашиваем).
-- `sni_domain` (string, optional): зарезервировано под будущий SNI override, в текущей реализации не применяется.
-- `provider` (string): `"cloudflare" | "fastly" | "googlecdn" | "azurecdn"` (сейчас используется для классификации, но не влияет на HTTP-логику).
+- `kind = "http" | "https" | "socks5"`
+- `address = "host:port"` или URL
 
-Как работает v2:
+Важно: нельзя одновременно задавать `[proxy]` и `[pt]`.
 
-- при `front_domains` движок выполняет `HEAD https://<front_domain>/` с `Host: <real_host>`;
-- первый кандидат, который отвечает со статусом `< 500`, считается рабочим и кэшируется на `fronting_probe_ttl_secs`.
+### `[pt]` (опционально)
 
-Примечание про WebSocket:
+- `kind = "trojan" | "shadowsocks" | "obfs4" | "snowflake"`
+- `local_socks5_bind` (дефолт `127.0.0.1:0`)
+- `silent_drop` (дефолт `false`)
 
-- WebSocket использует domain fronting v2 (probe `HEAD https://<front>/` + кэширование) и v1 fallback (первый кандидат) для совместимости.
+Подсекции по `kind`:
 
-### `tls_randomization_enabled`
+- `[pt.trojan]`: `server`, `password`, optional `sni`, `alpn_protocols`, `insecure_skip_verify`
+- `[pt.shadowsocks]`: `server`, `password`, `method`
+- `[pt.obfs4]`: `server`, `cert`, optional `fingerprint`, optional `iat_mode`, `tor_bin`, `obfs4proxy_bin`, args
+- `[pt.snowflake]`: `tor_bin`, `snowflake_bin`, optional `broker/front/amp_cache/bridge`, `stun_servers`, args
 
-- `tls_randomization_enabled` (bool): если `true`, движок добавляет дефолтный `User-Agent`, если в запросе нет `User-Agent`.
-  В текущей реализации это не меняет TLS handshake.
+### `[system_proxy]`
 
-## `[evasion]`
+Дефолты:
 
-DPI-evasion и "circuit breaker" по TCP RST.
+- `auto_configure = false`
+- `mode = "off"`
+- `pac_port = 8888`
+- `socks_endpoint = "127.0.0.1:1080"`
 
-- `strategy` (string, optional): `"fragment" | "desync" | "auto"`
-  - `"fragment"`: userspace TLS fragmentation во время рукопожатия (HTTPS only).
-  - `"auto"`: выбрать лучший доступный вариант (по умолчанию `"fragment"`, переключается на `"desync"`, если задан `client_hello_split_offsets`).
-  - `"desync"`: userspace TCP segmentation для первых TLS байт (best-effort split ClientHello по `client_hello_split_offsets`, затем обычная фрагментация; HTTPS only).
-- `fragment_size` (usize): размер фрагментов для последующих write (после первого).
-- `fragment_sleep_ms` (u64): пауза между фрагментами.
-- `rst_retry_max` (usize): max retry для fallback по TCP RST (если запрос упал на reset, движок пробует повторить через fragment path).
+`mode`: `off|all|pac|custom`
 
-Ограничения fragment-режима:
+### `[blocklist]`
 
-- применяется только для `https://`;
-- поддерживается прокси только `proxy.kind="socks5"` (в fragment/desync пути не поддерживаются HTTP/HTTPS прокси; SOCKS5-аутентификация тоже не поддерживается);
-- fragment/desync path использует отдельный стек (TCP + rustls + hyper), чтобы контролировать запись TLS рукопожатия; ALPN согласуется, поддерживаются HTTP/1.1 и HTTP/2.
+Дефолты:
 
-Traffic shaping / timing jitter:
+- `enabled = true`
+- `source = "https://github.com/zapret-info/z-i/raw/master/dump.csv"`
+- `auto_update = true`
+- `update_interval_hours = 24`
+- `cache_path = "~/.cache/prime-net-engine/blocklist.json"` (или platform cache dir)
 
-- `traffic_shaping_enabled` (bool): если `true`, fragment/desync path будет добавлять случайный jitter между фрагментами и (best-effort) рандомизировать размер последующих фрагментов.
-- `timing_jitter_ms_min` / `timing_jitter_ms_max` (u64): диапазон jitter (мс), применяется только при `traffic_shaping_enabled=true`.
-- `client_hello_split_offsets` (array of usize): best-effort split для `strategy="desync"` (байтовые оффсеты внутри первого TLS write).
+### `[updater]`
 
-## `[pt]` (Pluggable Transports, 2026-02-14)
+Дефолты:
 
-Update (2026-02-15):
+- `enabled = true`
+- `auto_check = true`
+- `check_interval_hours = 24`
+- `repo = "your-username/prime-net-engine"`
+- `channel = "stable"`
 
-- `kind="obfs4"` and `kind="snowflake"` are implemented via an external Tor client instance.
-- This requires `tor` plus the corresponding client transport binary:
-  - obfs4: `obfs4proxy`
-  - snowflake: `snowflake-client`
-- The engine will start Tor, wait for its SOCKS5 port to become ready, and then route HTTP through it.
+### `[telemetry]`
 
-### `[pt.obfs4]` (Tor obfs4 bridges)
+Дефолты:
 
-- `server`: `"host:port"` (bridge address)
-- `fingerprint` (optional): 40 hex chars (bridge identity fingerprint)
-- `cert`: `cert=...` value from the Tor bridge line
-- `iat_mode` (u8, optional): `0..=2` (default = 0)
-- `tor_bin` (string): default `"tor"`
-- `tor_args` (array): extra CLI args for tor (advanced)
-- `obfs4proxy_bin` (string): default `"obfs4proxy"`
-- `obfs4proxy_args` (array): extra args for obfs4proxy (advanced)
+- `crash_reports = false`
+- `endpoint = "https://crashes.example.com"`
+- `include_config = false`
 
-### `[pt.snowflake]` (Tor snowflake)
+## Основные валидации
 
-- `tor_bin` (string): default `"tor"`
-- `tor_args` (array): extra CLI args for tor (advanced)
-- `snowflake_bin` (string): default `"snowflake-client"`
-- `broker` (optional): broker URL
-- `front` (optional): front domain (domain fronting)
-- `amp_cache` (optional): AMP cache URL
-- `stun_servers` (array): STUN servers (each is passed as `-stun <server>` to snowflake-client)
-- `bridge` (optional): placeholder bridge address (a safe dummy is used if unset)
-- `snowflake_args` (array): extra args for snowflake-client (advanced)
+- `initial_concurrency`, `max_concurrency`, `chunk_size_mb`, таймауты > 0.
+- `initial_concurrency <= max_concurrency`.
+- `http3_only=true` требует `prefer_http3=true`.
+- `dns_fallback_chain` не пустой, без дублей, и согласован с `*_enabled`.
+- при `dot_enabled=true` и `doq_enabled=true` соответствующие списки серверов не пустые.
+- `domain_fronting_enabled=true` требует непустые валидные `domain_fronting_rules`.
+- `pt` и `proxy` одновременно запрещены.
+- `system_proxy.socks_endpoint` должен быть `host:port` (`[::1]:port` для IPv6).
+- `updater.repo` должен быть формата `owner/name`.
+- `download.verify_hash` должен быть `auto` или `sha256:<64 hex>`.
+- `ech_mode` требует доступности TLS 1.3 в диапазоне `tls.min_version..tls.max_version`.
 
-Клиентский PT-режим: движок поднимает локальный SOCKS5 и направляет HTTP через него.
-
-- `kind`: `"trojan" | "shadowsocks" | "obfs4" | "snowflake"`
-  - `"trojan"`: реализовано (клиент).
-  - `"shadowsocks"`: реализовано (TCP-клиент).
-  - `"obfs4"`: Tor PT (client) via external `tor` + `obfs4proxy` (compatible with Tor obfs4 bridges).
-  - `"snowflake"`: Tor PT (client) via external `tor` + `snowflake-client`.
-- `local_socks5_bind`: например `"127.0.0.1:0"` (порт `0` = выбрать случайный).
-- `silent_drop`: best-effort "active probing resistance" для локального SOCKS5 (молча закрывать на мусорных handshakes).
-
-### `[pt.trojan]`
-
-- `server`: `"host:port"`
-- `password`: строка
-- `sni` (optional): SNI override
-- `alpn_protocols` (array): ALPN list (по умолчанию `["http/1.1"]`)
-- `insecure_skip_verify` (bool): DANGEROUS; только для тестов
-
-## `[proxy]`
-
-Прокси применяется в двух местах:
-
-- Обычный путь (`fetch`/`fetch_stream`/`download_to_path`) использует `reqwest::Client` и поддерживает `kind="http"|"https"|"socks5"`.
-- Fragment/desync путь использует ручное подключение (TCP + rustls + hyper) и поддерживает только `kind="socks5"` (без аутентификации).
-
-- `kind`: `"http" | "https" | "socks5"`
-- `address`: `"host:port"` или полный URL со схемой
-
-Для `socks5` используется схема `socks5h://` (DNS через прокси).
-Для IPv6 используйте формат `"[::1]:1080"` (в квадратных скобках).
-
-## `[transport]` (2026-02-14)
-
-- `prefer_http3` (bool): prefer HTTP/3 (QUIC) for `https://` requests (best-effort; disabled when `proxy != None`).
-- `http3_only` (bool): if `true`, do not fall back to TCP transports when HTTP/3 was selected.
-- `http3_connect_timeout_ms` (u64): QUIC connect timeout.
-- `http3_idle_timeout_ms` (u64): QUIC idle timeout.
-- `http3_keep_alive_interval_ms` (u64, optional): QUIC keep-alive interval.
-- `http3_insecure_skip_verify` (bool): DANGEROUS; accept invalid certificates for HTTP/3 (intended for testing).
-
-## `[evasion]` update (2026-02-15)
-
-- `tls_record_max_fragment_size` (usize, optional): максимальный TLS fragment size (bytes), применяется только для fragment/desync пути (best-effort; зависит от поддержки на стороне сервера).
-- Fragment path больше не форсит HTTP/1.1: ALPN согласуется, поддерживаются HTTP/1.1 и HTTP/2.
-- Fragment/desync path поддерживает SOCKS5-прокси (без auth) при `proxy.kind="socks5"`.
-
-## `[privacy]`
-
-### `[privacy.tracker_blocker]`
-
-- `enabled` (bool): enable tracker blocker.
-- `lists` (array<string>): built-in presets (`easyprivacy`, `easylist`, `ublock`).
-- `custom_lists` (array<string>): file paths with hosts/adblock-like rules.
-- `mode` (string): `block|log_only`.
-- `on_block` (string): `error|empty_200`.
-- `allowlist` (array<string>): domains excluded from blocking.
-
-### `[privacy.referer]`
-
-- `enabled` (bool): enable referer policy processing.
-- `mode` (string): `strip|origin_only|pass_through`.
-- `strip_from_search_engines` (bool): force strip for known search referers.
-- `search_engine_domains` (array<string>): extra search engine domains.
-
-### `[privacy.signals]`
-
-- `send_dnt` (bool): add `DNT: 1`.
-- `send_gpc` (bool): add `Sec-GPC: 1`.
+Практический шаблон: `config.example.toml`.

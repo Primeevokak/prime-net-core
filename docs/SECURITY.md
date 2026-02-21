@@ -1,69 +1,46 @@
-# Модель безопасности
-
-## Что защищает `prime-net-engine`
-
-Приватность DNS:
-- запросы через DoH/DoT/DoQ;
-- снижение риска DNS-утечек.
-
-Снижение узнаваемости TLS:
-- настройки TLS randomization;
-- поддержка ECH (в зависимости от режима).
-
-Обход DPI:
-- fragment/desync-стратегии;
-- опции traffic shaping.
-
-Pluggable transports:
-- поддержка Trojan и Shadowsocks;
-- интеграция Tor PT (`obfs4`, `snowflake`) при соответствующей конфигурации.
-
-## Что `prime-net-engine` не закрывает полностью
-
-- DNS-утечки на уровне ОС/приложений, которые обходят прокси.
-- Браузерный fingerprinting (canvas/fonts/WebGL и т.п.).
-- Трафик-анализ сильным противником.
-- Компрометацию конечного устройства.
+﻿# SECURITY
 
 ## Модель угроз
 
-Основная целевая угроза:
-1. Цензура и фильтрация на уровне ISP/локальной сети.
+`prime-net-engine` ориентирован в первую очередь на:
 
-Не является полным решением для:
-1. Точечного преследования со стороны сильного государственного противника.
-2. Требований полной анонимности.
+- сетевые ограничения и DPI на уровне провайдера/локальной сети;
+- снижение утечек DNS и гибкий выбор transport path.
 
-Для high-risk сценариев используйте `prime-net-engine` совместно с Tor/VPN и операционными мерами безопасности.
+Проект не является полной системой анонимности.
 
-## Безопасность обновлений
+## Что покрывается
 
-- Предпочитайте подписанные обновления (feature `signature-verification`).
-- Используйте только официальные релизы репозитория.
-- Регулярно выполняйте `prime-net-engine update check`.
+- DNS privacy: DoH/DoT/DoQ + контролируемый fallback;
+- транспортные техники обхода: fragment/desync, fronting, PT;
+- privacy middleware на уровне HTTP-запросов;
+- базовая диагностика состояния proxy/blocklist.
 
-## Безопасная настройка
+## Что не покрывается полностью
 
-- По возможности используйте пресет `strict-privacy`.
-- Держите blocklist в актуальном состоянии.
-- После смены сети/ОС перепроверяйте `proxy status` и DNS-поведение.
+- деанонимизация на уровне браузера/устройства;
+- глобальный traffic correlation сильным противником;
+- утечки из приложений, которые не используют этот движок/прокси;
+- компрометация конечной машины.
 
-## Сообщение о уязвимостях
+## Обновления и подписи
 
-Не публикуйте уязвимости в публичных issue до исправления.
+`update install` использует проверку подписи релизного артефакта (`.sig`).
 
-Контакт: `security@yourproject.com`
+Технически:
 
-## Privacy Threat Model Extension
+- при сборке без feature `signature-verification` установка обновления завершится ошибкой;
+- в текущем исходнике публичный ключ релизов оставлен заглушкой (`REPLACE_WITH_REAL_RELEASE_SIGNING_KEY`), поэтому проверка подписи также завершится ошибкой до замены ключа.
 
-New privacy controls reduce passive tracking but do not eliminate fingerprinting.
+Следствие: без донастройки release-signing цепочки команда `update install` не должна считаться рабочим каналом обновления.
 
-Covered better now:
-- Known analytics/tracker endpoints via request-time blocking.
-- Referer query leakage to third-party origins.
-- Explicit privacy signals (`Sec-GPC`, `DNT`).
+## Практические рекомендации
 
-Still not fully covered:
-- Browser/device fingerprinting (canvas/fonts/WebGL, timing, behavior).
-- Network-level traffic correlation by strong adversaries.
-- Server-side identifier correlation when user is authenticated.
+- использовать пресет под задачу (`strict-privacy` или `aggressive-evasion`);
+- держать blocklist актуальным (`blocklist update`);
+- регулярно проверять реальный статус прокси (`proxy status`);
+- хранить логи инцидентов (`--log-file`, `--log-format json`).
+
+## Сообщения об уязвимостях
+
+Публичного канала security disclosure в репозитории не зафиксировано. Для ответственного раскрытия заведите отдельный приватный канал и не публикуйте детали до фикса.

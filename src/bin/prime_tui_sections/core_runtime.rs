@@ -142,6 +142,7 @@ fn activate_core(app: &mut App) -> Result<()> {
             }
             Ok(Some(_)) | Err(_) => {
                 app.core_process = None;
+                app.core_event_rx = None;
             }
         }
     }
@@ -153,7 +154,9 @@ fn activate_core(app: &mut App) -> Result<()> {
         "prime-net-engine"
     });
 
-    let child = Command::new(&bin)
+    let allow_unverified = std::mem::take(&mut app.allow_unverified_packet_bypass_next_start);
+    let mut command = Command::new(&bin);
+    command
         .arg("--config")
         .arg(&app.config_path)
         .arg("--log-level")
@@ -165,21 +168,29 @@ fn activate_core(app: &mut App) -> Result<()> {
         .arg(&endpoint)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            EngineError::Internal(format!(
-                "не удалось запустить ядро ({}) : {e}",
-                bin.display()
-            ))
-        })?;
+        .stderr(Stdio::piped());
+    if allow_unverified {
+        command.env("PRIME_PACKET_BYPASS_ALLOW_UNVERIFIED", "1");
+    }
+    let child = command.spawn().map_err(|e| {
+        EngineError::Internal(format!(
+            "не удалось запустить ядро ({}) : {e}",
+            bin.display()
+        ))
+    })?;
 
     app.core_process = Some(child);
+    let (event_tx, event_rx) = mpsc::channel();
     if let Some(child) = app.core_process.as_mut() {
-        attach_core_log_pump(child, app.log_viewer.clone());
+        attach_core_log_pump(child, app.log_viewer.clone(), event_tx);
     }
+    app.core_event_rx = Some(event_rx);
     app.core_start_pending = Some((endpoint.clone(), Instant::now()));
-    app.status_line = format!("Запуск ядра для {endpoint}...");
+    app.status_line = if allow_unverified {
+        format!("Запуск ядра для {endpoint} (режим без проверки SHA256, только на один запуск)...")
+    } else {
+        format!("Запуск ядра для {endpoint}...")
+    };
     Ok(())
 }
 
@@ -188,11 +199,21 @@ fn deactivate_core(app: &mut App) -> Result<()> {
         let _ = child.kill();
         let _ = child.wait();
     }
+    app.core_event_rx = None;
+    app.allow_unverified_packet_bypass_next_start = false;
     app.core_start_pending = None;
     system_proxy_manager().disable()?;
     app.proxy_managed_by_tui = false;
     app.status_line = "Ядро остановлено: системный прокси отключён".to_owned();
     Ok(())
+}
+
+fn restart_core_for_packet_bypass_prompt(app: &mut App, allow_unverified: bool) -> Result<()> {
+    if app.core_process.is_some() {
+        deactivate_core(app)?;
+    }
+    app.allow_unverified_packet_bypass_next_start = allow_unverified;
+    activate_core(app)
 }
 
 fn poll_core_startup(app: &mut App) -> Result<()> {
@@ -207,6 +228,7 @@ fn poll_core_startup(app: &mut App) -> Result<()> {
     match child.try_wait() {
         Ok(Some(status)) => {
             app.core_process = None;
+            app.core_event_rx = None;
             app.core_start_pending = None;
             app.proxy_managed_by_tui = false;
             app.status_line = format!("Ядро не запустилось (статус: {status})");
@@ -215,6 +237,7 @@ fn poll_core_startup(app: &mut App) -> Result<()> {
         Ok(None) => {}
         Err(e) => {
             app.core_process = None;
+            app.core_event_rx = None;
             app.core_start_pending = None;
             app.proxy_managed_by_tui = false;
             app.status_line = format!("Не удалось проверить процесс ядра: {e}");
@@ -235,6 +258,7 @@ fn poll_core_startup(app: &mut App) -> Result<()> {
         let _ = child.kill();
         let _ = child.wait();
         app.core_process = None;
+        app.core_event_rx = None;
         app.core_start_pending = None;
         app.proxy_managed_by_tui = false;
         app.status_line = "Таймаут запуска ядра (см. вкладку «Логи»)".to_owned();
@@ -242,7 +266,38 @@ fn poll_core_startup(app: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn attach_core_log_pump(child: &mut Child, log_viewer: Arc<LogViewer>) {
+fn drain_core_events(app: &mut App) {
+    let mut disconnected = false;
+    if let Some(rx) = app.core_event_rx.as_ref() {
+        loop {
+            match rx.try_recv() {
+                Ok(CoreUiEvent::PacketBypassIntegrityCheckFailed { source_url }) => {
+                    if app.packet_bypass_bootstrap_prompt.is_none()
+                        && app.packet_bypass_unsafe_confirm_prompt.is_none()
+                    {
+                        app.packet_bypass_bootstrap_prompt =
+                            Some(PacketBypassBootstrapPrompt { source_url });
+                        app.status_line = "Packet bypass не запущен безопасно: выберите дальнейшее действие".to_owned();
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+    }
+    if disconnected {
+        app.core_event_rx = None;
+    }
+}
+
+fn attach_core_log_pump(
+    child: &mut Child,
+    log_viewer: Arc<LogViewer>,
+    event_tx: mpsc::Sender<CoreUiEvent>,
+) {
     let Some(stderr) = child.stderr.take() else {
         log_viewer.add_log(LogEntry {
             timestamp: SystemTime::now(),
@@ -256,6 +311,7 @@ fn attach_core_log_pump(child: &mut Child, log_viewer: Arc<LogViewer>) {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
         let mut buf = Vec::new();
+        let mut integrity_alert_sent = false;
         loop {
             buf.clear();
             let Ok(n) = reader.read_until(b'\n', &mut buf) else {
@@ -272,6 +328,11 @@ fn attach_core_log_pump(child: &mut Child, log_viewer: Arc<LogViewer>) {
             }
             let line = String::from_utf8_lossy(&buf).into_owned();
             let (level, target, message) = parse_core_log_line(&line);
+            if !integrity_alert_sent && is_packet_bypass_missing_sidecar_issue(&target, &message) {
+                let source_url = extract_sidecar_source_url(&message);
+                let _ = event_tx.send(CoreUiEvent::PacketBypassIntegrityCheckFailed { source_url });
+                integrity_alert_sent = true;
+            }
             log_viewer.add_log(LogEntry {
                 timestamp: SystemTime::now(),
                 level,
@@ -301,6 +362,21 @@ fn parse_core_log_line(line: &str) -> (Level, String, String) {
     };
     let message = parts.collect::<Vec<_>>().join(" ");
     (level, target.to_owned(), message)
+}
+
+fn is_packet_bypass_missing_sidecar_issue(target: &str, message: &str) -> bool {
+    if target != "socks_cmd" && target != "packet_bypass" {
+        return false;
+    }
+    message.contains("packet bypass integrity check failed: no sha256 sidecar")
+}
+
+fn extract_sidecar_source_url(message: &str) -> Option<String> {
+    let marker = "no sha256 sidecar for '";
+    let idx = message.find(marker)?;
+    let rest = &message[idx + marker.len()..];
+    let end = rest.find('\'')?;
+    Some(rest[..end].to_owned())
 }
 
 fn proxy_mode_label(mode: &ProxyMode) -> &'static str {
