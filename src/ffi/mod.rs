@@ -128,15 +128,19 @@ pub extern "C" fn prime_engine_new(config_path: *const c_char) -> *mut PrimeEngi
 /// # Safety
 /// `engine` must be a pointer previously returned by `prime_engine_new`, not yet freed.
 pub unsafe extern "C" fn prime_engine_free(engine: *mut PrimeEngine) {
-    ffi_guard("prime_engine_free", || (), || {
-        if engine.is_null() {
-            return;
-        }
-        // SAFETY: pointer was created by prime_engine_new and is unique here.
-        unsafe {
-            let _ = Box::from_raw(engine as *mut PrimeEngineHandle);
-        }
-    });
+    ffi_guard(
+        "prime_engine_free",
+        || (),
+        || {
+            if engine.is_null() {
+                return;
+            }
+            // SAFETY: pointer was created by prime_engine_new and is unique here.
+            unsafe {
+                let _ = Box::from_raw(engine as *mut PrimeEngineHandle);
+            }
+        },
+    );
 }
 
 #[no_mangle]
@@ -151,7 +155,12 @@ pub unsafe extern "C" fn prime_engine_fetch(
 ) -> *mut PrimeResponse {
     ffi_guard(
         "prime_engine_fetch",
-        || pack_error(PRIME_ERR_RUNTIME, "Rust panic occurred in prime_engine_fetch"),
+        || {
+            pack_error(
+                PRIME_ERR_RUNTIME,
+                "Rust panic occurred in prime_engine_fetch",
+            )
+        },
         || {
             if engine.is_null() {
                 return pack_error(PRIME_ERR_NULL_PTR, "engine pointer is null");
@@ -292,7 +301,12 @@ pub unsafe extern "C" fn prime_request_wait(
 ) -> *mut PrimeResponse {
     ffi_guard(
         "prime_request_wait",
-        || pack_error(PRIME_ERR_RUNTIME, "Rust panic occurred in prime_request_wait"),
+        || {
+            pack_error(
+                PRIME_ERR_RUNTIME,
+                "Rust panic occurred in prime_request_wait",
+            )
+        },
         || {
             if handle.is_null() {
                 return pack_error(PRIME_ERR_NULL_PTR, "request handle pointer is null");
@@ -319,9 +333,9 @@ pub unsafe extern "C" fn prime_request_wait(
                         std::sync::mpsc::RecvTimeoutError::Timeout => {
                             EngineError::Internal("timeout".to_owned())
                         }
-                        std::sync::mpsc::RecvTimeoutError::Disconnected => {
-                            EngineError::Internal("request was cancelled (engine dropped)".to_owned())
-                        }
+                        std::sync::mpsc::RecvTimeoutError::Disconnected => EngineError::Internal(
+                            "request was cancelled (engine dropped)".to_owned(),
+                        ),
                     })
             };
 
@@ -361,36 +375,41 @@ pub unsafe extern "C" fn prime_request_wait(
 /// # Safety
 /// `handle` must be a valid pointer returned by `prime_engine_fetch_async`.
 pub unsafe extern "C" fn prime_request_cancel(handle: *mut PrimeRequestHandle) -> i32 {
-    ffi_guard("prime_request_cancel", || PRIME_ERR_RUNTIME, || {
-        if handle.is_null() {
-            return PRIME_ERR_NULL_PTR;
-        }
-        // SAFETY: pointer was allocated by prime_engine_fetch_async.
-        let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
+    ffi_guard(
+        "prime_request_cancel",
+        || PRIME_ERR_RUNTIME,
+        || {
+            if handle.is_null() {
+                return PRIME_ERR_NULL_PTR;
+            }
+            // SAFETY: pointer was allocated by prime_engine_fetch_async.
+            let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
 
-        let cur = inner.status.load(Ordering::SeqCst);
-        if cur == PrimeRequestStatus::COMPLETED as u8 || cur == PrimeRequestStatus::FAILED as u8 {
-            return PRIME_OK;
-        }
-        if cur == PrimeRequestStatus::CANCELLED as u8 {
-            return PRIME_OK;
-        }
+            let cur = inner.status.load(Ordering::SeqCst);
+            if cur == PrimeRequestStatus::COMPLETED as u8 || cur == PrimeRequestStatus::FAILED as u8
+            {
+                return PRIME_OK;
+            }
+            if cur == PrimeRequestStatus::CANCELLED as u8 {
+                return PRIME_OK;
+            }
 
-        inner
-            .status
-            .store(PrimeRequestStatus::CANCELLED as u8, Ordering::SeqCst);
+            inner
+                .status
+                .store(PrimeRequestStatus::CANCELLED as u8, Ordering::SeqCst);
 
-        if let Some(abort) = inner.abort.lock().as_ref() {
-            abort.abort();
-        }
+            if let Some(abort) = inner.abort.lock().as_ref() {
+                abort.abort();
+            }
 
-        // Wake any waiter (best-effort). The runtime task may still deliver a result if it already finished.
-        let _ = inner
-            .tx
-            .send(Err(EngineError::Internal("cancelled".to_owned())));
+            // Wake any waiter (best-effort). The runtime task may still deliver a result if it already finished.
+            let _ = inner
+                .tx
+                .send(Err(EngineError::Internal("cancelled".to_owned())));
 
-        PRIME_OK
-    })
+            PRIME_OK
+        },
+    )
 }
 
 #[no_mangle]
@@ -399,36 +418,44 @@ pub unsafe extern "C" fn prime_request_cancel(handle: *mut PrimeRequestHandle) -
 pub unsafe extern "C" fn prime_request_status(
     handle: *mut PrimeRequestHandle,
 ) -> PrimeRequestStatus {
-    ffi_guard("prime_request_status", || PrimeRequestStatus::FAILED, || {
-        if handle.is_null() {
-            return PrimeRequestStatus::FAILED;
-        }
-        // SAFETY: pointer was allocated by prime_engine_fetch_async.
-        let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
-        match inner.status.load(Ordering::SeqCst) {
-            0 => PrimeRequestStatus::PENDING,
-            1 => PrimeRequestStatus::RUNNING,
-            2 => PrimeRequestStatus::COMPLETED,
-            3 => PrimeRequestStatus::CANCELLED,
-            _ => PrimeRequestStatus::FAILED,
-        }
-    })
+    ffi_guard(
+        "prime_request_status",
+        || PrimeRequestStatus::FAILED,
+        || {
+            if handle.is_null() {
+                return PrimeRequestStatus::FAILED;
+            }
+            // SAFETY: pointer was allocated by prime_engine_fetch_async.
+            let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
+            match inner.status.load(Ordering::SeqCst) {
+                0 => PrimeRequestStatus::PENDING,
+                1 => PrimeRequestStatus::RUNNING,
+                2 => PrimeRequestStatus::COMPLETED,
+                3 => PrimeRequestStatus::CANCELLED,
+                _ => PrimeRequestStatus::FAILED,
+            }
+        },
+    )
 }
 
 #[no_mangle]
 /// # Safety
 /// `handle` must be a valid pointer returned by `prime_engine_fetch_async` and not already freed.
 pub unsafe extern "C" fn prime_request_free(handle: *mut PrimeRequestHandle) {
-    ffi_guard("prime_request_free", || (), || {
-        if handle.is_null() {
-            return;
-        }
-        // Best-effort: cancel underlying task to avoid background network activity after handle free.
-        let _ = unsafe { prime_request_cancel(handle) };
-        unsafe {
-            drop(Box::from_raw(handle as *mut PrimeRequestHandleInner));
-        }
-    });
+    ffi_guard(
+        "prime_request_free",
+        || (),
+        || {
+            if handle.is_null() {
+                return;
+            }
+            // Best-effort: cancel underlying task to avoid background network activity after handle free.
+            let _ = unsafe { prime_request_cancel(handle) };
+            unsafe {
+                drop(Box::from_raw(handle as *mut PrimeRequestHandleInner));
+            }
+        },
+    );
 }
 
 #[no_mangle]
@@ -436,18 +463,22 @@ pub unsafe extern "C" fn prime_request_free(handle: *mut PrimeRequestHandle) {
 /// `response` must be a pointer previously returned by `prime_engine_fetch` or `prime_request_wait`
 /// and not already freed via `prime_response_free`.
 pub unsafe extern "C" fn prime_response_free(response: *mut PrimeResponse) {
-    ffi_guard("prime_response_free", || (), || {
-        if response.is_null() {
-            return;
-        }
-        // SAFETY: response pointer was allocated in pack_response.
-        unsafe {
-            let boxed = Box::from_raw(response);
-            if !boxed.owner.is_null() {
-                let _ = Box::from_raw(boxed.owner as *mut OwnedPrimeResponse);
+    ffi_guard(
+        "prime_response_free",
+        || (),
+        || {
+            if response.is_null() {
+                return;
             }
-        }
-    });
+            // SAFETY: response pointer was allocated in pack_response.
+            unsafe {
+                let boxed = Box::from_raw(response);
+                if !boxed.owner.is_null() {
+                    let _ = Box::from_raw(boxed.owner as *mut OwnedPrimeResponse);
+                }
+            }
+        },
+    );
 }
 
 #[no_mangle]

@@ -121,7 +121,9 @@ impl DpiBypassExt for TcpStream {
 
 async fn send_tcb_desync_probe(addr: SocketAddr, fake_ttl: u8) -> std::io::Result<()> {
     // Best-effort: short-lived low-TTL probe connection to influence DPI state.
-    if let Ok(Ok(mut probe)) = tokio::time::timeout(Duration::from_millis(150), TcpStream::connect(addr)).await {
+    if let Ok(Ok(mut probe)) =
+        tokio::time::timeout(Duration::from_millis(150), TcpStream::connect(addr)).await
+    {
         let _ = probe.set_ttl(u32::from(fake_ttl.max(1)));
         let _ = probe.write_all(b"\0").await;
         let _ = probe.shutdown().await;
@@ -230,7 +232,10 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].len(), 19);
         assert_eq!(chunks[1].len(), 109);
-        assert_eq!([chunks[0].as_slice(), chunks[1].as_slice()].concat(), payload);
+        assert_eq!(
+            [chunks[0].as_slice(), chunks[1].as_slice()].concat(),
+            payload
+        );
     }
 
     #[test]

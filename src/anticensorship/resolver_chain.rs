@@ -581,7 +581,10 @@ mod tests {
 
         let err = chain.resolve("example.com").await.expect_err("must fail");
         let msg = err.to_string();
-        assert!(msg.contains("system_dns_enabled=false"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("system_dns_enabled=false"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[tokio::test]
