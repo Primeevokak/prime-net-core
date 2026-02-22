@@ -10,25 +10,19 @@ use super::{BoxStream, OutboundConnector, TargetAddr, TargetEndpoint};
 
 #[derive(Debug, Clone)]
 pub struct ShadowsocksOutbound {
+    resolver: Arc<ResolverChain>,
     context: shadowsocks::context::SharedContext,
-    server_cfg: shadowsocks::config::ServerConfig,
-    server_endpoint: String,
+    server_host: String,
+    server_port: u16,
+    password: String,
+    method: shadowsocks::crypto::CipherKind,
 }
 
 impl ShadowsocksOutbound {
     pub async fn new(resolver: Arc<ResolverChain>, cfg: ShadowsocksPtConfig) -> Result<Self> {
         let (host, port) = split_host_port(&cfg.server)?;
-        let server_addr = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            std::net::SocketAddr::new(ip, port)
-        } else {
-            let ips = resolver.resolve(&host).await?;
-            let ip = *ips.first().ok_or_else(|| {
-                EngineError::Internal(format!("dns resolver returned no IPs for '{}'", host))
-            })?;
-            info!(target: "outbound.shadowsocks", server_host = %host, resolved_ip = %ip, server_port = port, "Shadowsocks server resolved");
-            std::net::SocketAddr::new(ip, port)
-        };
-
+        
+        // Validate method early
         let method = cfg
             .method
             .parse::<shadowsocks::crypto::CipherKind>()
@@ -36,21 +30,16 @@ impl ShadowsocksOutbound {
                 EngineError::Config("pt.shadowsocks.method is invalid/unsupported".to_owned())
             })?;
 
-        let mut server_cfg = shadowsocks::config::ServerConfig::new(
-            shadowsocks::config::ServerAddr::from(server_addr),
-            cfg.password,
-            method,
-        )
-        .map_err(|e| EngineError::Config(format!("pt.shadowsocks config error: {e}")))?;
-        server_cfg.set_mode(shadowsocks::config::Mode::TcpOnly);
-
         let context =
             shadowsocks::context::Context::new_shared(shadowsocks::config::ServerType::Local);
 
         Ok(Self {
+            resolver,
             context,
-            server_cfg,
-            server_endpoint: server_addr.to_string(),
+            server_host: host,
+            server_port: port,
+            password: cfg.password,
+            method,
         })
     }
 
@@ -59,6 +48,29 @@ impl ShadowsocksOutbound {
             TargetAddr::Ip(ip) => format!("{ip}:{}", target.port),
             TargetAddr::Domain(host) => format!("{host}:{}", target.port),
         };
+
+        // Resolve server address for every connection to handle DNS changes/load balancing
+        let server_addr = if let Ok(ip) = self.server_host.parse::<std::net::IpAddr>() {
+            std::net::SocketAddr::new(ip, self.server_port)
+        } else {
+            let ips = self.resolver.resolve(&self.server_host).await?;
+            let ip = *ips.first().ok_or_else(|| {
+                EngineError::Internal(format!("dns resolver returned no IPs for '{}'", self.server_host))
+            })?;
+            info!(target: "outbound.shadowsocks", server_host = %self.server_host, resolved_ip = %ip, server_port = self.server_port, "Shadowsocks server resolved");
+            std::net::SocketAddr::new(ip, self.server_port)
+        };
+
+        let mut server_cfg = shadowsocks::config::ServerConfig::new(
+            shadowsocks::config::ServerAddr::from(server_addr),
+            self.password.clone(),
+            self.method,
+        )
+        .map_err(|e| EngineError::Config(format!("pt.shadowsocks config error: {e}")))?;
+        server_cfg.set_mode(shadowsocks::config::Mode::TcpOnly);
+        
+        let server_endpoint = server_addr.to_string();
+
         let addr = match target.addr {
             TargetAddr::Ip(ip) => {
                 let sa = std::net::SocketAddr::new(ip, target.port);
@@ -67,15 +79,15 @@ impl ShadowsocksOutbound {
             TargetAddr::Domain(d) => shadowsocks::relay::socks5::Address::from((d, target.port)),
         };
 
-        info!(target: "outbound.shadowsocks", server = %self.server_endpoint, destination = %target_label, "Shadowsocks outbound connect");
+        info!(target: "outbound.shadowsocks", server = %server_endpoint, destination = %target_label, "Shadowsocks outbound connect");
         let s = shadowsocks::relay::tcprelay::proxy_stream::client::ProxyClientStream::<
             shadowsocks::net::tcp::TcpStream,
-        >::connect(self.context.clone(), &self.server_cfg, addr).await.map_err(|e| {
-            warn!(target: "outbound.shadowsocks", server = %self.server_endpoint, destination = %target_label, error = %e, "Shadowsocks outbound connect failed");
+        >::connect(self.context.clone(), &server_cfg, addr).await.map_err(|e| {
+            warn!(target: "outbound.shadowsocks", server = %server_endpoint, destination = %target_label, error = %e, "Shadowsocks outbound connect failed");
             e
         })?;
 
-        info!(target: "outbound.shadowsocks", server = %self.server_endpoint, destination = %target_label, "Shadowsocks outbound connected");
+        info!(target: "outbound.shadowsocks", server = %server_endpoint, destination = %target_label, "Shadowsocks outbound connected");
         Ok(Box::new(s))
     }
 }

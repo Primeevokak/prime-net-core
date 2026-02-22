@@ -777,18 +777,12 @@ fn should_bypass_by_classifier_host(host: &str, port: u16) -> bool {
         return should_bypass_by_classifier_ip(ip, port);
     }
 
-    let key = format!("{host}:{port}");
+    let destination = format!("{host}:{port}");
+    let key = bypass_profile_key(&destination);
     if destination_failures(&key) >= LEARNED_BYPASS_MIN_FAILURES_DOMAIN {
         return true;
     }
 
-    let host_lower = host.to_ascii_lowercase();
-    if host_lower != host {
-        let key_lower = format!("{host_lower}:{port}");
-        if destination_failures(&key_lower) >= LEARNED_BYPASS_MIN_FAILURES_DOMAIN {
-            return true;
-        }
-    }
     false
 }
 

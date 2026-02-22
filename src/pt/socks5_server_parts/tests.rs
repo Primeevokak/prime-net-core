@@ -345,6 +345,7 @@ mod tests {
                 "127.0.0.1:19080".parse().expect("addr"),
                 "127.0.0.1:19081".parse().expect("addr"),
             ],
+            bypass_domain_check: Some(|host| host == "service.example.com"),
             ..RelayOptions::default()
         };
         let candidates = select_route_candidates(

@@ -124,11 +124,13 @@ impl PrimeHttpClient {
             let part_path = parts_dir.join(format!("{index:08}.part"));
             let expected_len = (chunk.end - chunk.start) + 1;
 
-            if let Ok(meta) = std::fs::metadata(&part_path) {
-                if meta.is_file() && meta.len() == expected_len {
-                    resumed = true;
-                    downloaded.fetch_add(expected_len, Ordering::Relaxed);
-                    continue;
+            if manifest_matches {
+                if let Ok(meta) = std::fs::metadata(&part_path) {
+                    if meta.is_file() && meta.len() == expected_len {
+                        resumed = true;
+                        downloaded.fetch_add(expected_len, Ordering::Relaxed);
+                        continue;
+                    }
                 }
             }
             pending_parts.push((chunk, part_path, expected_len));

@@ -101,7 +101,7 @@ impl DoHResolver {
         ttl_secs: u64,
         bootstrap_ips: Vec<IpAddr>,
     ) -> Result<Self> {
-        let providers = if provider_names.is_empty() {
+        let providers: Vec<DoHProvider> = if provider_names.is_empty() {
             vec![
                 DoHProvider::AdGuard,
                 DoHProvider::Google,
@@ -116,19 +116,25 @@ impl DoHResolver {
 
         let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(8));
         if !bootstrap_ips.is_empty() {
-            // Use the same bootstrap IP list for all configured DoH endpoints. This avoids
-            // system DNS leakage when connecting to DoH itself. SNI still uses the hostname.
-            for provider in &providers {
-                if let Ok(url) = Url::parse(&provider.endpoint_url()) {
-                    if let Some(host) = url.host_str() {
-                        let addrs: Vec<std::net::SocketAddr> = bootstrap_ips
-                            .iter()
-                            .copied()
-                            .map(|ip| std::net::SocketAddr::new(ip, 443))
-                            .collect();
-                        builder = builder.resolve_to_addrs(host, &addrs);
+            // Only apply bootstrap IPs if we have a single provider.
+            // Applying the same IP list to multiple distinct providers would be incorrect
+            // (e.g. resolving google.com and cloudflare.com to the same IP).
+            if providers.len() == 1 {
+                if let Some(provider) = providers.first() {
+                    if let Ok(url) = Url::parse(&provider.endpoint_url()) {
+                        if let Some(host) = url.host_str() {
+                            let addrs: Vec<std::net::SocketAddr> = bootstrap_ips
+                                .iter()
+                                .copied()
+                                .map(|ip| std::net::SocketAddr::new(ip, 443))
+                                .collect();
+                            builder = builder.resolve_to_addrs(host, &addrs);
+                        }
                     }
                 }
+            } else {
+                // If we could log here, we should warn that bootstrap_ips are ignored for multi-provider setup.
+                // For now, we just skip applying them to avoid breakage.
             }
         }
         let client = builder.build()?;
@@ -185,11 +191,16 @@ impl DoHResolver {
         dnssec_ok: bool,
     ) -> Result<DoHResolved> {
         let endpoint = provider.endpoint_url();
+        
+        let (a_res, aaaa_res) = tokio::join!(
+            self.query_record(&endpoint, domain, "A", dnssec_ok),
+            self.query_record(&endpoint, domain, "AAAA", dnssec_ok)
+        );
+
+        let a = a_res?;
+        let aaaa = aaaa_res?;
+
         let mut addresses = Vec::new();
-        let a = self.query_record(&endpoint, domain, "A", dnssec_ok).await?;
-        let aaaa = self
-            .query_record(&endpoint, domain, "AAAA", dnssec_ok)
-            .await?;
         addresses.extend(a.ips);
         addresses.extend(aaaa.ips);
         addresses.sort_unstable();

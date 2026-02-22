@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
 use reqwest::Method;
 use tokio::task::AbortHandle;
 
@@ -19,7 +18,7 @@ use crate::ffi::callbacks::{FfiProgressContext, ProgressCallback};
 pub mod callbacks;
 
 thread_local! {
-    static LAST_ERROR: RefCell<Option<CString>> = RefCell::new(None);
+    static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
 #[repr(C)]
