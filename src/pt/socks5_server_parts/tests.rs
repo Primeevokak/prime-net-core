@@ -3,17 +3,24 @@ mod tests {
     use super::*;
 
     fn clear_route_state_for_test(route_key: &str) {
+        let service_key = route_service_key(route_key);
         if let Ok(mut guard) = DEST_ROUTE_HEALTH
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
         {
             guard.remove(route_key);
+            if let Some(service_key) = service_key.as_ref() {
+                guard.remove(service_key);
+            }
         }
         if let Ok(mut guard) = DEST_ROUTE_WINNER
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
         {
             guard.remove(route_key);
+            if let Some(service_key) = service_key.as_ref() {
+                guard.remove(service_key);
+            }
         }
     }
 
@@ -135,12 +142,79 @@ mod tests {
     }
 
     #[test]
-    fn bypass_zero_reply_soft_marks_tls_zero_reply_after_any_payload() {
-        assert!(should_mark_bypass_zero_reply_soft(443, 1, 0));
-        assert!(should_mark_bypass_zero_reply_soft(443, 120, 0));
-        assert!(!should_mark_bypass_zero_reply_soft(443, 0, 0));
-        assert!(!should_mark_bypass_zero_reply_soft(443, 10, 5));
-        assert!(!should_mark_bypass_zero_reply_soft(80, 100, 0));
+    fn route_service_key_groups_subdomains_by_registrable_domain() {
+        let api_key = route_decision_key(
+            "rr2---sn-gvnuxaxjvh-88vs.googlevideo.com:443",
+            &TargetAddr::Domain("rr2---sn-gvnuxaxjvh-88vs.googlevideo.com".to_owned()),
+        );
+        let collector_key = route_decision_key(
+            "rr3---sn-gvnuxaxjvh-88vz.googlevideo.com:443",
+            &TargetAddr::Domain("rr3---sn-gvnuxaxjvh-88vz.googlevideo.com".to_owned()),
+        );
+        let api_service = route_service_key(&api_key).expect("service key");
+        let collector_service = route_service_key(&collector_key).expect("service key");
+        assert_eq!(api_service, collector_service);
+        assert!(api_service.starts_with("googlevideo.com:443|"));
+    }
+
+    #[test]
+    fn adaptive_route_skips_race_when_service_winner_is_healthy() {
+        let winner_route_key = route_decision_key(
+            "rr2---sn-gvnuxaxjvh-88vs.googlevideo.com:443",
+            &TargetAddr::Domain("rr2---sn-gvnuxaxjvh-88vs.googlevideo.com".to_owned()),
+        );
+        let probe_route_key = route_decision_key(
+            "rr3---sn-gvnuxaxjvh-88vz.googlevideo.com:443",
+            &TargetAddr::Domain("rr3---sn-gvnuxaxjvh-88vz.googlevideo.com".to_owned()),
+        );
+        clear_route_state_for_test(&winner_route_key);
+        clear_route_state_for_test(&probe_route_key);
+        let service_key = route_service_key(&winner_route_key).expect("service key");
+        if let Ok(mut guard) = DEST_ROUTE_WINNER
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+        {
+            guard.insert(
+                service_key,
+                RouteWinner {
+                    route_id: "bypass:1".to_owned(),
+                    updated_at_unix: now_unix_secs(),
+                },
+            );
+        }
+        let candidates = vec![
+            RouteCandidate::direct("test"),
+            RouteCandidate::bypass("test", "127.0.0.1:19080".parse().expect("addr"), 0, 1),
+        ];
+        let decision = route_race_decision(443, &probe_route_key, &candidates);
+        assert_eq!(decision, (false, RouteRaceReason::WinnerHealthy));
+        clear_route_state_for_test(&winner_route_key);
+        clear_route_state_for_test(&probe_route_key);
+    }
+
+    #[test]
+    fn bypass_zero_reply_soft_requires_meaningful_payload_and_lifetime() {
+        assert!(!should_mark_bypass_zero_reply_soft(443, 1, 0, 5_000));
+        assert!(!should_mark_bypass_zero_reply_soft(
+            443,
+            ROUTE_SOFT_ZERO_REPLY_MIN_C2U - 1,
+            0,
+            5_000
+        ));
+        assert!(!should_mark_bypass_zero_reply_soft(
+            443,
+            ROUTE_SOFT_ZERO_REPLY_MIN_C2U,
+            0,
+            ROUTE_SOFT_ZERO_REPLY_MIN_LIFETIME_MS - 1
+        ));
+        assert!(should_mark_bypass_zero_reply_soft(
+            443,
+            ROUTE_SOFT_ZERO_REPLY_MIN_C2U,
+            0,
+            ROUTE_SOFT_ZERO_REPLY_MIN_LIFETIME_MS
+        ));
+        assert!(!should_mark_bypass_zero_reply_soft(443, 500, 5, 5_000));
+        assert!(!should_mark_bypass_zero_reply_soft(80, 500, 0, 5_000));
     }
 
     #[test]

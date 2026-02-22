@@ -248,7 +248,11 @@ fn route_winner_for_key(route_key: &str) -> Option<RouteWinner> {
     let Ok(guard) = map.lock() else {
         return None;
     };
-    guard.get(route_key).cloned()
+    if let Some(winner) = guard.get(route_key).cloned() {
+        return Some(winner);
+    }
+    let service_key = route_service_key(route_key)?;
+    guard.get(&service_key).cloned()
 }
 
 fn ordered_route_candidates(
@@ -433,13 +437,16 @@ fn record_route_success(route_key: &str, candidate: &RouteCandidate) {
     }
     let winner_map = DEST_ROUTE_WINNER.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut guard) = winner_map.lock() {
-        guard.insert(
-            route_key.to_owned(),
-            RouteWinner {
-                route_id: route_id.clone(),
-                updated_at_unix: now,
-            },
-        );
+        let winner = RouteWinner {
+            route_id: route_id.clone(),
+            updated_at_unix: now,
+        };
+        guard.insert(route_key.to_owned(), winner.clone());
+        if let Some(service_key) = route_service_key(route_key) {
+            if service_key != route_key {
+                guard.insert(service_key, winner);
+            }
+        }
     }
     if matches!(candidate.kind, RouteKind::Bypass) {
         record_global_bypass_profile_success(candidate, now);
@@ -508,6 +515,16 @@ fn record_route_failure(route_key: &str, candidate: &RouteCandidate, reason: &'s
             .unwrap_or(false)
         {
             guard.remove(route_key);
+        }
+        if let Some(service_key) = route_service_key(route_key) {
+            if service_key != route_key
+                && guard
+                    .get(&service_key)
+                    .map(|w| w.route_id == route_id)
+                    .unwrap_or(false)
+            {
+                guard.remove(&service_key);
+            }
         }
     }
     if matches!(candidate.kind, RouteKind::Bypass) {
@@ -637,8 +654,12 @@ fn should_mark_bypass_zero_reply_soft(
     port: u16,
     bytes_client_to_bypass: u64,
     bytes_bypass_to_client: u64,
+    session_lifetime_ms: u64,
 ) -> bool {
-    port == 443 && bytes_client_to_bypass > 0 && bytes_bypass_to_client == 0
+    port == 443
+        && bytes_bypass_to_client == 0
+        && bytes_client_to_bypass >= ROUTE_SOFT_ZERO_REPLY_MIN_C2U
+        && session_lifetime_ms >= ROUTE_SOFT_ZERO_REPLY_MIN_LIFETIME_MS
 }
 
 fn should_mark_empty_bypass_session_as_soft_failure(candidate: &RouteCandidate, port: u16) -> bool {

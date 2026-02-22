@@ -1,10 +1,10 @@
+use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use reqwest::Method;
 use tokio::task::AbortHandle;
@@ -18,7 +18,9 @@ use crate::ffi::callbacks::{FfiProgressContext, ProgressCallback};
 
 pub mod callbacks;
 
-static LAST_ERROR: Lazy<Mutex<Option<CString>>> = Lazy::new(|| Mutex::new(None));
+thread_local! {
+    static LAST_ERROR: RefCell<Option<CString>> = RefCell::new(None);
+}
 
 #[repr(C)]
 pub struct PrimeEngine {
@@ -294,7 +296,10 @@ pub unsafe extern "C" fn prime_engine_fetch_async(
 #[no_mangle]
 /// # Safety
 /// `handle` must be a valid pointer returned by `prime_engine_fetch_async` and not previously
-/// freed via `prime_request_free` or consumed by a successful `prime_request_wait`.
+/// freed via `prime_request_free`.
+///
+/// Note: This function does NOT free the handle. You must call `prime_request_free` even after
+/// this function returns a response or an error.
 pub unsafe extern "C" fn prime_request_wait(
     handle: *mut PrimeRequestHandle,
     timeout_ms: u64,
@@ -314,9 +319,8 @@ pub unsafe extern "C" fn prime_request_wait(
             // SAFETY: pointer was allocated by prime_engine_fetch_async.
             let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
 
-            // Best-effort: if already cancelled, return immediately.
+            // If already cancelled, return immediately.
             if inner.status.load(Ordering::SeqCst) == PrimeRequestStatus::CANCELLED as u8 {
-                unsafe { drop(Box::from_raw(handle as *mut PrimeRequestHandleInner)) };
                 return pack_error(PRIME_ERR_RUNTIME, "cancelled");
             }
 
@@ -344,15 +348,12 @@ pub unsafe extern "C" fn prime_request_wait(
                     inner
                         .status
                         .store(PrimeRequestStatus::COMPLETED as u8, Ordering::SeqCst);
-                    // SAFETY: we are done with the handle; free it.
-                    unsafe { drop(Box::from_raw(handle as *mut PrimeRequestHandleInner)) };
                     pack_ok(response)
                 }
                 Ok(Err(err)) => {
                     inner
                         .status
                         .store(PrimeRequestStatus::FAILED as u8, Ordering::SeqCst);
-                    unsafe { drop(Box::from_raw(handle as *mut PrimeRequestHandleInner)) };
                     pack_error(error_code_from(&err), &err.to_string())
                 }
                 Err(EngineError::Internal(msg)) if msg == "timeout" => {
@@ -363,7 +364,6 @@ pub unsafe extern "C" fn prime_request_wait(
                     inner
                         .status
                         .store(PrimeRequestStatus::FAILED as u8, Ordering::SeqCst);
-                    unsafe { drop(Box::from_raw(handle as *mut PrimeRequestHandleInner)) };
                     pack_error(error_code_from(&err), &err.to_string())
                 }
             }
@@ -484,8 +484,10 @@ pub unsafe extern "C" fn prime_response_free(response: *mut PrimeResponse) {
 #[no_mangle]
 pub extern "C" fn prime_last_error_message() -> *const c_char {
     ffi_guard("prime_last_error_message", ptr::null, || {
-        let guard = LAST_ERROR.lock();
-        guard.as_ref().map_or(ptr::null(), |msg| msg.as_ptr())
+        LAST_ERROR.with(|last| match *last.borrow() {
+            Some(ref msg) => msg.as_ptr(),
+            None => ptr::null(),
+        })
     })
 }
 
@@ -687,8 +689,9 @@ fn set_last_error(err: EngineError) {
 
 fn set_last_error_text(message: &str) {
     let message = to_cstring(message);
-    let mut guard = LAST_ERROR.lock();
-    *guard = message;
+    LAST_ERROR.with(|last| {
+        *last.borrow_mut() = message;
+    });
 }
 
 fn ffi_guard<T, F, P>(fn_name: &'static str, on_panic: P, f: F) -> T

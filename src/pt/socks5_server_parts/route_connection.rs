@@ -357,14 +357,17 @@ async fn handle_client(
             bypass_profiles = connected.candidate.bypass_profile_total,
             "bypass tunnel established"
         );
+        let bypass_tunnel_started = Instant::now();
         match tokio::io::copy_bidirectional(&mut tcp, &mut connected.stream).await {
             Ok((c2u, u2c)) => {
+                let lifetime_ms = bypass_tunnel_started.elapsed().as_millis() as u64;
                 info!(
                     target: "socks5",
                     conn_id,
                     destination = %target,
                     bytes_client_to_bypass = c2u,
                     bytes_bypass_to_client = u2c,
+                    session_lifetime_ms = lifetime_ms,
                     bypass_profile = connected.candidate.bypass_profile_idx + 1,
                     bypass_profiles = connected.candidate.bypass_profile_total,
                     "bypass tunnel closed"
@@ -422,7 +425,7 @@ async fn handle_client(
                         bypass_profiles = connected.candidate.bypass_profile_total,
                         "bypass profile marked as weak for destination"
                     );
-                } else if should_mark_bypass_zero_reply_soft(port, c2u, u2c) {
+                } else if should_mark_bypass_zero_reply_soft(port, c2u, u2c, lifetime_ms) {
                     record_route_failure(
                         &connected.route_key,
                         &connected.candidate,
@@ -436,6 +439,7 @@ async fn handle_client(
                         destination = %target,
                         bytes_client_to_bypass = c2u,
                         bytes_bypass_to_client = u2c,
+                        session_lifetime_ms = lifetime_ms,
                         "adaptive route observed soft zero-reply; winner confidence reduced"
                     );
                 } else {

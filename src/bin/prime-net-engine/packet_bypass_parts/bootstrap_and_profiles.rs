@@ -13,6 +13,8 @@ use tokio::sync::{Mutex, OnceCell};
 use tracing::{info, warn};
 
 static RELEASE_CACHE: OnceCell<Mutex<HashMap<String, Option<String>>>> = OnceCell::const_new();
+static RELEASE_ASSET_SHA256_CACHE: OnceCell<Mutex<HashMap<String, Option<String>>>> =
+    OnceCell::const_new();
 
 #[derive(Debug)]
 pub struct PacketBypassGuard {
@@ -235,6 +237,35 @@ async fn get_release_cache() -> &'static Mutex<HashMap<String, Option<String>>> 
     RELEASE_CACHE
         .get_or_init(|| async { Mutex::new(HashMap::new()) })
         .await
+}
+
+async fn get_release_asset_sha256_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
+    RELEASE_ASSET_SHA256_CACHE
+        .get_or_init(|| async { Mutex::new(HashMap::new()) })
+        .await
+}
+
+async fn remember_release_asset_sha256(url: &str, sha256_hex: Option<String>) {
+    let mut cache = get_release_asset_sha256_cache().await.lock().await;
+    cache.insert(url.to_owned(), sha256_hex);
+}
+
+async fn release_asset_sha256_hex(url: &str) -> Option<String> {
+    let cache = get_release_asset_sha256_cache().await.lock().await;
+    cache.get(url).cloned().flatten()
+}
+
+fn parse_sha256_digest_field(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let digest = trimmed
+        .strip_prefix("sha256:")
+        .or_else(|| trimmed.strip_prefix("SHA256:"))
+        .unwrap_or(trimmed)
+        .trim();
+    if parse_sha256_hex(digest).is_some() {
+        return Some(digest.to_ascii_lowercase());
+    }
+    None
 }
 
 /// Finds a free TCP port on 127.0.0.1.
@@ -694,12 +725,17 @@ async fn resolve_latest_asset_url(repo: &str, asset_pattern: &str) -> Result<Str
         for asset in assets {
             let name = asset["name"].as_str().unwrap_or("");
             let download_url = asset["browser_download_url"].as_str().unwrap_or("");
+            let digest_hex = asset["digest"]
+                .as_str()
+                .and_then(parse_sha256_digest_field);
             if (name == asset_pattern || name.contains(asset_pattern)) && !download_url.is_empty() {
+                remember_release_asset_sha256(download_url, digest_hex.clone()).await;
                 info!(
                     target: "packet_bypass",
                     repo = repo,
                     tag = tag_name,
                     asset = name,
+                    has_sha256 = digest_hex.is_some(),
                     "resolved latest release asset"
                 );
                 return Ok(download_url.to_owned());

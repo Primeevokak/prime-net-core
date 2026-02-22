@@ -144,14 +144,17 @@ async fn handle_http_proxy(
                 bypass_profiles = connected.candidate.bypass_profile_total,
                 "bypass tunnel established"
             );
+            let bypass_tunnel_started = Instant::now();
             match tokio::io::copy_bidirectional(&mut tcp, &mut connected.stream).await {
                 Ok((c2u, u2c)) => {
+                    let lifetime_ms = bypass_tunnel_started.elapsed().as_millis() as u64;
                     info!(
                         target: "socks5",
                         conn_id,
                         destination = %destination,
                         bytes_client_to_bypass = c2u,
                         bytes_bypass_to_client = u2c,
+                        session_lifetime_ms = lifetime_ms,
                         bypass_profile = connected.candidate.bypass_profile_idx + 1,
                         bypass_profiles = connected.candidate.bypass_profile_total,
                         "bypass tunnel closed"
@@ -209,7 +212,7 @@ async fn handle_http_proxy(
                             bypass_profiles = connected.candidate.bypass_profile_total,
                             "bypass profile marked as weak for destination"
                         );
-                    } else if should_mark_bypass_zero_reply_soft(port, c2u, u2c) {
+                    } else if should_mark_bypass_zero_reply_soft(port, c2u, u2c, lifetime_ms) {
                         record_route_failure(
                             &connected.route_key,
                             &connected.candidate,
@@ -223,6 +226,7 @@ async fn handle_http_proxy(
                             destination = %destination,
                             bytes_client_to_bypass = c2u,
                             bytes_bypass_to_client = u2c,
+                            session_lifetime_ms = lifetime_ms,
                             "adaptive route observed soft zero-reply; winner confidence reduced"
                         );
                     } else {
@@ -648,6 +652,42 @@ fn route_destination_key(route_key: &str) -> &str {
         .split_once('|')
         .map(|(k, _)| k)
         .unwrap_or(route_key)
+}
+
+fn route_service_key(route_key: &str) -> Option<String> {
+    let (destination_key, family) = route_key.split_once('|')?;
+    let service_destination = route_service_state_key(destination_key)?;
+    Some(format!("{service_destination}|{family}"))
+}
+
+fn route_service_state_key(destination: &str) -> Option<String> {
+    let (host, port) = split_host_port_for_connect(destination)?;
+    let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if normalized_host.is_empty() {
+        return None;
+    }
+    if parse_ip_literal(&normalized_host).is_some() {
+        return None;
+    }
+    let service_host = registrable_domain_bucket(&normalized_host)?;
+    Some(format!("{service_host}:{port}"))
+}
+
+fn registrable_domain_bucket(host: &str) -> Option<String> {
+    let labels: Vec<&str> = host.split('.').filter(|label| !label.is_empty()).collect();
+    if labels.len() < 2 {
+        return None;
+    }
+    let tld = labels[labels.len() - 1];
+    let sld = labels[labels.len() - 2];
+    if labels.len() >= 3
+        && tld.len() == 2
+        && matches!(sld, "co" | "com" | "net" | "org" | "gov" | "edu" | "ac")
+    {
+        let third = labels[labels.len() - 3];
+        return Some(format!("{third}.{sld}.{tld}"));
+    }
+    Some(format!("{sld}.{tld}"))
 }
 
 fn route_state_key(destination: &str) -> String {

@@ -196,6 +196,18 @@ async fn verify_downloaded_payload_integrity(
                 "PRIME_PACKET_BYPASS_PAYLOAD_SHA256 must contain a 64-hex sha256 digest".to_owned(),
             )
         })?
+    } else if let Some(hex) = release_asset_sha256_hex(source_url).await {
+        let parsed = parse_sha256_hex(&hex).ok_or_else(|| {
+            EngineError::Config(format!(
+                "cached release asset digest is invalid for '{source_url}'"
+            ))
+        })?;
+        info!(
+            target: "packet_bypass",
+            source = source_url,
+            "resolved packet bypass sha256 from release metadata cache"
+        );
+        parsed
     } else {
         match resolve_sha256_from_sidecar(source_url).await? {
             Some(v) => v,

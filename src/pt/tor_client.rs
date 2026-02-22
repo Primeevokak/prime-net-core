@@ -245,7 +245,12 @@ async fn ensure_tools_from_tor_bundle(install_dir: &Path) -> Result<()> {
         let urls = tor_bundle_urls();
         info!(target: "pt.bootstrap", dir = %install_dir.display(), mirrors = urls.len(), "downloading tor expert bundle");
         let bytes = download_bytes_from_urls(&urls).await?;
-        extract_tor_bundle_tools(&bytes, install_dir)?;
+        
+        let install_dir = install_dir.to_owned();
+        tokio::task::spawn_blocking(move || {
+            extract_tor_bundle_tools(&bytes, &install_dir)
+        }).await.map_err(|e| EngineError::Internal(format!("bootstrap task failed: {e}")))??;
+        
         info!(target: "pt.bootstrap", dir = %install_dir.display(), "tor expert bundle extracted");
         Ok(())
     }

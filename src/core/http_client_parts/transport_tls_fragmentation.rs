@@ -262,16 +262,6 @@ impl PrimeHttpClient {
             ))
         })?;
 
-        let addr = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            std::net::SocketAddr::new(ip, port)
-        } else {
-            let ips = self.resolver_chain.resolve(&host).await?;
-            let ip = *ips.first().ok_or_else(|| {
-                EngineError::Internal(format!("dns resolver returned no IPs for '{host}'"))
-            })?;
-            std::net::SocketAddr::new(ip, port)
-        };
-
         let tcp = if let Some(proxy) = &self.config.proxy {
             match proxy.kind {
                 crate::config::ProxyKind::Socks5 => {
@@ -284,6 +274,15 @@ impl PrimeHttpClient {
                 }
             }
         } else {
+            let addr = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                std::net::SocketAddr::new(ip, port)
+            } else {
+                let ips = self.resolver_chain.resolve(&host).await?;
+                let ip = *ips.first().ok_or_else(|| {
+                    EngineError::Internal(format!("dns resolver returned no IPs for '{host}'"))
+                })?;
+                std::net::SocketAddr::new(ip, port)
+            };
             TcpStream::connect(addr).await?
         };
         let _ = tcp.set_nodelay(true);
