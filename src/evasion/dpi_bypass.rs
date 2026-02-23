@@ -23,6 +23,7 @@ pub enum DesyncStrategy {
     TcbDesync { fake_ttl: u8 },
     HttpFragmentation,
     FakePackets { ttl: u8, count: u8, data_size: usize },
+    OobData { offset: usize },
 }
 
 #[derive(Debug, Error)]
@@ -114,11 +115,13 @@ impl DpiBypassExt for TcpStream {
                     write_split_prefix(self, data, first_packet_size, Duration::from_millis(20))
                         .await?;
                 }
+                DesyncStrategy::OobData { offset } => {
+                    write_oob_at(self, data, offset).await?;
+                }
                 DesyncStrategy::HttpFragmentation => {
                     write_http_fragmented(self, data).await?;
                 }
                 DesyncStrategy::TcbDesync { .. } | DesyncStrategy::FakePackets { .. } => {
-                    // Transport desync is applied at connect phase; payload stays intact.
                     self.write_all(data).await?;
                 }
             }
@@ -126,6 +129,42 @@ impl DpiBypassExt for TcpStream {
             Ok(())
         })
     }
+}
+
+async fn write_oob_at(stream: &mut TcpStream, data: &[u8], offset: usize) -> std::io::Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let cut = offset.min(data.len().saturating_sub(1));
+    
+    if cut > 0 {
+        stream.write_all(&data[..cut]).await?;
+    }
+    
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Networking::WinSock::{send, SOCKET, MSG_OOB};
+        use std::os::windows::io::AsRawSocket;
+        
+        let sock = stream.as_raw_socket() as SOCKET;
+        let byte_to_send = data[cut];
+        unsafe {
+            let res = send(sock, &byte_to_send as *const u8, 1, MSG_OOB);
+            if res == -1 {
+                stream.write_all(&[byte_to_send]).await?;
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        stream.write_all(&[data[cut]]).await?;
+    }
+
+    if cut + 1 < data.len() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        stream.write_all(&data[cut+1..]).await?;
+    }
+    Ok(())
 }
 
 async fn send_tcb_desync_probe(addr: SocketAddr, fake_ttl: u8) -> std::io::Result<()> {
@@ -234,7 +273,7 @@ fn chunk_for_strategy(data: &[u8], strategy: DesyncStrategy) -> Vec<Vec<u8>> {
             }
             out
         }
-        DesyncStrategy::TcbDesync { .. } | DesyncStrategy::FakePackets { .. } => vec![data.to_vec()],
+        DesyncStrategy::TcbDesync { .. } | DesyncStrategy::FakePackets { .. } | DesyncStrategy::OobData { .. } => vec![data.to_vec()],
     }
 }
 

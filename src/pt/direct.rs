@@ -45,6 +45,10 @@ impl DirectOutbound {
         self
     }
 
+    pub fn resolver(&self) -> Arc<ResolverChain> {
+        self.resolver.clone()
+    }
+
     async fn connect_impl(&self, target: TargetEndpoint) -> Result<BoxStream> {
         let target = normalize_target_endpoint(target);
         let target_label = match &target.addr {
@@ -441,6 +445,10 @@ impl OutboundConnector for DirectOutbound {
         target: TargetEndpoint,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<BoxStream>> + Send + 'a>> {
         Box::pin(async move { self.connect_impl(target).await })
+    }
+
+    fn resolver(&self) -> Option<Arc<crate::anticensorship::ResolverChain>> {
+        Some(self.resolver.clone())
     }
 }
 

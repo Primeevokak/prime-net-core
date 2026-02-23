@@ -19,7 +19,13 @@ fn select_race_probe_stage(destination: &str) -> u8 {
     // Aggressive Stage 2/3 probes can trigger resets (10054) on sensitive services like SoundCloud.
     // Stage escalation will happen naturally if Stage 1 is detected as blocked.
     let (host, _) = split_host_port_for_connect(destination).unwrap_or((destination.to_owned(), 443));
-    if host.contains("soundcloud") || host.contains("sndcdn") || host.contains("ytimg") || host.contains("discord") {
+    
+    // SoundCloud and some others often require aggressive SNI splitting (Stage 3) immediately to work on strict ISPs.
+    if host.contains("soundcloud") || host.contains("sndcdn") {
+        return 3;
+    }
+    
+    if host.contains("ytimg") || host.contains("discord") {
         return 1;
     }
 

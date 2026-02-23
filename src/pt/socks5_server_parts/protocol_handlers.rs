@@ -584,8 +584,8 @@ fn tune_relay_for_target(
         },
         2 => RelayOptions {
             fragment_client_hello: true,
-            fragment_size_min: base.fragment_size_min.clamp(1, 16),
-            fragment_size_max: base.fragment_size_max.clamp(1, 32),
+            fragment_size_min: 16,
+            fragment_size_max: 128,
             fragment_sleep_ms: base.fragment_sleep_ms.min(2),
             fragment_budget_bytes: base.fragment_budget_bytes.clamp(4096, 8192),
             client_hello_split_offsets: vec![1, 5],
@@ -593,21 +593,23 @@ fn tune_relay_for_target(
         },
         3 => RelayOptions {
             fragment_client_hello: true,
-            fragment_size_min: base.fragment_size_min.clamp(1, 4),
-            fragment_size_max: base.fragment_size_max.clamp(1, 8),
-            fragment_sleep_ms: base.fragment_sleep_ms.min(5),
+            // Balanced fragmentation: large enough to not be 'junk', small enough to split SNI
+            fragment_size_min: 32,
+            fragment_size_max: 256,
+            fragment_sleep_ms: base.fragment_sleep_ms.min(10),
             fragment_budget_bytes: base.fragment_budget_bytes.clamp(8192, 16384),
-            client_hello_split_offsets: vec![1, 5, 32, 48],
+            // Targets: 1st byte, then middle of Handshake, then SNI parts
+            client_hello_split_offsets: vec![1, 32, 48, 64],
             ..base
         },
         _ => RelayOptions {
             fragment_client_hello: true,
-            fragment_size_min: 1,
-            fragment_size_max: 2,
-            fragment_sleep_ms: base.fragment_sleep_ms.min(10),
+            fragment_size_min: 16,
+            fragment_size_max: 64,
+            fragment_sleep_ms: base.fragment_sleep_ms.min(20),
             fragment_budget_bytes: base.fragment_budget_bytes.clamp(8192, 32768),
-            client_hello_split_offsets: vec![1, 3, 5, 32, 48, 64],
-            sni_spoofing: true, // Enable fake SNI probe for the most aggressive stage
+            client_hello_split_offsets: vec![1, 2, 3, 5, 32, 48, 64, 128],
+            sni_spoofing: true, 
             ..base
         },
     };

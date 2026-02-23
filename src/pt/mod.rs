@@ -35,6 +35,10 @@ pub trait OutboundConnector: Send + Sync {
         &'a self,
         target: TargetEndpoint,
     ) -> Pin<Box<dyn Future<Output = Result<BoxStream>> + Send + 'a>>;
+
+    fn resolver(&self) -> Option<Arc<crate::anticensorship::ResolverChain>> {
+        None
+    }
 }
 
 pub type DynOutbound = Arc<dyn OutboundConnector>;

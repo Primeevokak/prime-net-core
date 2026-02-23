@@ -371,19 +371,17 @@ impl UniversalDnsResolver {
     #[cfg(feature = "hickory-dns")]
     fn resolver_opts(&self) -> ResolverOpts {
         let mut opts = ResolverOpts::default();
-        // Force-disable DNSSEC validation. In censored environments, 
-        // validation often triggers infinite recursion or deep loops (see logs).
-        // Since we use DoH/DoT, we rely on the secure transport layer.
-        opts.validate = false;
+        // DNSSEC validation is removed from build, ensure we don't try to set it.
+        // In censored environments, we focus on raw speed and retry logic.
+        opts.cache_size = self.config.cache_size.max(128);
         opts.recursion_desired = true;
-        opts.cache_size = self.config.cache_size.max(16);
+        // Increase timeout for DoH to 4s to prevent accidental fallback to poisoned system DNS
         opts.timeout = if self.config.query_timeout.as_secs() == 0 {
-            Duration::from_secs(1)
+            Duration::from_secs(4)
         } else {
-            self.config.query_timeout
+            self.config.query_timeout.max(Duration::from_secs(3))
         };
-        // retry_count is "retries", attempts is total tries.
-        opts.attempts = (self.config.retry_count + 1).max(1);
+        opts.attempts = (self.config.retry_count + 2).max(2);
         opts
     }
 
@@ -417,7 +415,7 @@ impl UniversalDnsResolver {
                 DnsResolverType::CustomUdp(v) => format!("udp:{v}"),
                 DnsResolverType::CustomTcp(v) => format!("tcp:{v}"),
             },
-            dnssec: opts.validate,
+            dnssec: false, // Force false in cache key
             cache_size: opts.cache_size,
             timeout_ms: opts.timeout.as_millis() as u64,
             attempts: opts.attempts,
@@ -448,7 +446,7 @@ impl UniversalDnsResolver {
                     EngineError::Internal(format!("system resolver build failed: {e}"))
                 })?;
                 let opts = self.resolver_opts();
-                builder.options_mut().validate = opts.validate;
+                // Standard options only
                 builder.options_mut().cache_size = opts.cache_size;
                 builder.options_mut().timeout = opts.timeout;
                 builder.options_mut().attempts = opts.attempts;

@@ -30,6 +30,6 @@ fn main() {
     let bins = ["prime-net-engine", "prime-tui"];
     for bin in bins {
         println!("cargo:rustc-link-arg-bin={bin}=/MANIFEST:EMBED");
-        println!("cargo:rustc-link-arg-bin={bin}=/MANIFESTUAC:level='requireAdministrator'");
+        println!("cargo:rustc-link-arg-bin={bin}=/MANIFESTUAC:level='asInvoker'");
     }
 }
