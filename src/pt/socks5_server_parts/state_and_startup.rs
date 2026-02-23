@@ -18,7 +18,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::blocklist::expand_tilde;
 use crate::error::{EngineError, Result};
-use crate::evasion::{FragmentConfig, FragmentingIo};
+use std::sync::Arc;
+use crate::anticensorship::ResolverChain;
 
 use super::{BoxStream, DynOutbound, TargetAddr, TargetEndpoint};
 
@@ -484,19 +485,43 @@ async fn connect_bypass_upstream(
     bypass_addr: SocketAddr,
     bypass_profile_idx: u8,
     bypass_profile_total: u8,
+    _resolver: Option<Arc<ResolverChain>>,
 ) -> Result<TcpStream> {
-    let connect =
-        tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(bypass_addr)).await;
-    let mut bypass = match connect {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
+    // We intentionally DO NOT resolve the domain to an IP here.
+    // Instead, we pass the original TargetAddr (which may be a domain) to the upstream SOCKS5.
+    // This allows CIADPI (ByeDPI) to perform its own resolution or SNI-based evasion on the domain name.
+    
+    let mut bypass = None;
+    let mut last_e = None;
+    for retry in 0..3 {
+        let connect =
+            tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(bypass_addr)).await;
+        match connect {
+            Ok(Ok(s)) => {
+                bypass = Some(s);
+                break;
+            }
+            Ok(Err(e)) => {
+                last_e = Some(e);
+                if retry < 2 { tokio::time::sleep(Duration::from_millis(100)).await; }
+            }
+            Err(_) => {
+                if retry < 2 { tokio::time::sleep(Duration::from_millis(100)).await; }
+            }
+        }
+    }
+
+    let mut bypass = match bypass {
+        Some(s) => s,
+        None => {
+            let e = last_e.unwrap_or_else(|| std::io::Error::new(ErrorKind::TimedOut, "bypass connect timeout"));
             warn!(
                 target: "socks5",
                 conn_id,
                 destination = %target_label,
                 bypass = %bypass_addr,
                 error = %e,
-                "bypass connect failed"
+                "bypass connect failed after retries"
             );
             record_bypass_profile_failure(
                 target_label,
@@ -505,22 +530,6 @@ async fn connect_bypass_upstream(
                 "connect-failed",
             );
             return Err(e.into());
-        }
-        Err(_) => {
-            warn!(
-                target: "socks5",
-                conn_id,
-                destination = %target_label,
-                bypass = %bypass_addr,
-                "bypass connect timeout"
-            );
-            record_bypass_profile_failure(
-                target_label,
-                bypass_profile_idx,
-                bypass_profile_total,
-                "connect-timeout",
-            );
-            return Err(EngineError::Internal("bypass connect timeout".to_owned()));
         }
     };
     let _ = bypass.set_nodelay(true);
@@ -704,6 +713,7 @@ async fn connect_route_candidate(
                 bypass_addr,
                 candidate.bypass_profile_idx,
                 candidate.bypass_profile_total,
+                outbound.resolver(),
             )
             .await?;
             Ok(Box::new(stream))

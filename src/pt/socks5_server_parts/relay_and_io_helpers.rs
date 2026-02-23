@@ -49,14 +49,33 @@ async fn relay_bidirectional(
                 && !responded;
 
             if use_fragmentation {
-                let sni_offset = find_sni_offset(current_buf);
-                if let Some(off) = sni_offset {
-                    // Optimized 3-way SNI split
+                let sni_info = find_sni_info(current_buf);
+                if let Some((off, len)) = sni_info {
+                    // Aggressive 4-way SNI split: Before, Type, Len, Data
+                    // 1. Everything before the SNI extension
                     upstream_w.write_all(&current_buf[..off]).await?;
                     tokio::time::sleep(Duration::from_millis(15)).await;
-                    upstream_w.write_all(&current_buf[off..off+1]).await?;
-                    tokio::time::sleep(Duration::from_millis(15)).await;
-                    upstream_w.write_all(&current_buf[off+1..]).await?;
+                    
+                    if len >= 4 {
+                        // 2. SNI Extension Type (2 bytes)
+                        upstream_w.write_all(&current_buf[off..off+2]).await?;
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        
+                        // 3. SNI Extension Length (2 bytes)
+                        upstream_w.write_all(&current_buf[off+2..off+4]).await?;
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        
+                        // 4. SNI Extension Data
+                        upstream_w.write_all(&current_buf[off+4..off+len]).await?;
+                    } else {
+                        upstream_w.write_all(&current_buf[off..off+len]).await?;
+                    }
+                    
+                    // 5. Everything after the SNI extension
+                    if off + len < n {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        upstream_w.write_all(&current_buf[off+len..]).await?;
+                    }
                 } else {
                     let chunk_size = c2u_opts.fragment_size_max.min(n).max(1);
                     let mut p = 0;
@@ -110,7 +129,7 @@ fn is_tls_client_hello(buf: &[u8]) -> bool {
     buf.len() >= 5 && buf[0] == 0x16 && buf[1] == 0x03
 }
 
-fn find_sni_offset(buf: &[u8]) -> Option<usize> {
+fn find_sni_info(buf: &[u8]) -> Option<(usize, usize)> {
     if !is_tls_client_hello(buf) || buf.len() < 43 {
         return None;
     }
@@ -132,7 +151,7 @@ fn find_sni_offset(buf: &[u8]) -> Option<usize> {
         let ext_type = u16::from_be_bytes([buf[pos], buf[pos+1]]);
         let ext_len = u16::from_be_bytes([buf[pos+2], buf[pos+3]]) as usize;
         if ext_type == 0x0000 {
-            return Some(pos + 2); 
+            return Some((pos, 4 + ext_len)); 
         }
         pos += 4 + ext_len;
     }
@@ -319,7 +338,7 @@ fn is_expected_disconnect(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     matches!(
         e.kind(),
-        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe
+        ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe
     )
 }
 
@@ -335,17 +354,24 @@ fn split_host_port_for_connect(target: &str) -> Option<(String, u16)> {
     if t.starts_with('[') {
         let end = t.find(']')?;
         let host = t[1..end].trim();
+        if host.is_empty() { return None; }
         let rest = t.get(end + 1..)?;
         let port = rest.strip_prefix(':')?.trim().parse::<u16>().ok()?;
         return Some((host.to_owned(), port));
     }
     let (host, port) = t.rsplit_once(':')?;
+    let host = host.trim();
+    if host.is_empty() { return None; }
     let port = port.trim().parse::<u16>().ok()?;
     Some((host.to_owned(), port))
 }
 
 fn parse_ip_literal(host: &str) -> Option<std::net::IpAddr> {
-    host.parse::<std::net::IpAddr>().ok()
+    let h = host.trim();
+    if h.starts_with('[') && h.ends_with(']') {
+        return h[1..h.len() - 1].parse().ok();
+    }
+    h.parse::<std::net::IpAddr>().ok()
 }
 
 struct HttpForwardTarget {
@@ -358,7 +384,12 @@ fn parse_http_forward_target(target: &str, request_head: &str) -> Option<HttpFor
     let target = target.trim();
     if let Ok(url) = url::Url::parse(target) {
         if !url.scheme().eq_ignore_ascii_case("http") { return None; }
-        let host = url.host_str()?.to_owned();
+        let raw_host = url.host_str()?.to_owned();
+        let host = if raw_host.starts_with('[') && raw_host.ends_with(']') {
+            raw_host[1..raw_host.len()-1].to_owned()
+        } else {
+            raw_host
+        };
         let port = url.port_or_known_default().unwrap_or(80);
         let mut request_uri = url.path().to_owned();
         if let Some(q) = url.query() { request_uri.push('?'); request_uri.push_str(q); }
@@ -366,7 +397,7 @@ fn parse_http_forward_target(target: &str, request_head: &str) -> Option<HttpFor
     }
     if target.starts_with('/') {
         let host_header = extract_header_value(request_head, "Host")?;
-        let (host, port) = host_header.rsplit_once(':').map(|(h, p)| (h.to_owned(), p.parse().unwrap_or(80))).unwrap_or((host_header, 80));
+        let (host, port) = split_host_port_with_default(&host_header, 80)?;
         return Some(HttpForwardTarget { host, port, request_uri: target.to_owned() });
     }
     None
@@ -401,4 +432,37 @@ async fn read_cstring(tcp: &mut TcpStream, limit: usize) -> Result<String> {
         if data.len() > limit { return Err(EngineError::InvalidInput("too long".to_owned())); }
     }
     Ok(String::from_utf8_lossy(&data).to_string())
+}
+
+fn split_host_port_with_default(target: &str, default_port: u16) -> Option<(String, u16)> {
+    let t = target.trim();
+    if t.is_empty() { return None; }
+    if let Some((host, port)) = split_host_port_for_connect(t) {
+        return Some((host, port));
+    }
+    if t.starts_with('[') && t.ends_with(']') {
+        let host = t[1..t.len()-1].trim();
+        if host.is_empty() { return None; }
+        return Some((host.to_owned(), default_port));
+    }
+    if !t.contains(':') {
+        return Some((t.to_owned(), default_port));
+    }
+    None
+}
+
+async fn send_fake_sni_probe(upstream: &mut BoxStream, ttl: u8) -> std::io::Result<()> {
+    // Construct a fake TLS ClientHello with SNI max.ru
+    let mut probe = hex::decode("16030100510100004d0303").unwrap();
+    // Random 32 bytes
+    probe.extend((0..32).map(|_| rand::random::<u8>()));
+    probe.push(0x00); // session id len
+    probe.extend_from_slice(&hex::decode("00021301010000240000000b00090000066d61782e7275").unwrap());
+    
+    // In a real scenario we'd set TTL here, but BoxStream doesn't support it directly.
+    // For now we just write the probe.
+    let _ = ttl;
+    upstream.write_all(&probe).await?;
+    upstream.flush().await?;
+    Ok(())
 }

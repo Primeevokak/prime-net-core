@@ -828,7 +828,7 @@ mod tests {
         let ch = capture_client_hello(client_cfg);
         let suites = cipher_suites_from_client_hello(&ch).expect("cipher suites present");
 
-        // Ensure common TLS 1.3 suites appear in the intended order: 0x1301 < 0x1302 < 0x1303.
+        // Ensure common TLS 1.3 suites appear in the intended order for Chrome: 0x1301 < 0x1303 < 0x1302.
         let i1 = suites
             .iter()
             .position(|v| *v == 0x1301)
@@ -841,7 +841,7 @@ mod tests {
             .iter()
             .position(|v| *v == 0x1303)
             .expect("TLS_CHACHA20_POLY1305_SHA256");
-        assert!(i1 < i2 && i2 < i3);
+        assert!(i1 < i3 && i3 < i2);
     }
 
     #[test]

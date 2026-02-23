@@ -152,32 +152,13 @@ fn route_race_candidate_delay_ms(idx: usize, candidate: &RouteCandidate, has_dir
 }
 
 fn route_race_launch_candidates(ordered: &[RouteCandidate]) -> Vec<RouteCandidate> {
-    if !ordered.iter().any(|c| c.kind == RouteKind::Direct) {
-        return ordered
-            .iter()
-            .take(ROUTE_RACE_MAX_CANDIDATES)
-            .cloned()
-            .collect();
-    }
-
-    // Keep direct probe first, then race a capped set of bypass profiles.
-    // This avoids dropping all but two bypass candidates when direct exists.
-    let mut launch =
-        Vec::with_capacity(ordered.len().min(ROUTE_RACE_MAX_CANDIDATES.saturating_add(1)));
-    launch.extend(
-        ordered
-            .iter()
-            .filter(|candidate| candidate.kind == RouteKind::Direct)
-            .cloned(),
-    );
-    launch.extend(
-        ordered
-            .iter()
-            .filter(|candidate| candidate.kind == RouteKind::Bypass)
-            .take(ROUTE_RACE_MAX_CANDIDATES)
-            .cloned(),
-    );
-    launch
+    // Respect the ordering provided by the scorer.
+    // If Bypass is ranked higher (e.g. due to blocklist match), it should be launched first.
+    ordered
+        .iter()
+        .take(ROUTE_RACE_MAX_CANDIDATES)
+        .cloned()
+        .collect()
 }
 
 fn route_race_bypass_extra_delay_ms(source: &str) -> u64 {
@@ -516,6 +497,18 @@ async fn handle_client(
             }
             Err(e) => {
                 if attempt < max_attempts && (e.kind() == ErrorKind::ConnectionReset || e.kind() == ErrorKind::BrokenPipe) {
+                    let signal = classify_io_error(&e);
+                    record_destination_failure(
+                        &target,
+                        signal,
+                        tuned.options.classifier_emit_interval_secs,
+                        tuned.stage,
+                    );
+                    record_route_failure(
+                        &connected.route_key,
+                        &connected.candidate,
+                        blocking_signal_label(signal),
+                    );
                     warn!(target: "socks5.route", conn_id, destination = %target, error = %e, "direct relay reset early, trying fallback");
                     attempt += 1;
                     continue;

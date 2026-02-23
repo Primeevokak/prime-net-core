@@ -92,6 +92,7 @@ fn select_bypass_source(
                     return Some("builtin");
                 }
             }
+            // CRITICAL: Always check if the classifier has learned that this host needs bypass
             if should_bypass_by_classifier_host(host, port) {
                 return Some("learned-domain");
             }
@@ -140,13 +141,34 @@ fn select_route_candidates(
 ) -> Vec<RouteCandidate> {
     let family = route_family_for_target(target);
     let mut out = vec![RouteCandidate::direct_with_family("adaptive", family)];
-    let Some(source) = select_bypass_source(relay_opts, target, port) else {
-        return out;
-    };
-    for (addr, idx, total) in select_bypass_candidates(relay_opts, destination) {
-        out.push(RouteCandidate::bypass_with_family(
-            source, addr, idx, total, family,
-        ));
+    
+    // Attempt to determine the bypass source (builtin, learned, or adaptive-race)
+    let source = select_bypass_source(relay_opts, target, port).unwrap_or_else(|| {
+        // Fallback: If it's port 443 and a public IP, allow adaptive race with bypass
+        if port == 443 {
+            let is_public = match target {
+                TargetAddr::Ip(ip) => is_bypassable_public_ip(*ip),
+                TargetAddr::Domain(host) => {
+                    if let Some(ip) = parse_ip_literal(host) {
+                        is_bypassable_public_ip(ip)
+                    } else {
+                        true // Assume public domain
+                    }
+                }
+            };
+            if is_public {
+                return "adaptive-race";
+            }
+        }
+        "none"
+    });
+
+    if source != "none" {
+        for (addr, idx, total) in select_bypass_candidates(relay_opts, destination) {
+            out.push(RouteCandidate::bypass_with_family(
+                source, addr, idx, total, family,
+            ));
+        }
     }
     out
 }
@@ -161,16 +183,32 @@ fn bypass_profile_health_key(route_id: &str, family: RouteIpFamily) -> String {
 
 fn route_health_score(route_key: &str, candidate: &RouteCandidate, now: u64) -> i64 {
     let route_id = candidate.route_id();
+    let mut bonus = 0i64;
+    
+    // Give a significant bonus to bypass routes when they are explicitly requested by blocklist or classifier.
+    // This ensures they win the race against direct connections that might succeed at TCP level but fail later.
+    if candidate.kind == RouteKind::Bypass {
+        match candidate.source {
+            "builtin" | "learned-domain" | "learned-ip" => {
+                bonus += 1000;
+            }
+            "adaptive-race" => {
+                bonus += 10;
+            }
+            _ => {}
+        }
+    }
+
     let local_score = {
         let map = DEST_ROUTE_HEALTH.get_or_init(|| Mutex::new(HashMap::new()));
         let Ok(guard) = map.lock() else {
-            return global_bypass_profile_score(candidate, now);
+            return global_bypass_profile_score(candidate, now) + bonus;
         };
         let Some(per_route) = guard.get(route_key) else {
-            return global_bypass_profile_score(candidate, now);
+            return global_bypass_profile_score(candidate, now) + bonus;
         };
         let Some(health) = per_route.get(&route_id) else {
-            return global_bypass_profile_score(candidate, now);
+            return global_bypass_profile_score(candidate, now) + bonus;
         };
         let mut score = (health.successes as i64 * 3) - (health.failures as i64 * 4);
         score -= i64::from(health.consecutive_failures) * 8;
@@ -179,7 +217,7 @@ fn route_health_score(route_key: &str, candidate: &RouteCandidate, now: u64) -> 
         }
         score
     };
-    local_score + global_bypass_profile_score(candidate, now)
+    local_score + global_bypass_profile_score(candidate, now) + bonus
 }
 
 fn bypass_profile_health_last_seen_unix(health: &BypassProfileHealth) -> u64 {
@@ -203,15 +241,22 @@ fn global_bypass_profile_score(candidate: &RouteCandidate, now: u64) -> i64 {
     }
     let primary_key = bypass_profile_health_key(&route_id, candidate.family);
     let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(|| Mutex::new(HashMap::new()));
-    let Ok(guard) = map.lock() else {
-        return 0;
-    };
-    if let Some(health) = guard.get(&primary_key) {
-        return bypass_profile_score_from_health(health, now);
-    }
-    if candidate.family != RouteIpFamily::Any {
-        if let Some(legacy) = guard.get(&route_id) {
-            return bypass_profile_score_from_health(legacy, now);
+    if let Ok(mut guard) = map.lock() {
+        if let Some(health) = guard.get(&primary_key) {
+            if should_reset_bypass_profile_health(health, now) {
+                guard.remove(&primary_key);
+                return 0;
+            }
+            return bypass_profile_score_from_health(health, now);
+        }
+        if candidate.family != RouteIpFamily::Any {
+            if let Some(legacy) = guard.get(&route_id) {
+                if should_reset_bypass_profile_health(legacy, now) {
+                    guard.remove(&route_id);
+                    return 0;
+                }
+                return bypass_profile_score_from_health(legacy, now);
+            }
         }
     }
     0
@@ -229,6 +274,21 @@ fn bypass_profile_score_from_health(health: &BypassProfileHealth, now: u64) -> i
         score -= 4;
     }
     score
+}
+
+fn should_reset_bypass_profile_health(health: &BypassProfileHealth, now: u64) -> bool {
+    // If it's a "total failure" profile (many errors, zero successes)
+    if health.successes == 0 && (health.failures > 20 || health.connect_failures > 10) {
+        // Reset if the last failure was more than 10 minutes ago
+        if now.saturating_sub(health.last_failure_unix) > 600 {
+            return true;
+        }
+    }
+    // If it has extremely low score but hasn't been tried for 30 minutes
+    if bypass_profile_score_from_health(health, now) < GLOBAL_BYPASS_HARD_WEAK_SCORE && now.saturating_sub(health.last_failure_unix) > 1800 {
+        return true;
+    }
+    false
 }
 
 fn route_is_temporarily_weak(route_key: &str, route_id: &str, now: u64) -> bool {
@@ -303,6 +363,7 @@ fn ordered_route_candidates(
         }
         let a_score = route_health_score(route_key, a, now);
         let b_score = route_health_score(route_key, b, now);
+        
         b_score
             .cmp(&a_score)
             .then_with(|| a.kind_rank().cmp(&b.kind_rank()))
@@ -675,16 +736,10 @@ fn should_mark_empty_bypass_session_as_soft_failure(candidate: &RouteCandidate, 
     if port != 443 || candidate.kind != RouteKind::Bypass {
         return false;
     }
-    // Don't mark built-in rules as soft failures just because they are empty (0/0).
-    // Built-in rules are usually there because we know the domain is blocked, 
-    // so empty sessions are likely just app behavior, not a bypass failure.
-    if matches!(candidate.source, "builtin") {
-        return false;
-    }
     
     matches!(
         candidate.source,
-        "learned-domain" | "learned-ip"
+        "builtin" | "learned-domain" | "learned-ip"
     )
 }
 

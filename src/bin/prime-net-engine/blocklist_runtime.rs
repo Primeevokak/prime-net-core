@@ -78,6 +78,15 @@ pub async fn initialize_runtime_blocklist(cfg: &BlocklistConfig) -> Result<Runti
 
     let cache_path = expand_tilde(&cfg.cache_path);
     let mut cache = BlocklistCache::status(&cache_path)?;
+    
+    // Invalidate suspiciously small cache for large known sources to force re-parsing with improved logic
+    if let Some(ref c) = cache {
+        if c.domains.len() < 5000 && (c.source.contains("zapret-info") || c.source.contains("z-i")) {
+            warn!(target: "socks_cmd", domains = c.domains.len(), "cached blocklist is suspiciously small; invalidating to force full re-parse");
+            cache = None;
+        }
+    }
+
     let mut cache_updated = false;
 
     if cfg.auto_update && should_refresh_cache(cache.as_ref(), cfg.update_interval_hours) {

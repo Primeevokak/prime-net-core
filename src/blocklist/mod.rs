@@ -82,7 +82,8 @@ pub async fn update_blocklist(source: &str, cache_path: &Path) -> Result<Blockli
         .build()
         .map_err(|e| EngineError::Internal(format!("failed to build blocklist client: {e}")))?;
 
-    let body = client.get(source).send().await?.text().await?;
+    let bytes = client.get(source).send().await?.bytes().await?;
+    let body = String::from_utf8_lossy(&bytes);
     let mut domains = parse_domains_from_text(&body);
     if domains.is_empty() {
         return Err(EngineError::Internal(
@@ -124,22 +125,39 @@ fn looks_like_domain(s: &str) -> bool {
     }
     s.contains('.')
         && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
 }
 
 fn parse_domains_from_text(body: &str) -> Vec<String> {
     let semicolon = parse_domains_csv(body, b';');
     let comma = parse_domains_csv(body, b',');
 
-    if semicolon.is_empty() && comma.is_empty() {
-        return parse_domains_legacy(body);
-    }
-
-    if semicolon.len() >= comma.len() {
+    let mut domains = if semicolon.len() >= comma.len() {
         semicolon
     } else {
         comma
+    };
+
+    // Fallback: if we got very few domains from a large body, use regex to extract everything that looks like a domain.
+    // 10000 is a safe threshold because known blocklists (z-i, antizapret) are much larger.
+    if domains.len() < 10000 && body.len() > 1024 * 1024 {
+        let re = regex::Regex::new(r"(?i)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}").unwrap();
+        let mut regex_domains = Vec::new();
+        for cap in re.captures_iter(body) {
+            let d = cap[0].to_ascii_lowercase();
+            if looks_like_domain(&d) {
+                regex_domains.push(d);
+            }
+        }
+        if regex_domains.len() > domains.len() {
+            domains = regex_domains;
+        }
     }
+
+    if domains.is_empty() {
+        return parse_domains_legacy(body);
+    }
+    domains
 }
 
 fn parse_domains_csv(body: &str, delimiter: u8) -> Vec<String> {
@@ -147,33 +165,30 @@ fn parse_domains_csv(body: &str, delimiter: u8) -> Vec<String> {
     let mut rdr = ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
+        .quoting(false)
         .trim(Trim::All)
         .delimiter(delimiter)
         .from_reader(body.as_bytes());
 
     for record in rdr.records().flatten() {
-        if let Some(domain) = pick_domain_from_record(&record) {
-            domains.push(domain);
-        }
+        domains.extend(pick_domains_from_record(&record));
     }
     domains
 }
 
-fn pick_domain_from_record(record: &csv::StringRecord) -> Option<String> {
-    if let Some(v) = record.get(0) {
-        let domain = normalize_domain_candidate(v);
-        if looks_like_domain(&domain) {
-            return Some(domain);
+fn pick_domains_from_record(record: &csv::StringRecord) -> Vec<String> {
+    let mut domains = Vec::new();
+    for field in record.iter() {
+        let candidate = normalize_domain_candidate(field);
+        // Split by pipe OR whitespace to catch multiple domains in one field
+        for part in candidate.split(|c: char| c == '|' || c.is_whitespace()) {
+            let sub_candidate = normalize_domain_candidate(part);
+            if looks_like_domain(&sub_candidate) {
+                domains.push(sub_candidate);
+            }
         }
     }
-
-    for field in record.iter().skip(1) {
-        let domain = normalize_domain_candidate(field);
-        if looks_like_domain(&domain) {
-            return Some(domain);
-        }
-    }
-    None
+    domains
 }
 
 fn normalize_domain_candidate(value: &str) -> String {

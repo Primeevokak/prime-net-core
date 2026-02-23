@@ -405,13 +405,13 @@ mod tests {
     #[test]
     fn find_sni_offset_basic_client_hello() {
         let ch = build_client_hello("example.com", false);
-        assert_eq!(find_sni_offset(&ch), Some(52));
+        assert_eq!(find_sni_info(&ch).map(|(o, _)| o), Some(52));
     }
 
     #[test]
     fn find_sni_offset_with_padding_extension() {
         let ch = build_client_hello("example.com", true);
-        assert_eq!(find_sni_offset(&ch), Some(58));
+        assert_eq!(find_sni_info(&ch).map(|(o, _)| o), Some(58));
     }
 
     #[test]
