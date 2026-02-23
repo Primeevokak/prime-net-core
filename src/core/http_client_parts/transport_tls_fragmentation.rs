@@ -114,10 +114,11 @@ impl PrimeHttpClient {
         let mut cfg = FragmentConfig {
             first_write_max: 64,
             first_write_plan: None,
-            fragment_size: self.config.evasion.fragment_size.max(1),
+            fragment_size_min: self.config.evasion.fragment_size_min.max(1),
+            fragment_size_max: self.config.evasion.fragment_size_max.max(1),
             sleep_ms: self.config.evasion.fragment_sleep_ms,
             jitter_ms: None,
-            randomize_fragment_size: false,
+            randomize_fragment_size: self.config.evasion.randomize_fragment_size,
             split_at_sni: false,
         };
         self.apply_traffic_shaping_to_fragment_cfg(&mut cfg);
@@ -140,10 +141,11 @@ impl PrimeHttpClient {
         let mut cfg = FragmentConfig {
             first_write_max: 64,
             first_write_plan: Some(sizes),
-            fragment_size: self.config.evasion.fragment_size.max(1),
+            fragment_size_min: self.config.evasion.fragment_size_min.max(1),
+            fragment_size_max: self.config.evasion.fragment_size_max.max(1),
             sleep_ms: self.config.evasion.fragment_sleep_ms,
             jitter_ms: None,
-            randomize_fragment_size: false,
+            randomize_fragment_size: self.config.evasion.randomize_fragment_size,
             split_at_sni: self.config.evasion.split_at_sni,
         };
         self.apply_traffic_shaping_to_fragment_cfg(&mut cfg);

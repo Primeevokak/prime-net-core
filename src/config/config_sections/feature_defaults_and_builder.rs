@@ -34,10 +34,27 @@ pub struct EvasionConfig {
     pub prime_mode: bool,
     #[serde(default)]
     pub strategy: Option<EvasionStrategy>,
-    #[serde(default = "default_fragment_size")]
-    pub fragment_size: usize,
+    #[serde(default = "default_fragment_size_min")]
+    pub fragment_size_min: usize,
+    #[serde(default = "default_fragment_size_max")]
+    pub fragment_size_max: usize,
+    #[serde(default = "default_randomize_fragment_size")]
+    pub randomize_fragment_size: bool,
     #[serde(default = "default_fragment_sleep_ms")]
     pub fragment_sleep_ms: u64,
+    /// Optional TCP receive window size for the first packet (0 uses system default).
+    /// Small values (1-10) can confuse some DPI.
+    #[serde(default)]
+    pub tcp_window_size: u32,
+    /// Number of fake packets to send before the real connection (0 disables).
+    #[serde(default)]
+    pub fake_packets_count: u8,
+    /// TTL for fake packets (should be enough to reach DPI but not the server).
+    #[serde(default = "default_fake_ttl")]
+    pub fake_packets_ttl: u8,
+    /// Size of junk data in fake packets.
+    #[serde(default = "default_fake_data_size")]
+    pub fake_packets_data_size: usize,
     /// Optional TLS maximum fragment size (in bytes) applied only for the fragment path.
     ///
     /// This influences TLS record sizing (best-effort; depends on peer support for MFL).
@@ -85,8 +102,14 @@ impl Default for EvasionConfig {
     fn default() -> Self {
         Self {
             strategy: None,
-            fragment_size: default_fragment_size(),
+            fragment_size_min: default_fragment_size_min(),
+            fragment_size_max: default_fragment_size_max(),
+            randomize_fragment_size: default_randomize_fragment_size(),
             fragment_sleep_ms: default_fragment_sleep_ms(),
+            tcp_window_size: 0,
+            fake_packets_count: 0,
+            fake_packets_ttl: default_fake_ttl(),
+            fake_packets_data_size: default_fake_data_size(),
             tls_record_max_fragment_size: None,
             rst_retry_max: default_rst_retry_max(),
             traffic_shaping_enabled: false,
@@ -114,12 +137,28 @@ pub enum EvasionStrategy {
     Auto,
 }
 
-fn default_fragment_size() -> usize {
+fn default_fragment_size_min() -> usize {
+    1
+}
+
+fn default_fragment_size_max() -> usize {
     64
+}
+
+fn default_randomize_fragment_size() -> bool {
+    true
 }
 
 fn default_fragment_sleep_ms() -> u64 {
     10
+}
+
+fn default_fake_ttl() -> u8 {
+    2
+}
+
+fn default_fake_data_size() -> usize {
+    16
 }
 
 fn default_rst_retry_max() -> usize {
@@ -329,7 +368,7 @@ fn default_system_proxy_socks_endpoint() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlocklistConfig {
-    #[serde(default = "default_blocklist_enabled")]
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_blocklist_source")]
     pub source: String,
@@ -382,7 +421,7 @@ fn default_blocklist_cache_path() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdaterConfig {
-    #[serde(default = "default_updater_enabled")]
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_updater_auto_check")]
     pub auto_check: bool,

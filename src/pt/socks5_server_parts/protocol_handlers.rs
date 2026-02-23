@@ -572,14 +572,16 @@ fn tune_relay_for_target(
         1 => RelayOptions {
             fragment_client_hello: true,
             // Более крупные фрагменты с минимальной паузой: безопасный базовый профиль без долгих задержек handshake.
-            fragment_size: base.fragment_size.clamp(1, 24),
+            fragment_size_min: base.fragment_size_min.clamp(1, 24),
+            fragment_size_max: base.fragment_size_max.clamp(1, 24),
             fragment_sleep_ms: base.fragment_sleep_ms.min(2),
             fragment_budget_bytes: base.fragment_budget_bytes.clamp(2 * 1024, 6 * 1024),
             ..base
         },
         2 => RelayOptions {
             fragment_client_hello: true,
-            fragment_size: base.fragment_size.clamp(1, 8),
+            fragment_size_min: base.fragment_size_min.clamp(1, 8),
+            fragment_size_max: base.fragment_size_max.clamp(1, 8),
             fragment_sleep_ms: base.fragment_sleep_ms.min(1),
             fragment_budget_bytes: base.fragment_budget_bytes.clamp(4 * 1024, 8 * 1024),
             client_hello_split_offsets: vec![1, 5, 40],
@@ -587,7 +589,8 @@ fn tune_relay_for_target(
         },
         3 => RelayOptions {
             fragment_client_hello: true,
-            fragment_size: base.fragment_size.clamp(1, 4),
+            fragment_size_min: base.fragment_size_min.clamp(1, 4),
+            fragment_size_max: base.fragment_size_max.clamp(1, 4),
             fragment_sleep_ms: 0,
             fragment_budget_bytes: base.fragment_budget_bytes.clamp(6 * 1024, 12 * 1024),
             client_hello_split_offsets: vec![1, 5, 40, 64],
@@ -595,7 +598,8 @@ fn tune_relay_for_target(
         },
         _ => RelayOptions {
             fragment_client_hello: true,
-            fragment_size: base.fragment_size.clamp(1, 2),
+            fragment_size_min: 1,
+            fragment_size_max: base.fragment_size_max.clamp(1, 2),
             fragment_sleep_ms: 0,
             fragment_budget_bytes: base.fragment_budget_bytes.clamp(8 * 1024, 16 * 1024),
             client_hello_split_offsets: vec![1, 5, 40, 64],
@@ -608,7 +612,7 @@ fn tune_relay_for_target(
             destination = %destination,
             stage,
             source = ?source,
-            fragment_size = tuned.fragment_size,
+            fragment_size_max = tuned.fragment_size_max,
             fragment_sleep_ms = tuned.fragment_sleep_ms,
             fragment_budget_bytes = tuned.fragment_budget_bytes,
             "adaptive DPI relay profile selected"

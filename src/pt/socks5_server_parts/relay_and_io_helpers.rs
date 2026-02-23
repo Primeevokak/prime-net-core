@@ -3,6 +3,10 @@ async fn relay_bidirectional(
     upstream: &mut BoxStream,
     relay_opts: RelayOptions,
 ) -> std::io::Result<(u64, u64)> {
+    if relay_opts.tcp_window_size > 0 {
+        let _ = apply_tcp_window_size(client, relay_opts.tcp_window_size);
+    }
+
     if !relay_opts.fragment_client_hello {
         return tokio::io::copy_bidirectional(client, upstream).await;
     }
@@ -12,29 +16,34 @@ async fn relay_bidirectional(
 
     let upstream_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let upstream_seen_c2u = upstream_seen.clone();
+    
+    // Auto-MTU: If we are in aggressive stage, cap write sizes early to avoid PMTU issues.
+    let is_aggressive = relay_opts.fragment_size_max <= 8;
+
     let c2u = async move {
         let mut total = 0u64;
         let mut budget = relay_opts.fragment_budget_bytes;
         let started = tokio::time::Instant::now();
         let mut buf = [0u8; 16 * 1024];
         let mut maybe_tls = None;
+        let mut client_hello_sent = false;
 
-        let aggressive_fragment_profile = relay_opts.fragment_size <= 4;
         let fragment_cfg = FragmentConfig {
-            first_write_max: relay_opts.fragment_size.clamp(1, 64),
+            first_write_max: relay_opts.fragment_size_max.clamp(1, 64),
             first_write_plan: if relay_opts.client_hello_split_offsets.is_empty() {
                 None
             } else {
                 Some(offsets_to_plan(&relay_opts.client_hello_split_offsets))
             },
-            fragment_size: relay_opts.fragment_size.max(1),
+            fragment_size_min: relay_opts.fragment_size_min.max(1),
+            fragment_size_max: relay_opts.fragment_size_max.max(1),
             sleep_ms: relay_opts.fragment_sleep_ms,
-            jitter_ms: if aggressive_fragment_profile && relay_opts.fragment_sleep_ms == 0 {
+            jitter_ms: if relay_opts.randomize_fragment_size && relay_opts.fragment_sleep_ms == 0 {
                 Some((0, 3))
             } else {
                 None
             },
-            randomize_fragment_size: aggressive_fragment_profile,
+            randomize_fragment_size: relay_opts.randomize_fragment_size,
             split_at_sni: relay_opts.split_at_sni,
         };
         let (mut frag_upstream_w, frag_handle) =
@@ -49,15 +58,26 @@ async fn relay_bidirectional(
             total += n as u64;
 
             if maybe_tls.is_none() {
-                maybe_tls = Some(is_tls_client_hello(&buf[..n]));
-                if !maybe_tls.unwrap_or(false) {
+                let is_ch = is_tls_client_hello(&buf[..n]);
+                maybe_tls = Some(is_ch);
+                if is_ch {
+                    client_hello_sent = true;
+                } else {
                     frag_handle.disable();
                 }
             }
 
             // Фрагментируем только в раннем окне handshake или до первых байтов от upstream.
-            let within_handshake_window = started.elapsed() <= Duration::from_secs(3);
+            let elapsed = started.elapsed();
+            let within_handshake_window = elapsed <= Duration::from_secs(3);
             let upstream_has_responded = upstream_seen_c2u.load(Ordering::Relaxed);
+            
+            // Passive Fingerprinting: Detect silent drops.
+            // If ClientHello was sent but no response within 3s window, abort with specific error.
+            if client_hello_sent && !upstream_has_responded && elapsed > Duration::from_secs(3) {
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "silent drop detected (no response to ClientHello)"));
+            }
+
             let use_fragmentation = maybe_tls.unwrap_or(false)
                 && budget > 0
                 && within_handshake_window
@@ -76,7 +96,17 @@ async fn relay_bidirectional(
                 }
             } else {
                 frag_handle.disable();
-                frag_upstream_w.write_all(&buf[..n]).await?;
+                // Auto-MTU hint: use smaller writes if we suspect MTU issues.
+                if is_aggressive && n > 1300 {
+                     let mut p = 0;
+                     while p < n {
+                         let chunk = (n - p).min(1200);
+                         frag_upstream_w.write_all(&buf[p..p+chunk]).await?;
+                         p += chunk;
+                     }
+                } else {
+                    frag_upstream_w.write_all(&buf[..n]).await?;
+                }
             }
         }
         Ok::<u64, std::io::Error>(total)
@@ -100,6 +130,14 @@ async fn relay_bidirectional(
 
     let (bytes_client_to_upstream, bytes_upstream_to_client) = tokio::try_join!(c2u, u2c)?;
     Ok((bytes_client_to_upstream, bytes_upstream_to_client))
+}
+
+fn apply_tcp_window_size(stream: &TcpStream, size: u32) -> std::io::Result<()> {
+    use socket2::SockRef;
+    let socket = SockRef::from(stream);
+    let _ = socket.set_recv_buffer_size(size as usize);
+    let _ = socket.set_send_buffer_size(size as usize);
+    Ok(())
 }
 
 fn offsets_to_plan(offsets: &[usize]) -> Vec<usize> {

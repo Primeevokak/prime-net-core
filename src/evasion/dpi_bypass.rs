@@ -22,6 +22,7 @@ pub enum DesyncStrategy {
     SplitHandshake { first_packet_size: usize },
     TcbDesync { fake_ttl: u8 },
     HttpFragmentation,
+    FakePackets { ttl: u8, count: u8, data_size: usize },
 }
 
 #[derive(Debug, Error)]
@@ -82,8 +83,16 @@ impl DpiBypassExt for TcpStream {
         strategy: DesyncStrategy,
     ) -> Pin<Box<dyn Future<Output = Result<TcpStream>> + Send>> {
         Box::pin(async move {
-            if let DesyncStrategy::TcbDesync { fake_ttl } = strategy {
-                let _ = send_tcb_desync_probe(addr, fake_ttl).await;
+            match strategy {
+                DesyncStrategy::TcbDesync { fake_ttl } => {
+                    let _ = send_tcb_desync_probe(addr, fake_ttl).await;
+                }
+                DesyncStrategy::FakePackets { ttl, count, data_size } => {
+                    for _ in 0..count {
+                        let _ = send_fake_payload_probe(addr, ttl, data_size).await;
+                    }
+                }
+                _ => {}
             }
             Ok(TcpStream::connect(addr).await?)
         })
@@ -108,7 +117,7 @@ impl DpiBypassExt for TcpStream {
                 DesyncStrategy::HttpFragmentation => {
                     write_http_fragmented(self, data).await?;
                 }
-                DesyncStrategy::TcbDesync { .. } => {
+                DesyncStrategy::TcbDesync { .. } | DesyncStrategy::FakePackets { .. } => {
                     // Transport desync is applied at connect phase; payload stays intact.
                     self.write_all(data).await?;
                 }
@@ -126,6 +135,20 @@ async fn send_tcb_desync_probe(addr: SocketAddr, fake_ttl: u8) -> std::io::Resul
     {
         let _ = probe.set_ttl(u32::from(fake_ttl.max(1)));
         let _ = probe.write_all(b"\0").await;
+        let _ = probe.shutdown().await;
+    }
+    Ok(())
+}
+
+async fn send_fake_payload_probe(addr: SocketAddr, ttl: u8, data_size: usize) -> std::io::Result<()> {
+    use rand::RngCore;
+    if let Ok(Ok(mut probe)) =
+        tokio::time::timeout(Duration::from_millis(200), TcpStream::connect(addr)).await
+    {
+        let _ = probe.set_ttl(u32::from(ttl.max(1)));
+        let mut junk = vec![0u8; data_size.clamp(1, 1024)];
+        rand::thread_rng().fill_bytes(&mut junk);
+        let _ = probe.write_all(&junk).await;
         let _ = probe.shutdown().await;
     }
     Ok(())
@@ -211,7 +234,7 @@ fn chunk_for_strategy(data: &[u8], strategy: DesyncStrategy) -> Vec<Vec<u8>> {
             }
             out
         }
-        DesyncStrategy::TcbDesync { .. } => vec![data.to_vec()],
+        DesyncStrategy::TcbDesync { .. } | DesyncStrategy::FakePackets { .. } => vec![data.to_vec()],
     }
 }
 

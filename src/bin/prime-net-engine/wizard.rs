@@ -129,20 +129,20 @@ pub async fn run_wizard(opts: &WizardOpts) -> Result<()> {
             let picked = auto_tune_fragment_size(&mut cfg, &url).await;
             match picked {
                 Ok(sz) => {
-                    cfg.evasion.fragment_size = sz;
-                    println!("Picked fragment_size={sz}");
+                    cfg.evasion.fragment_size_max = sz;
+                    println!("Picked fragment_size_max={sz}");
                 }
                 Err(e) => {
                     println!(
-                        "Auto-tune failed: {e}. Keeping fragment_size={}",
-                        cfg.evasion.fragment_size
+                        "Auto-tune failed: {e}. Keeping fragment_size_max={}",
+                        cfg.evasion.fragment_size_max
                     );
                 }
             }
             println!();
         } else {
-            let sz = prompt_u64("fragment_size (bytes)", cfg.evasion.fragment_size as u64)?;
-            cfg.evasion.fragment_size = sz as usize;
+            let sz = prompt_u64("fragment_size_max (bytes)", cfg.evasion.fragment_size_max as u64)?;
+            cfg.evasion.fragment_size_max = sz as usize;
         }
     }
 
@@ -157,7 +157,8 @@ pub async fn run_wizard(opts: &WizardOpts) -> Result<()> {
 async fn auto_tune_fragment_size(cfg: &mut EngineConfig, test_url: &str) -> Result<usize> {
     let candidates = [64usize, 48, 32, 16, 8];
     for &sz in &candidates {
-        cfg.evasion.fragment_size = sz;
+        cfg.evasion.fragment_size_max = sz;
+        cfg.evasion.fragment_size_min = sz.min(10);
         cfg.evasion.fragment_sleep_ms = 10;
 
         let client = PrimeEngine::new(cfg.clone()).await?.client();

@@ -10,3 +10,5 @@ mod test_cmd_tests;
 mod tui_tests;
 #[path = "integration/updater_tests.rs"]
 mod updater_tests;
+#[path = "integration/evasion_tests.rs"]
+mod evasion_tests;

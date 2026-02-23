@@ -119,7 +119,8 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
     if relay_opts.fragment_client_hello {
         info!(
             target: "socks_cmd",
-            fragment_size = relay_opts.fragment_size,
+            fragment_size_min = relay_opts.fragment_size_min,
+            fragment_size_max = relay_opts.fragment_size_max,
             fragment_sleep_ms = relay_opts.fragment_sleep_ms,
             fragment_budget_bytes = relay_opts.fragment_budget_bytes,
             split_at_sni = relay_opts.split_at_sni,
@@ -175,9 +176,12 @@ fn build_direct_relay_options(cfg: &EngineConfig) -> RelayOptions {
         fragment_client_hello: true,
         split_at_sni: cfg.evasion.split_at_sni,
         client_hello_split_offsets: split_offsets,
-        fragment_size: cfg.evasion.fragment_size.clamp(1, 64),
+        fragment_size_min: cfg.evasion.fragment_size_min.clamp(1, 64),
+        fragment_size_max: cfg.evasion.fragment_size_max.clamp(1, 64),
+        randomize_fragment_size: cfg.evasion.randomize_fragment_size,
         fragment_sleep_ms: cfg.evasion.fragment_sleep_ms.min(50),
         fragment_budget_bytes: cfg.evasion.fragment_budget_bytes.clamp(1024, 128 * 1024),
+        tcp_window_size: cfg.evasion.tcp_window_size,
         stage1_failures: 1,
         stage2_failures: 2,
         stage3_failures: 3,

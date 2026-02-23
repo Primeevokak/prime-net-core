@@ -72,9 +72,12 @@ pub struct RelayOptions {
     pub fragment_client_hello: bool,
     pub split_at_sni: bool,
     pub client_hello_split_offsets: Vec<usize>,
-    pub fragment_size: usize,
+    pub fragment_size_min: usize,
+    pub fragment_size_max: usize,
+    pub randomize_fragment_size: bool,
     pub fragment_sleep_ms: u64,
     pub fragment_budget_bytes: usize,
+    pub tcp_window_size: u32,
     pub stage1_failures: u8,
     pub stage2_failures: u8,
     pub stage3_failures: u8,
@@ -97,9 +100,12 @@ impl Default for RelayOptions {
             fragment_client_hello: false,
             split_at_sni: true,
             client_hello_split_offsets: vec![1, 5, 40],
-            fragment_size: 64,
+            fragment_size_min: 1,
+            fragment_size_max: 64,
+            randomize_fragment_size: true,
             fragment_sleep_ms: 0,
             fragment_budget_bytes: 8192,
+            tcp_window_size: 0,
             stage1_failures: 1,
             stage2_failures: 2,
             stage3_failures: 3,
@@ -125,6 +131,7 @@ enum BlockingSignal {
     EarlyClose,
     BrokenPipe,
     SuspiciousZeroReply,
+    SilentDrop,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -135,6 +142,8 @@ struct DestinationClassifier {
     early_closes: u64,
     broken_pipes: u64,
     suspicious_zero_replies: u64,
+    #[serde(default)]
+    silent_drops: u64,
     successes: u64,
     #[serde(default)]
     last_seen_unix: u64,

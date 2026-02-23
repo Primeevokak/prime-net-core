@@ -2688,6 +2688,7 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "shadowsocks",
+ "socket2 0.5.10",
  "tempfile",
  "thiserror 2.0.18",
  "tiny_http",

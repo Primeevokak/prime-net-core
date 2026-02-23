@@ -111,6 +111,7 @@ fn record_destination_failure(
             BlockingSignal::SuspiciousZeroReply => {
                 stats.suspicious_zero_replies = stats.suspicious_zero_replies.saturating_add(1)
             }
+            BlockingSignal::SilentDrop => stats.silent_drops = stats.silent_drops.saturating_add(1),
         }
         stats.last_seen_unix = now;
     }
@@ -160,6 +161,9 @@ fn record_stage_outcome(stage: u8, success: bool) {
 }
 
 fn classify_io_error(e: &std::io::Error) -> BlockingSignal {
+    if e.to_string().contains("silent drop") {
+        return BlockingSignal::SilentDrop;
+    }
     match e.kind() {
         ErrorKind::ConnectionReset => BlockingSignal::Reset,
         ErrorKind::TimedOut => BlockingSignal::Timeout,
@@ -176,6 +180,7 @@ fn blocking_signal_label(signal: BlockingSignal) -> &'static str {
         BlockingSignal::EarlyClose => "early-close",
         BlockingSignal::BrokenPipe => "broken-pipe",
         BlockingSignal::SuspiciousZeroReply => "suspicious-zero-reply",
+        BlockingSignal::SilentDrop => "silent-drop",
     }
 }
 
@@ -215,6 +220,7 @@ fn maybe_emit_classifier_summary(interval_secs: u64) {
                 failures = s.failures,
                 resets = s.resets,
                 timeouts = s.timeouts,
+                silent_drops = s.silent_drops,
                 early_closes = s.early_closes,
                 broken_pipes = s.broken_pipes,
                 suspicious_zero_replies = s.suspicious_zero_replies,

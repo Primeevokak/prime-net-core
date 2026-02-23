@@ -17,13 +17,15 @@ pub struct FragmentConfig {
     ///
     /// If set and non-empty, it takes precedence over `first_write_max`.
     pub first_write_plan: Option<Vec<usize>>,
+    /// Minimum chunk size for subsequent writes while fragmentation is enabled.
+    pub fragment_size_min: usize,
     /// Maximum chunk size for subsequent writes while fragmentation is enabled.
-    pub fragment_size: usize,
+    pub fragment_size_max: usize,
     /// Optional delay between chunks.
     pub sleep_ms: u64,
     /// Optional per-chunk jitter range (overrides `sleep_ms` when set).
     pub jitter_ms: Option<(u64, u64)>,
-    /// If true, randomize chunk sizes for non-first writes in 1..=fragment_size (best-effort).
+    /// If true, randomize chunk sizes for non-first writes in fragment_size_min..=fragment_size_max.
     pub randomize_fragment_size: bool,
     /// If true, attempt to split first TLS ClientHello exactly at SNI extension boundary.
     /// This has higher priority than `first_write_plan`.
@@ -35,7 +37,8 @@ impl Default for FragmentConfig {
         Self {
             first_write_max: 64,
             first_write_plan: None,
-            fragment_size: 64,
+            fragment_size_min: 1,
+            fragment_size_max: 64,
             sleep_ms: 10,
             jitter_ms: None,
             randomize_fragment_size: false,
@@ -75,8 +78,14 @@ pub struct FragmentingIo<T> {
 
 impl<T> FragmentingIo<T> {
     pub fn new(inner: T, mut cfg: FragmentConfig) -> (Self, FragmentHandle) {
-        if cfg.fragment_size == 0 {
-            cfg.fragment_size = 1;
+        if cfg.fragment_size_max == 0 {
+            cfg.fragment_size_max = 1;
+        }
+        if cfg.fragment_size_min == 0 {
+            cfg.fragment_size_min = 1;
+        }
+        if cfg.fragment_size_min > cfg.fragment_size_max {
+            cfg.fragment_size_min = cfg.fragment_size_max;
         }
         if cfg.first_write_max == 0 {
             cfg.first_write_max = 1;
@@ -165,11 +174,15 @@ impl<T> FragmentingIo<T> {
             return self.cfg.first_write_max.min(buf_len.max(1)).max(1);
         }
 
-        if self.cfg.randomize_fragment_size && self.cfg.fragment_size > 1 {
-            let max = self.cfg.fragment_size.min(buf_len.max(1));
-            return rand::thread_rng().gen_range(1..=max.max(1));
+        if self.cfg.randomize_fragment_size {
+            let min = self.cfg.fragment_size_min.max(1);
+            let max = self.cfg.fragment_size_max.min(buf_len.max(1)).max(min);
+            if min >= max {
+                return min;
+            }
+            return rand::thread_rng().gen_range(min..=max);
         }
-        self.cfg.fragment_size.min(buf_len.max(1)).max(1)
+        self.cfg.fragment_size_max.min(buf_len.max(1)).max(1)
     }
 }
 
@@ -324,25 +337,6 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for FragmentingIo<T> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        // We intentionally degrade to non-vectored writes while fragmentation is enabled.
-        false
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[std::io::IoSlice<'_>],
-    ) -> Poll<std::io::Result<usize>> {
-        // Keep behavior simple and deterministic: write from the first non-empty slice.
-        for b in bufs {
-            if !b.is_empty() {
-                return self.poll_write(cx, b);
-            }
-        }
-        Poll::Ready(Ok(0))
     }
 }
 
