@@ -422,6 +422,23 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                 ],
             },
             PacketBypassProfile {
+                name: "meta-extreme".to_owned(),
+                args: vec![
+                    "--port".to_owned(),
+                    find_free_port().to_string(),
+                    "--split".to_owned(),
+                    "1".to_owned(),
+                    "--oob".to_owned(),
+                    "1".to_owned(),
+                    "--disorder".to_owned(),
+                    "1".to_owned(),
+                    "--ttl".to_owned(),
+                    "3".to_owned(),
+                    "--timeout".to_owned(),
+                    "6".to_owned(),
+                ],
+            },
+            PacketBypassProfile {
                 name: "super-safe".to_owned(),
                 args: vec![
                     "--port".to_owned(),

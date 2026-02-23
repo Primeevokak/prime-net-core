@@ -347,11 +347,14 @@ async fn handle_client(
 
         if connected.candidate.kind == RouteKind::Bypass {
             let bypass_tunnel_started = Instant::now();
-            match tokio::io::copy_bidirectional(&mut tcp, &mut connected.stream).await {
+            let tuned = tune_relay_for_target(relay_opts.clone(), port, &target, false, true);
+            
+            // Use our relay_bidirectional instead of raw copy even for bypass.
+            // This applies our internal fragmentation ON TOP of CIADPI's evasion.
+            match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options.clone()).await {
                 Ok((c2u, u2c)) => {
                     let lifetime_ms = bypass_tunnel_started.elapsed().as_millis() as u64;
                     if c2u == 0 && u2c == 0 && attempt < max_attempts {
-                        // Silent failure of bypass route: mark as weak and try next attempt.
                         warn!(target: "socks5.route", conn_id, destination = %target, route = %connected.candidate.route_id(), "bypass failed with zero bytes, trying fallback");
                         record_route_failure(&connected.route_key, &connected.candidate, "zero-reply-soft");
                         attempt += 1;
@@ -367,8 +370,9 @@ async fn handle_client(
                         session_lifetime_ms = lifetime_ms,
                         bypass_profile = connected.candidate.bypass_profile_idx + 1,
                         bypass_profiles = connected.candidate.bypass_profile_total,
-                        "bypass tunnel closed"
+                        "bypass tunnel closed (double-evasion active)"
                     );
+                    
                     if should_skip_empty_session_scoring(c2u, u2c) {
                         if should_mark_empty_bypass_session_as_soft_failure(&connected.candidate, port)
                         {
@@ -416,7 +420,7 @@ async fn handle_client(
                         conn_id,
                         destination = %target,
                         error = %e,
-                        "bypass tunnel error"
+                        "bypass tunnel error (double-evasion)"
                     );
                     record_bypass_profile_failure(
                         &target,
@@ -430,7 +434,7 @@ async fn handle_client(
             }
         }
 
-        let tuned = tune_relay_for_target(relay_opts.clone(), port, &target, false);
+        let tuned = tune_relay_for_target(relay_opts.clone(), port, &target, false, false);
         match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options.clone()).await {
             Ok((bytes_client_to_upstream, bytes_upstream_to_client)) => {
                 if bytes_client_to_upstream == 0 && bytes_upstream_to_client == 0 && attempt < max_attempts {

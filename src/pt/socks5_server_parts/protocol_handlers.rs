@@ -260,7 +260,7 @@ async fn handle_http_proxy(
             return Ok(());
         }
 
-        let tuned = tune_relay_for_target(relay_opts, port, &destination, false);
+        let tuned = tune_relay_for_target(relay_opts, port, &destination, false, false);
         match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options.clone()).await {
             Ok((bytes_client_to_upstream, bytes_upstream_to_client)) => {
                 if should_skip_empty_session_scoring(bytes_client_to_upstream, bytes_upstream_to_client)
@@ -430,7 +430,7 @@ async fn handle_http_proxy(
         out.write_all(buffered_body).await?;
     }
 
-    let tuned = tune_relay_for_target(relay_opts, parsed.port, &destination, false);
+    let tuned = tune_relay_for_target(relay_opts, parsed.port, &destination, false, false);
     match relay_bidirectional(&mut tcp, &mut out, tuned.options.clone()).await {
         Ok((bytes_client_to_upstream, bytes_upstream_to_client)) => {
             if should_skip_empty_session_scoring(bytes_client_to_upstream, bytes_upstream_to_client)
@@ -514,12 +514,35 @@ async fn handle_http_proxy(
     Ok(())
 }
 
+fn is_meta_service(destination: &str) -> bool {
+    let d = destination.to_ascii_lowercase();
+    d.contains("facebook.com") || d.contains("instagram.com") || d.contains("fbcdn.net") || d.contains("cdninstagram.com")
+}
+
 fn tune_relay_for_target(
     base: RelayOptions,
     port: u16,
     destination: &str,
     socks4_flow: bool,
+    is_bypass: bool,
 ) -> TunedRelay {
+    if is_bypass || is_meta_service(destination) {
+        // Double-evasion or Meta service mode.
+        // Use extremely aggressive fragmentation.
+        let mut opts = base.clone();
+        opts.fragment_client_hello = true;
+        opts.split_at_sni = true;
+        // Split at very small offsets to confuse DPI
+        opts.client_hello_split_offsets = vec![1, 2, 3, 4, 5, 8, 16, 32];
+        opts.fragment_size_max = 1; // Force 1-byte chunks for the budget
+        opts.fragment_sleep_ms = opts.fragment_sleep_ms.max(10);
+        return TunedRelay {
+            options: opts,
+            stage: 4,
+            source: StageSelectionSource::Adaptive,
+        };
+    }
+
     if !base.fragment_client_hello {
         return TunedRelay {
             options: base,
