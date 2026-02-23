@@ -76,7 +76,13 @@ impl BlocklistCache {
 }
 
 pub async fn update_blocklist(source: &str, cache_path: &Path) -> Result<BlocklistCache> {
-    let body = reqwest::get(source).await?.text().await?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| EngineError::Internal(format!("failed to build blocklist client: {e}")))?;
+
+    let body = client.get(source).send().await?.text().await?;
     let mut domains = parse_domains_from_text(&body);
     if domains.is_empty() {
         return Err(EngineError::Internal(

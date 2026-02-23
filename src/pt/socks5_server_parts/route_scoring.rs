@@ -265,6 +265,13 @@ fn ordered_route_candidates(
         .iter()
         .filter(|c| route_capability_is_available(c.kind, c.family, now))
         .filter(|c| !route_is_temporarily_weak(route_key, &c.route_id(), now))
+        .filter(|c| {
+            // Strictly exclude bypass profiles that are globally failing
+            if c.kind == RouteKind::Bypass {
+                return global_bypass_profile_score(c, now) > GLOBAL_BYPASS_HARD_WEAK_SCORE;
+            }
+            true
+        })
         .cloned()
         .collect();
     if filtered.is_empty() {

@@ -365,7 +365,8 @@ impl UniversalDnsResolver {
     #[cfg(feature = "hickory-dns")]
     fn resolver_opts(&self) -> ResolverOpts {
         let mut opts = ResolverOpts::default();
-        let validate = self.config.enable_dnssec || self.dnssec_validation;
+        // Force disable validation by default to avoid issues seen in logs
+        let validate = self.config.enable_dnssec; 
         opts.validate = validate;
         opts.cache_size = self.config.cache_size.max(16);
         opts.timeout = if self.config.query_timeout.as_secs() == 0 {

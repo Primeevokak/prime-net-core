@@ -204,7 +204,7 @@ async fn handle_client(
     // Приветствие SOCKS5: VER, NMETHODS, METHODS...
     let mut hdr = [0u8; 2];
     if tcp.read_exact(&mut hdr).await.is_err() {
-        info!(target: "socks5", conn_id, peer = %peer, client = %client, "client disconnected before protocol negotiation");
+        debug!(target: "socks5", conn_id, peer = %peer, client = %client, "client disconnected before protocol negotiation");
         return Ok(());
     }
     if hdr[0] != 0x05 {

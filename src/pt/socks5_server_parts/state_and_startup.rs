@@ -13,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinSet;
 use tokio::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::blocklist::expand_tilde;
 use crate::error::{EngineError, Result};

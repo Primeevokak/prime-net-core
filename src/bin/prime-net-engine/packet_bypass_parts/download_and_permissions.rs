@@ -138,6 +138,7 @@ fn make_executable(_path: &Path) -> Result<()> {
 
 async fn download_from_mirrors(name: &str, urls: &[String]) -> Result<(Vec<u8>, String)> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(120))
         .user_agent("prime-net-engine/packet-bypass-bootstrap")

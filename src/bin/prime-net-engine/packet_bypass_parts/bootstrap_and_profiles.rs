@@ -672,6 +672,7 @@ async fn resolve_latest_asset_url(repo: &str, asset_pattern: &str) -> Result<Str
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let result: Result<String> = async {
         let client = reqwest::Client::builder()
+            .no_proxy()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(15))
             .user_agent(format!(
