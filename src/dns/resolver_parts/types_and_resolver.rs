@@ -311,18 +311,21 @@ impl UniversalDnsResolver {
                         Ok(lookup) => {
                             let mut ips: Vec<IpAddr> = lookup.iter().collect();
                             
-                            // Filter out loopback IPs for public domains (DNS poisoning protection)
-                            if !domain.ends_with(".local") && !domain.contains("localhost") {
-                                ips.retain(|ip| !ip.is_loopback());
+                            // ANTI-POISONING: Strictly filter out loopback and unspecified IPs for public domains.
+                            // If an ISP returns 127.0.0.1 for Instagram, we ignore it and try the next resolver in chain (DoH).
+                            let is_public_domain = !domain.ends_with(".local") && !domain.contains("localhost");
+                            if is_public_domain {
+                                ips.retain(|ip| !ip.is_loopback() && !ip.is_unspecified());
                             }
 
-                            ips.sort_unstable();
-                            ips.dedup();
                             if !ips.is_empty() {
+                                ips.sort_unstable();
+                                ips.dedup();
                                 return Ok(ips);
                             }
+                            
                             last_err = Some(EngineError::Internal(format!(
-                                "dns lookup for '{domain}' using {kind:?} returned no valid addresses (all filtered or empty)"
+                                "dns lookup for '{domain}' using {kind:?} returned only poisoned or empty results"
                             )));
                         }
                         Err(e) => {
@@ -336,7 +339,7 @@ impl UniversalDnsResolver {
             }
             Err(last_err.unwrap_or_else(|| {
                 EngineError::Internal(format!(
-                    "dns lookup for '{domain}' failed (no resolvers configured)"
+                    "dns lookup for '{domain}' failed: all resolvers returned no valid addresses"
                 ))
             }))
         }
@@ -371,17 +374,14 @@ impl UniversalDnsResolver {
     #[cfg(feature = "hickory-dns")]
     fn resolver_opts(&self) -> ResolverOpts {
         let mut opts = ResolverOpts::default();
-        // DNSSEC validation is removed from build, ensure we don't try to set it.
-        // In censored environments, we focus on raw speed and retry logic.
-        opts.cache_size = self.config.cache_size.max(128);
+        opts.cache_size = self.config.cache_size.max(512);
         opts.recursion_desired = true;
-        // Increase timeout for DoH to 4s to prevent accidental fallback to poisoned system DNS
         opts.timeout = if self.config.query_timeout.as_secs() == 0 {
-            Duration::from_secs(4)
+            Duration::from_secs(5)
         } else {
             self.config.query_timeout.max(Duration::from_secs(3))
         };
-        opts.attempts = (self.config.retry_count + 2).max(2);
+        opts.attempts = (self.config.retry_count + 3).max(3);
         opts
     }
 
@@ -415,7 +415,7 @@ impl UniversalDnsResolver {
                 DnsResolverType::CustomUdp(v) => format!("udp:{v}"),
                 DnsResolverType::CustomTcp(v) => format!("tcp:{v}"),
             },
-            dnssec: false, // Force false in cache key
+            dnssec: false, // Hardcoded false
             cache_size: opts.cache_size,
             timeout_ms: opts.timeout.as_millis() as u64,
             attempts: opts.attempts,
@@ -446,7 +446,6 @@ impl UniversalDnsResolver {
                     EngineError::Internal(format!("system resolver build failed: {e}"))
                 })?;
                 let opts = self.resolver_opts();
-                // Standard options only
                 builder.options_mut().cache_size = opts.cache_size;
                 builder.options_mut().timeout = opts.timeout;
                 builder.options_mut().attempts = opts.attempts;

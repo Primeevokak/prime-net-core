@@ -360,8 +360,6 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                 args: vec![
                     "--port".to_owned(),
                     find_free_port().to_string(),
-                    "--disorder".to_owned(),
-                    "1".to_owned(),
                     "--oob".to_owned(),
                     "1".to_owned(),
                     "--split".to_owned(),
@@ -405,8 +403,10 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                     find_free_port().to_string(),
                     "--split".to_owned(),
                     "1+s".to_owned(),
+                    "--tlsrec".to_owned(),
+                    "1+s".to_owned(),
                     "--timeout".to_owned(),
-                    "5".to_owned(),
+                    "10".to_owned(),
                 ],
             },
         ];

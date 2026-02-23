@@ -120,6 +120,18 @@ fn record_destination_failure(
         match signal {
             BlockingSignal::Reset => {
                 stats.resets = stats.resets.saturating_add(1);
+                
+                // AUTOMATION: If we see repeated resets, clear preferred stage to force a re-probe.
+                // This handles cases where an ISP starts blocking a previously working strategy.
+                if stats.resets >= 3 {
+                    if let Ok(mut pref_guard) = DEST_PREFERRED_STAGE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+                        if pref_guard.remove(destination).is_some() {
+                            warn!(target: "socks5.classifier", destination, "cleared preferred stage due to repeated resets");
+                        }
+                    }
+                    stats.resets = 0;
+                }
+
                 // Special case: if we reset on Stage 1 for a sensitive host, 
                 // it might mean fragmentation itself is being blocked. 
                 // Force Stage 0 (no fragmentation) for this host.

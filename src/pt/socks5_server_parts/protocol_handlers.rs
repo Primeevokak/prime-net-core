@@ -574,43 +574,54 @@ fn tune_relay_for_target(
         },
         1 => RelayOptions {
             fragment_client_hello: true,
-            // Безопасная фрагментация: имитируем малый MTU, не трогая заголовок TLS слишком сильно
-            fragment_size_min: 64,
-            fragment_size_max: 128,
-            fragment_sleep_ms: base.fragment_sleep_ms.min(1),
-            fragment_budget_bytes: base.fragment_budget_bytes.clamp(4096, 8192),
-            client_hello_split_offsets: vec![], // Без разрезов SNI на первой стадии
+            fragment_size_min: 128,
+            fragment_size_max: 512,
+            fragment_sleep_ms: 0,
+            fragment_budget_bytes: 4096,
+            client_hello_split_offsets: vec![], // Plain fragmentation
             ..base
         },
         2 => RelayOptions {
             fragment_client_hello: true,
-            fragment_size_min: 16,
+            fragment_size_min: 64,
             fragment_size_max: 128,
-            fragment_sleep_ms: base.fragment_sleep_ms.min(2),
-            fragment_budget_bytes: base.fragment_budget_bytes.clamp(4096, 8192),
-            client_hello_split_offsets: vec![1, 5],
+            fragment_sleep_ms: 0,
+            fragment_budget_bytes: 8192,
+            client_hello_split_offsets: vec![5], // Split at SNI tag
             ..base
         },
         3 => RelayOptions {
             fragment_client_hello: true,
-            // Balanced fragmentation: large enough to not be 'junk', small enough to split SNI
-            fragment_size_min: 32,
-            fragment_size_max: 256,
-            fragment_sleep_ms: base.fragment_sleep_ms.min(10),
-            fragment_budget_bytes: base.fragment_budget_bytes.clamp(8192, 16384),
-            // Targets: 1st byte, then middle of Handshake, then SNI parts
-            client_hello_split_offsets: vec![1, 32, 48, 64],
-            ..base
-        },
-        _ => RelayOptions {
-            fragment_client_hello: true,
             fragment_size_min: 16,
             fragment_size_max: 64,
-            fragment_sleep_ms: base.fragment_sleep_ms.min(20),
-            fragment_budget_bytes: base.fragment_budget_bytes.clamp(8192, 32768),
-            client_hello_split_offsets: vec![1, 2, 3, 5, 32, 48, 64, 128],
-            sni_spoofing: true, 
+            fragment_sleep_ms: 1,
+            fragment_budget_bytes: 16384,
+            client_hello_split_offsets: vec![1, 5, 32, 48],
             ..base
+        },
+        _ => {
+            // Stage 4: Randomized "Fuzzing" Mode
+            let mut offsets = vec![1]; // Always split at first byte
+            let mut rng = rand::thread_rng();
+            // Randomly pick 2-4 more split points
+            for _ in 0..rng.gen_range(2..=4) {
+                offsets.push(rng.gen_range(2..=128));
+            }
+            offsets.sort_unstable();
+            offsets.dedup();
+
+            RelayOptions {
+                fragment_client_hello: true,
+                fragment_size_min: 1,
+                fragment_size_max: 16,
+                fragment_sleep_ms: rng.gen_range(1..=10),
+                fragment_budget_bytes: 32768,
+                client_hello_split_offsets: offsets,
+                tcp_window_trick: true, 
+                tcp_window_size: 64,
+                sni_spoofing: true, 
+                ..base
+            }
         },
     };
     if stage > 0 {

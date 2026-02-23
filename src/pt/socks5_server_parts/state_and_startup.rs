@@ -700,56 +700,24 @@ async fn connect_route_candidate(
 
             // Resolve domain via engine's DoH resolver if it's a domain target.
             // This prevents poisoned system DNS results (like 127.0.0.1 for Instagram)
-            // from being passed to the bypass strategy (which might use system DNS itself).
+            // from being passed to the bypass strategy.
             let resolved_target = if let TargetAddr::Domain(host) = &target.addr {
-                let mut chosen_ip = None;
-                
                 if let Some(resolver) = outbound.resolver() {
                     match resolver.resolve(host).await {
                         Ok(ips) => {
-                            // Filter loopback/sinkhole IPs
-                            let valid_ips: Vec<_> = ips.into_iter()
-                                .filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
-                                .collect();
-                            
-                            if let Some(ip) = valid_ips.first() {
-                                chosen_ip = Some(*ip);
+                            if let Some(ip) = ips.first() {
+                                TargetEndpoint {
+                                    addr: TargetAddr::Ip(*ip),
+                                    port: target.port,
+                                }
+                            } else {
+                                target
                             }
                         }
                         Err(e) => {
-                            warn!(target: "socks5.route", conn_id, host, error = %e, "DoH resolution failed for bypass");
+                            warn!(target: "socks5.route", conn_id, host, error = %e, "resolution failed for bypass, using raw target");
+                            target
                         }
-                    }
-                }
-
-                // EMERGENCY DNS PINNING: If DoH failed or returned poisoned IPs, use trusted hardcoded IPs
-                // for critical services. This is the last line of defense against DNS hijacking.
-                if chosen_ip.is_none() {
-                    let host_lower = host.to_lowercase();
-                    if host_lower.contains("instagram.com") || host_lower.contains("cdninstagram.com") {
-                        // Instagram (Meta) IPs - multiple fallbacks including Cloudflare-adjacent ones
-                        let ips = ["157.240.239.174", "157.240.214.174", "31.13.72.174", "104.16.123.96"];
-                        let idx = (conn_id % ips.len() as u64) as usize;
-                        chosen_ip = Some(ips[idx].parse().unwrap());
-                    } else if host_lower.contains("discord.com") || host_lower.contains("discord.gg") || host_lower.contains("discordapp.net") {
-                        // Discord (Cloudflare/Global) IPs - multiple fallbacks
-                        let ips = ["162.159.138.232", "162.159.128.233", "162.159.135.232"];
-                        let idx = (conn_id % ips.len() as u64) as usize;
-                        chosen_ip = Some(ips[idx].parse().unwrap());
-                    } else if host_lower.contains("soundcloud.com") || host_lower.contains("sndcdn.com") {
-                        // SoundCloud (Amazon CloudFront) IPs
-                        chosen_ip = Some("52.84.150.35".parse().unwrap());
-                    }
-                    
-                    if let Some(ip) = chosen_ip {
-                        info!(target: "socks5.route", conn_id, host, ip = %ip, "used emergency DNS pinning for poisoned/failed domain");
-                    }
-                }
-
-                if let Some(ip) = chosen_ip {
-                    TargetEndpoint {
-                        addr: TargetAddr::Ip(ip),
-                        port: target.port,
                     }
                 } else {
                     target
