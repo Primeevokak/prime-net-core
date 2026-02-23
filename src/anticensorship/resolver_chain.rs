@@ -86,6 +86,8 @@ impl ResolverChain {
 
     async fn resolve_parallel(&self, domain: &str) -> Result<Vec<IpAddr>> {
         use tokio::task::JoinSet;
+        use tokio::time::{Duration, Instant};
+        const DNS_PARALLEL_COLLECT_WINDOW_MS: u64 = 250;
         let mut set = JoinSet::new();
 
         for kind in &self.chain {
@@ -99,12 +101,33 @@ impl ResolverChain {
         }
 
         let mut last_err: Option<EngineError> = None;
+        let mut merged_ips: Vec<IpAddr> = Vec::new();
+        let mut collect_deadline: Option<Instant> = None;
 
-        while let Some(joined) = set.join_next().await {
+        loop {
+            let joined = if let Some(deadline) = collect_deadline {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => {
+                        break;
+                    }
+                    joined = set.join_next() => joined,
+                }
+            } else {
+                set.join_next().await
+            };
+
+            let Some(joined) = joined else {
+                break;
+            };
+
             match joined {
                 Ok((_kind, Ok(ips))) if !ips.is_empty() => {
-                    set.abort_all();
-                    return Ok(ips);
+                    merged_ips.extend(ips);
+                    if collect_deadline.is_none() {
+                        collect_deadline = Some(
+                            Instant::now() + Duration::from_millis(DNS_PARALLEL_COLLECT_WINDOW_MS),
+                        );
+                    }
                 }
                 Ok((kind, Ok(_))) => {
                     last_err = Some(EngineError::Internal(format!(
@@ -117,6 +140,13 @@ impl ResolverChain {
                     last_err = Some(EngineError::Internal(format!("DNS race task error: {e}")));
                 }
             }
+        }
+
+        if !merged_ips.is_empty() {
+            set.abort_all();
+            merged_ips.sort_unstable();
+            merged_ips.dedup();
+            return Ok(merged_ips);
         }
 
         Err(last_err.unwrap_or_else(|| {
@@ -304,7 +334,9 @@ impl ResolverChain {
         opts.cache_size = self.cfg.dns_cache_size;
         opts.timeout = std::time::Duration::from_secs(self.cfg.dns_query_timeout_secs.max(1));
         opts.attempts = self.cfg.dns_attempts.max(1);
-        opts.validate = self.cfg.dnssec_enabled;
+        // Hickory is built without DNSSEC validation features in this project.
+        // Enabling `validate` here produces runtime warnings for every lookup.
+        opts.validate = false;
         // Back-compat: reuse doh_cache_ttl_secs as a hard upper-bound for cached answers.
         // (Hickory cache is shared across all upstream protocols).
         let max_ttl = std::time::Duration::from_secs(self.cfg.doh_cache_ttl_secs.max(30));
@@ -489,7 +521,7 @@ async fn lookup_ips(resolver: &TokioResolver, domain: &str) -> Result<Vec<IpAddr
     let mut ips: Vec<IpAddr> = lookup.iter().collect();
     ips.sort_unstable();
     ips.dedup();
-    Ok(ips)
+    sanitize_resolved_ips(domain, ips)
 }
 
 #[cfg(feature = "hickory-dns")]
@@ -528,7 +560,30 @@ async fn system_resolve(domain: &str) -> Result<Vec<IpAddr>> {
     let mut ips: Vec<IpAddr> = result.map(|addr| addr.ip()).collect();
     ips.sort_unstable();
     ips.dedup();
+    sanitize_resolved_ips(domain, ips)
+}
+
+fn sanitize_resolved_ips(domain: &str, mut ips: Vec<IpAddr>) -> Result<Vec<IpAddr>> {
+    if should_filter_poisoned_ips(domain) {
+        ips.retain(|ip| !ip.is_unspecified() && !ip.is_loopback());
+        if ips.is_empty() {
+            return Err(EngineError::InvalidInput(format!(
+                "dns resolver returned only unspecified/sinkhole IPs for '{domain}'"
+            )));
+        }
+    }
     Ok(ips)
+}
+
+fn should_filter_poisoned_ips(domain: &str) -> bool {
+    let host = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    if host == "localhost" || host.ends_with(".local") {
+        return false;
+    }
+    true
 }
 
 #[cfg(feature = "hickory-dns")]
@@ -654,5 +709,24 @@ mod tests {
 
         let ips = chain.resolve("1.2.3.4").await.expect("ip literal");
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+    }
+
+    #[test]
+    fn sanitize_resolved_ips_filters_sinkhole_for_public_domains() {
+        let ips = vec![
+            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(157, 240, 30, 63)),
+        ];
+
+        let sanitized = sanitize_resolved_ips("www.instagram.com", ips).expect("sanitized");
+        assert_eq!(sanitized, vec![IpAddr::V4(Ipv4Addr::new(157, 240, 30, 63))]);
+    }
+
+    #[test]
+    fn sanitize_resolved_ips_keeps_localhost_loopback() {
+        let ips = vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))];
+        let sanitized = sanitize_resolved_ips("localhost", ips).expect("localhost must pass");
+        assert_eq!(sanitized, vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))]);
     }
 }

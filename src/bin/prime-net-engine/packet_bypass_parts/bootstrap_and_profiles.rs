@@ -65,15 +65,15 @@ pub async fn maybe_start_packet_bypass(
     {
         let require_admin = std::env::var("PRIME_PACKET_BYPASS_REQUIRE_ADMIN")
             .map(|v| {
-                !matches!(
+                matches!(
                     v.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "off"
+                    "1" | "true" | "on"
                 )
             })
-            .unwrap_or(true);
+            .unwrap_or(false);
         if require_admin && !is_elevated() {
             return Err(EngineError::Config(
-                "packet-level bypass requires administrator rights. restart terminal as Administrator or set PRIME_PACKET_BYPASS_REQUIRE_ADMIN=0".to_owned(),
+                "packet-level bypass strict admin mode is enabled but process is not elevated. restart terminal as Administrator or unset PRIME_PACKET_BYPASS_REQUIRE_ADMIN".to_owned(),
             ));
         }
     }
@@ -360,14 +360,16 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                 args: vec![
                     "--port".to_owned(),
                     find_free_port().to_string(),
-                    "--oob".to_owned(),
+                    "--disorder".to_owned(),
                     "1".to_owned(),
                     "--split".to_owned(),
                     "1+s".to_owned(),
+                    "--oob".to_owned(),
+                    "1".to_owned(),
                     "--tlsrec".to_owned(),
                     "1+s".to_owned(),
                     "--timeout".to_owned(),
-                    "5".to_owned(),
+                    "4".to_owned(),
                 ],
             },
             PacketBypassProfile {
@@ -375,23 +377,12 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                 args: vec![
                     "--port".to_owned(),
                     find_free_port().to_string(),
+                    "--split".to_owned(),
+                    "1".to_owned(),
                     "--oob".to_owned(),
                     "1".to_owned(),
-                    "--split".to_owned(),
-                    "2".to_owned(),
                     "--tlsrec".to_owned(),
                     "1+s".to_owned(),
-                    "--timeout".to_owned(),
-                    "5".to_owned(),
-                ],
-            },
-            PacketBypassProfile {
-                name: "oob-pure".to_owned(),
-                args: vec![
-                    "--port".to_owned(),
-                    find_free_port().to_string(),
-                    "--oob".to_owned(),
-                    "1".to_owned(),
                     "--timeout".to_owned(),
                     "5".to_owned(),
                 ],
@@ -403,10 +394,8 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                     find_free_port().to_string(),
                     "--split".to_owned(),
                     "1+s".to_owned(),
-                    "--tlsrec".to_owned(),
-                    "1+s".to_owned(),
                     "--timeout".to_owned(),
-                    "10".to_owned(),
+                    "5".to_owned(),
                 ],
             },
         ];

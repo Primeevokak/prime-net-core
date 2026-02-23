@@ -697,38 +697,9 @@ async fn connect_route_candidate(
             let bypass_addr = candidate.bypass_addr.ok_or_else(|| {
                 EngineError::Internal("bypass candidate is missing address".to_owned())
             })?;
-
-            // Resolve domain via engine's DoH resolver if it's a domain target.
-            // This prevents poisoned system DNS results (like 127.0.0.1 for Instagram)
-            // from being passed to the bypass strategy.
-            let resolved_target = if let TargetAddr::Domain(host) = &target.addr {
-                if let Some(resolver) = outbound.resolver() {
-                    match resolver.resolve(host).await {
-                        Ok(ips) => {
-                            if let Some(ip) = ips.first() {
-                                TargetEndpoint {
-                                    addr: TargetAddr::Ip(*ip),
-                                    port: target.port,
-                                }
-                            } else {
-                                target
-                            }
-                        }
-                        Err(e) => {
-                            warn!(target: "socks5.route", conn_id, host, error = %e, "resolution failed for bypass, using raw target");
-                            target
-                        }
-                    }
-                } else {
-                    target
-                }
-            } else {
-                target
-            };
-
             let stream = connect_bypass_upstream(
                 conn_id,
-                &resolved_target,
+                &target,
                 &destination,
                 bypass_addr,
                 candidate.bypass_profile_idx,
