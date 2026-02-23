@@ -640,6 +640,8 @@ pub struct AntiCensorshipConfig {
     pub dns_fallback_chain: Vec<DnsResolverKind>,
     #[serde(default)]
     pub system_dns_enabled: bool,
+    #[serde(default = "default_dns_parallel_racing")]
+    pub dns_parallel_racing: bool,
     /// Preferred ECH behavior.
     ///
     /// If set, it enables ECH and overrides legacy `ech_enabled`.
@@ -688,6 +690,7 @@ impl Default for AntiCensorshipConfig {
             doq_sni: default_doq_sni(),
             dns_fallback_chain: vec![DnsResolverKind::Doh, DnsResolverKind::System],
             system_dns_enabled: true,
+            dns_parallel_racing: default_dns_parallel_racing(),
             ech_mode: None,
             ech_enabled: false,
             domain_fronting_enabled: false,
@@ -750,6 +753,10 @@ fn default_dns_timeout_secs() -> u64 {
 
 fn default_dns_attempts() -> usize {
     2
+}
+
+fn default_dns_parallel_racing() -> bool {
+    true
 }
 
 fn default_dot_sni() -> String {

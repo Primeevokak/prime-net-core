@@ -211,6 +211,7 @@ fn build_reqwest_client(
     tls: rustls::ClientConfig,
 ) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
+        .no_proxy() // Force no proxy for internal engine requests
         .connect_timeout(Duration::from_secs(cfg.download.connect_timeout_secs))
         .timeout(Duration::from_secs(cfg.download.request_timeout_secs))
         .tcp_keepalive(Duration::from_secs(30))
@@ -401,29 +402,30 @@ fn apply_ja3_profile(
     match profile {
         Ja3Fingerprint::RustlsDefault => {}
         Ja3Fingerprint::Chrome120 => {
-            // Chrome generally prefers AES_128 first (then AES_256, then CHACHA20).
+            // Updated for Chrome 125 mimicry:
+            // Chrome prefers AES_128_GCM, then CHACHA20, then AES_256_GCM for TLS 1.3.
             reorder_cipher_suites(
                 &mut provider.cipher_suites,
                 &[
                     rustls::CipherSuite::TLS13_AES_128_GCM_SHA256,
-                    rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
                     rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+                    rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
                     rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
                     rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-                    rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-                    rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
                     rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
                     rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+                    rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                    rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
                 ],
             );
-            // Keep X25519 first for compatibility; keep PQ-hybrid (if present) last.
+            // Chrome 125+ uses X25519, secp256r1, and then hybrid PQ groups.
             reorder_kx_groups(
                 &mut provider.kx_groups,
                 &[
                     rustls::NamedGroup::X25519,
                     rustls::NamedGroup::secp256r1,
-                    rustls::NamedGroup::secp384r1,
                     rustls::NamedGroup::X25519MLKEM768,
+                    rustls::NamedGroup::secp384r1,
                 ],
             );
         }

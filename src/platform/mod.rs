@@ -37,6 +37,30 @@ pub fn system_proxy_manager() -> Box<dyn ProxyManager> {
     Box::new(windows::WindowsProxyManager)
 }
 
+pub fn resolve_process_id_by_connection(local: std::net::SocketAddr, remote: std::net::SocketAddr) -> Option<u32> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::get_process_id_by_connection(local, remote)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (local, remote);
+        None
+    }
+}
+
+pub fn resolve_process_name_by_pid(pid: u32) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::get_process_name_by_pid(pid)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub fn system_proxy_manager() -> Box<dyn ProxyManager> {
     Box::new(macos::MacOSProxyManager)

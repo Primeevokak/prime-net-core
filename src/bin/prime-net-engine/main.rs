@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use prime_net_engine_core::error::{EngineError, Result};
 use prime_net_engine_core::EngineConfig;
-use tracing::Level;
+use tracing::{info, Level};
 
 use crate::blocklist_cmd::{run_blocklist, BlocklistOpts};
 use crate::config_check::{run_config_check, ConfigCheckOpts};
@@ -40,6 +40,14 @@ async fn main() {
 }
 
 async fn real_main() -> Result<()> {
+    // Aggressively prevent any library from using system proxy.
+    std::env::set_var("http_proxy", "");
+    std::env::set_var("https_proxy", "");
+    std::env::set_var("all_proxy", "");
+    std::env::remove_var("http_proxy");
+    std::env::remove_var("https_proxy");
+    std::env::remove_var("all_proxy");
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print_help();
@@ -55,6 +63,14 @@ async fn real_main() -> Result<()> {
         rotation: parsed.log_rotation,
     })
     .map_err(EngineError::Io)?;
+
+    info!(
+        version = prime_net_engine_core::version::APP_VERSION,
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        build = if cfg!(debug_assertions) { "debug" } else { "release" },
+        "=== PRIME NET ENGINE STARTUP ==="
+    );
 
     let cfg = match &parsed.config_path {
         Some(path) => EngineConfig::from_file(path)?,

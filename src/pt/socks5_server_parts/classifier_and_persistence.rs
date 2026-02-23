@@ -15,13 +15,21 @@ fn destination_preferred_stage(destination: &str) -> u8 {
 }
 
 fn select_race_probe_stage(destination: &str) -> u8 {
-    // Гонка v1: выбор между стадиями 1/2/3 по здоровью стадий и хэшу назначения,
-    // чтобы разнести первые пробы по разным профилям.
+    // For the very first probe of a domain, always prefer Stage 1 (Safest).
+    // Aggressive Stage 2/3 probes can trigger resets (10054) on sensitive services like SoundCloud.
+    // Stage escalation will happen naturally if Stage 1 is detected as blocked.
+    let (host, _) = split_host_port_for_connect(destination).unwrap_or((destination.to_owned(), 443));
+    if host.contains("soundcloud") || host.contains("sndcdn") || host.contains("ytimg") || host.contains("discord") {
+        return 1;
+    }
+
     let stats = STAGE_RACE_STATS.get_or_init(|| Mutex::new(HashMap::new()));
     let Ok(guard) = stats.lock() else {
         return 1;
     };
-    let mut candidates = vec![1u8, 2u8, 3u8];
+    
+    // For new domains, never probe with Stage 3 or 4. They are too aggressive.
+    let mut candidates = vec![1u8, 2u8]; 
     candidates.sort_by(|a, b| {
         let sa = guard.get(a).cloned().unwrap_or_default();
         let sb = guard.get(b).cloned().unwrap_or_default();
@@ -29,7 +37,7 @@ fn select_race_probe_stage(destination: &str) -> u8 {
         let rb = stage_penalty(sb.successes, sb.failures);
         ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
     });
-    // Сохраняем исследование: выбираем один из двух лучших профилей по хэшу назначения.
+
     if candidates.len() >= 2 {
         let idx = (stable_hash(destination) % 2) as usize;
         return candidates[idx];
@@ -104,7 +112,18 @@ fn record_destination_failure(
         let stats = guard.entry(destination.to_owned()).or_default();
         stats.failures = stats.failures.saturating_add(1);
         match signal {
-            BlockingSignal::Reset => stats.resets = stats.resets.saturating_add(1),
+            BlockingSignal::Reset => {
+                stats.resets = stats.resets.saturating_add(1);
+                // Special case: if we reset on Stage 1 for a sensitive host, 
+                // it might mean fragmentation itself is being blocked. 
+                // Force Stage 0 (no fragmentation) for this host.
+                if stage == 1 && (destination.contains("soundcloud") || destination.contains("sndcdn")) {
+                    if let Ok(mut pref_guard) = DEST_PREFERRED_STAGE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+                        pref_guard.insert(destination.to_owned(), 0);
+                        info!(target: "socks5.classifier", destination, "forced Stage 0 fallback due to Stage 1 reset");
+                    }
+                }
+            },
             BlockingSignal::Timeout => stats.timeouts = stats.timeouts.saturating_add(1),
             BlockingSignal::EarlyClose => stats.early_closes = stats.early_closes.saturating_add(1),
             BlockingSignal::BrokenPipe => stats.broken_pipes = stats.broken_pipes.saturating_add(1),

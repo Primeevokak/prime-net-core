@@ -3,7 +3,11 @@ async fn relay_bidirectional(
     upstream: &mut BoxStream,
     relay_opts: RelayOptions,
 ) -> std::io::Result<(u64, u64)> {
-    if relay_opts.tcp_window_size > 0 {
+    if relay_opts.tcp_window_trick {
+        // TCP Zero-Window Trick: Start with a tiny window to confuse DPI.
+        // 64 bytes is a safe minimum for Windows to avoid os error 10022.
+        let _ = apply_tcp_window_size(client, 64);
+    } else if relay_opts.tcp_window_size > 0 {
         let _ = apply_tcp_window_size(client, relay_opts.tcp_window_size);
     }
 
@@ -16,7 +20,7 @@ async fn relay_bidirectional(
 
     let upstream_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let upstream_seen_c2u = upstream_seen.clone();
-    
+
     // Auto-MTU: If we are in aggressive stage, cap write sizes early to avoid PMTU issues.
     let is_aggressive = relay_opts.fragment_size_max <= 8;
 
@@ -29,7 +33,7 @@ async fn relay_bidirectional(
         let mut client_hello_sent = false;
 
         let fragment_cfg = FragmentConfig {
-            first_write_max: relay_opts.fragment_size_max.clamp(1, 64),
+            first_write_max: 64, // Keep first write small for DPI bypass
             first_write_plan: if relay_opts.client_hello_split_offsets.is_empty() {
                 None
             } else {
@@ -62,6 +66,10 @@ async fn relay_bidirectional(
                 maybe_tls = Some(is_ch);
                 if is_ch {
                     client_hello_sent = true;
+                    // Inject fake SNI only if explicitly enabled (can break some services)
+                    if relay_opts.sni_spoofing {
+                        let _ = send_fake_sni_probe(&mut frag_upstream_w, 2).await;
+                    }
                 } else {
                     frag_handle.disable();
                 }
@@ -71,7 +79,7 @@ async fn relay_bidirectional(
             let elapsed = started.elapsed();
             let within_handshake_window = elapsed <= Duration::from_secs(3);
             let upstream_has_responded = upstream_seen_c2u.load(Ordering::Relaxed);
-            
+
             // Passive Fingerprinting: Detect silent drops.
             // If ClientHello was sent but no response within 3s window, abort with specific error.
             if client_hello_sent && !upstream_has_responded && elapsed > Duration::from_secs(3) {
@@ -161,6 +169,20 @@ fn is_tls_client_hello(buf: &[u8]) -> bool {
     buf.len() >= 3 && buf[0] == 0x16 && buf[1] == 0x03
 }
 
+async fn send_fake_sni_probe<W>(upstream: &mut W, _ttl: u8) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    use crate::anticensorship::tls_randomizer::generate_fake_client_hello;
+
+    let fake_ch = generate_fake_client_hello();
+    let _ = upstream.write_all(&fake_ch).await;
+    let _ = upstream.flush().await;
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    Ok(())
+}
+
+
 async fn read_cstring(tcp: &mut TcpStream, limit: usize) -> Result<String> {
     let mut data = Vec::new();
     let mut b = [0u8; 1];
@@ -221,6 +243,7 @@ async fn handle_socks5_udp_associate(
     request_addr: TargetAddr,
     request_port: u16,
     silent_drop: bool,
+    relay_opts: RelayOptions,
 ) -> Result<()> {
     let bind = if peer.is_ipv4() {
         "0.0.0.0:0"
@@ -269,7 +292,16 @@ async fn handle_socks5_udp_associate(
                     let Some((target_addr, target_port, payload_offset)) = parse_socks5_udp_request(&udp_buf[..n]) else {
                         continue;
                     };
-                    let payload = &udp_buf[payload_offset..n];
+                    let mut payload = udp_buf[payload_offset..n].to_vec();
+
+                    // Add noise padding for QUIC/UDP to bypass protocol analysis.
+                    if let Some((min, max)) = relay_opts.udp_padding_range {
+                        if n < 1200 { // Only pad small control/handshake packets
+                            let pad_len = rand::thread_rng().gen_range(min..=max);
+                            payload.extend((0..pad_len).map(|_| rand::random::<u8>()));
+                        }
+                    }
+
                     let key = format_target(&target_addr, target_port);
                     let now = now_unix_secs();
                     let policy = policies.entry(key.clone()).or_default();
@@ -283,7 +315,15 @@ async fn handle_socks5_udp_associate(
                             continue;
                         }
                     };
-                    if udp.send_to(payload, target).await.is_ok() {
+
+                    // UDP Desync: Send a small garbage packet before the first real packet to confuse DPI.
+                    // Only apply to port 443 (QUIC) to avoid breaking sensitive protocols like Discord Voice or Games.
+                    if policy.sent == 0 && target_port == 443 {
+                        let junk: [u8; 8] = rand::random();
+                        let _ = udp.send_to(&junk, target).await;
+                    }
+
+                    if udp.send_to(&payload, target).await.is_ok() {
                         policy.sent = policy.sent.saturating_add(1);
                         remote_to_key.insert(target, key.clone());
                         if policy.sent >= UDP_POLICY_DISABLE_THRESHOLD && policy.recv == 0 {
@@ -667,126 +707,15 @@ fn is_expected_disconnect(e: &std::io::Error) -> bool {
 }
 
 async fn resolve_client_label(peer: SocketAddr, listen_addr: SocketAddr) -> String {
-    #[cfg(windows)]
-    {
-        tokio::task::spawn_blocking(move || describe_client(peer, listen_addr))
-            .await
-            .unwrap_or_else(|_| format!("unknown-app ({peer})"))
-    }
-    #[cfg(not(windows))]
-    {
-        describe_client(peer, listen_addr)
-    }
-}
+    use crate::platform::{resolve_process_id_by_connection, resolve_process_name_by_pid};
 
-fn describe_client(peer: SocketAddr, _listen_addr: SocketAddr) -> String {
-    #[cfg(windows)]
-    {
-        if let Some(pid) = resolve_client_pid_netstat(peer, _listen_addr) {
-            let name = resolve_process_name(pid).unwrap_or_else(|| "unknown".to_owned());
+    if let Some(pid) = resolve_process_id_by_connection(peer, listen_addr) {
+        if let Some(name) = resolve_process_name_by_pid(pid) {
             return format!("{name} (pid {pid})");
         }
+        return format!("pid {pid} ({peer})");
     }
     format!("unknown-app ({peer})")
 }
 
-#[cfg(windows)]
-fn resolve_client_pid_netstat(peer: SocketAddr, listen_addr: SocketAddr) -> Option<u32> {
-    let output = std::process::Command::new("netstat")
-        .args(["-ano", "-p", "tcp"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    for line in text.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 5 || !parts[0].eq_ignore_ascii_case("tcp") {
-            continue;
-        }
-        let local = parts[1];
-        let remote = parts[2];
-        if endpoint_matches(local, peer) && endpoint_matches(remote, listen_addr) {
-            if let Ok(pid) = parts[parts.len() - 1].parse::<u32>() {
-                return Some(pid);
-            }
-        }
-    }
-    None
-}
-
-#[cfg(windows)]
-fn endpoint_matches(token: &str, addr: SocketAddr) -> bool {
-    let t = token.trim().to_ascii_lowercase();
-    let direct = addr.to_string().to_ascii_lowercase();
-    if t == direct {
-        return true;
-    }
-
-    // netstat может показывать IPv4-адрес loopback в IPv6-mapped виде.
-    if let SocketAddr::V4(v4) = addr {
-        let mapped = format!("[::ffff:{}]:{}", v4.ip(), v4.port()).to_ascii_lowercase();
-        if t == mapped {
-            return true;
-        }
-    }
-
-    false
-}
-
-#[cfg(windows)]
-fn resolve_process_name(pid: u32) -> Option<String> {
-    let cache = PID_NAME_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock() {
-        if let Some(name) = guard.get(&pid) {
-            return Some(name.clone());
-        }
-    }
-
-    let output = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let text = String::from_utf8(output.stdout).ok()?;
-    let first = text.lines().next()?.trim();
-    if first.is_empty() || first.starts_with("INFO:") {
-        return None;
-    }
-    let name = parse_first_csv_column(first)?;
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(pid, name.clone());
-    }
-    Some(name)
-}
-
-#[cfg(windows)]
-fn parse_first_csv_column(line: &str) -> Option<String> {
-    let line = line.trim();
-    if !line.starts_with('"') {
-        return line
-            .split(',')
-            .next()
-            .map(|v| v.trim().trim_matches('"').to_owned());
-    }
-    let mut out = String::new();
-    let mut chars = line.chars();
-    let _ = chars.next();
-    while let Some(ch) = chars.next() {
-        if ch == '"' {
-            if let Some('"') = chars.clone().next() {
-                out.push('"');
-                let _ = chars.next();
-                continue;
-            }
-            break;
-        }
-        out.push(ch);
-    }
-    Some(out)
-}
 

@@ -568,41 +568,46 @@ fn tune_relay_for_target(
     }
 
     let tuned = match stage {
-        0 => base,
+        0 => RelayOptions {
+            fragment_client_hello: false,
+            ..base
+        },
         1 => RelayOptions {
             fragment_client_hello: true,
-            // Более крупные фрагменты с минимальной паузой: безопасный базовый профиль без долгих задержек handshake.
-            fragment_size_min: base.fragment_size_min.clamp(1, 24),
-            fragment_size_max: base.fragment_size_max.clamp(1, 24),
-            fragment_sleep_ms: base.fragment_sleep_ms.min(2),
-            fragment_budget_bytes: base.fragment_budget_bytes.clamp(2 * 1024, 6 * 1024),
+            // Безопасная фрагментация: имитируем малый MTU, не трогая заголовок TLS слишком сильно
+            fragment_size_min: 64,
+            fragment_size_max: 128,
+            fragment_sleep_ms: base.fragment_sleep_ms.min(1),
+            fragment_budget_bytes: base.fragment_budget_bytes.clamp(4096, 8192),
+            client_hello_split_offsets: vec![], // Без разрезов SNI на первой стадии
             ..base
         },
         2 => RelayOptions {
             fragment_client_hello: true,
-            fragment_size_min: base.fragment_size_min.clamp(1, 8),
-            fragment_size_max: base.fragment_size_max.clamp(1, 8),
-            fragment_sleep_ms: base.fragment_sleep_ms.min(1),
-            fragment_budget_bytes: base.fragment_budget_bytes.clamp(4 * 1024, 8 * 1024),
-            client_hello_split_offsets: vec![1, 5, 40],
+            fragment_size_min: base.fragment_size_min.clamp(1, 16),
+            fragment_size_max: base.fragment_size_max.clamp(1, 32),
+            fragment_sleep_ms: base.fragment_sleep_ms.min(2),
+            fragment_budget_bytes: base.fragment_budget_bytes.clamp(4096, 8192),
+            client_hello_split_offsets: vec![1, 5],
             ..base
         },
         3 => RelayOptions {
             fragment_client_hello: true,
             fragment_size_min: base.fragment_size_min.clamp(1, 4),
-            fragment_size_max: base.fragment_size_max.clamp(1, 4),
-            fragment_sleep_ms: 0,
-            fragment_budget_bytes: base.fragment_budget_bytes.clamp(6 * 1024, 12 * 1024),
-            client_hello_split_offsets: vec![1, 5, 40, 64],
+            fragment_size_max: base.fragment_size_max.clamp(1, 8),
+            fragment_sleep_ms: base.fragment_sleep_ms.min(5),
+            fragment_budget_bytes: base.fragment_budget_bytes.clamp(8192, 16384),
+            client_hello_split_offsets: vec![1, 5, 32, 48],
             ..base
         },
         _ => RelayOptions {
             fragment_client_hello: true,
             fragment_size_min: 1,
-            fragment_size_max: base.fragment_size_max.clamp(1, 2),
-            fragment_sleep_ms: 0,
-            fragment_budget_bytes: base.fragment_budget_bytes.clamp(8 * 1024, 16 * 1024),
-            client_hello_split_offsets: vec![1, 5, 40, 64],
+            fragment_size_max: 2,
+            fragment_sleep_ms: base.fragment_sleep_ms.min(10),
+            fragment_budget_bytes: base.fragment_budget_bytes.clamp(8192, 32768),
+            client_hello_split_offsets: vec![1, 3, 5, 32, 48, 64],
+            sni_spoofing: true, // Enable fake SNI probe for the most aggressive stage
             ..base
         },
     };

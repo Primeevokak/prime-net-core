@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinSet;
 use tokio::time::Duration;
@@ -22,8 +23,6 @@ use crate::evasion::{FragmentConfig, FragmentingIo};
 use super::{BoxStream, DynOutbound, TargetAddr, TargetEndpoint};
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
-#[cfg(windows)]
-static PID_NAME_CACHE: OnceLock<Mutex<HashMap<u32, String>>> = OnceLock::new();
 static WARNED_SOCKS4_LIMITATIONS: AtomicBool = AtomicBool::new(false);
 static WARNED_SOCKS4_AGGRESSIVE: AtomicBool = AtomicBool::new(false);
 static DEST_FAILURES: OnceLock<Mutex<HashMap<String, u8>>> = OnceLock::new();
@@ -55,16 +54,16 @@ const ROUTE_WEAK_BASE_SECS: u64 = 45;
 const ROUTE_WEAK_MAX_SECS: u64 = 5 * 60;
 const ROUTE_FAILS_BEFORE_WEAK: u8 = 2;
 const ROUTE_SOFT_ZERO_REPLY_MIN_C2U: u64 = 256;
-const ROUTE_SOFT_ZERO_REPLY_MIN_LIFETIME_MS: u64 = 1200;
+const ROUTE_SOFT_ZERO_REPLY_MIN_LIFETIME_MS: u64 = 2000;
 const ROUTE_CAPABILITY_NET_UNREACHABLE_SECS: u64 = 3 * 60;
 const ROUTE_CAPABILITY_BYPASS_REP03_SECS: u64 = 10 * 60;
 const ROUTE_CAPABILITY_BYPASS_REP_OTHER_SECS: u64 = 4 * 60;
 const GLOBAL_BYPASS_HARD_WEAK_SCORE: i64 = -80;
-const ROUTE_RACE_BASE_DELAY_MS: u64 = 60;
-const ROUTE_RACE_DIRECT_HEADSTART_MS: u64 = 120;
-const ROUTE_RACE_BYPASS_EXTRA_DELAY_MS: u64 = 120;
-const ROUTE_RACE_BYPASS_EXTRA_DELAY_BUILTIN_MS: u64 = 40;
-const ROUTE_RACE_BYPASS_EXTRA_DELAY_LEARNED_MS: u64 = 20;
+const ROUTE_RACE_BASE_DELAY_MS: u64 = 20;
+const ROUTE_RACE_DIRECT_HEADSTART_MS: u64 = 40;
+const ROUTE_RACE_BYPASS_EXTRA_DELAY_MS: u64 = 60;
+const ROUTE_RACE_BYPASS_EXTRA_DELAY_BUILTIN_MS: u64 = 20;
+const ROUTE_RACE_BYPASS_EXTRA_DELAY_LEARNED_MS: u64 = 10;
 const ROUTE_RACE_MAX_CANDIDATES: usize = 3;
 
 #[derive(Debug, Clone)]
@@ -78,6 +77,9 @@ pub struct RelayOptions {
     pub fragment_sleep_ms: u64,
     pub fragment_budget_bytes: usize,
     pub tcp_window_size: u32,
+    pub tcp_window_trick: bool,
+    pub sni_spoofing: bool,
+    pub udp_padding_range: Option<(usize, usize)>,
     pub stage1_failures: u8,
     pub stage2_failures: u8,
     pub stage3_failures: u8,
@@ -106,6 +108,9 @@ impl Default for RelayOptions {
             fragment_sleep_ms: 0,
             fragment_budget_bytes: 8192,
             tcp_window_size: 0,
+            tcp_window_trick: false,
+            sni_spoofing: false,
+            udp_padding_range: None,
             stage1_failures: 1,
             stage2_failures: 2,
             stage3_failures: 3,

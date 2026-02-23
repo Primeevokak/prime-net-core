@@ -273,229 +273,226 @@ async fn handle_client(
 
     if rh[1] == 0x03 {
         info!(target: "socks5", conn_id, peer = %peer, client = %client, bind_hint = %target, "SOCKS5 UDP ASSOCIATE requested");
-        return handle_socks5_udp_associate(conn_id, tcp, peer, client, dst, port, silent_drop)
-            .await;
+        return handle_socks5_udp_associate(
+            conn_id,
+            tcp,
+            peer,
+            client,
+            dst,
+            port,
+            silent_drop,
+            relay_opts,
+        )
+        .await;
     }
     info!(target: "socks5", conn_id, peer = %peer, client = %client, destination = %target, "SOCKS5 CONNECT requested");
     let target_endpoint = TargetEndpoint { addr: dst, port };
-    let mut connected = match connect_via_best_route(
-        conn_id,
-        outbound.clone(),
-        &relay_opts,
-        &target_endpoint,
-        &target,
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            if !silent_drop {
-                let _ = tcp
-                    .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                    .await;
-                let _ = tcp.shutdown().await;
-            }
-            return Err(e);
-        }
-    };
-    if connected.candidate.kind == RouteKind::Bypass {
-        info!(
-            target: "socks5",
-            conn_id,
-            peer = %peer,
-            client = %client,
-            destination = %target,
-            route = connected.candidate.route_label(),
-            source = connected.candidate.source,
-            bypass = ?connected.candidate.bypass_addr,
-            bypass_profile = connected.candidate.bypass_profile_idx + 1,
-            bypass_profiles = connected.candidate.bypass_profile_total,
-            raced = connected.raced,
-            "SOCKS5 CONNECT route selected"
-        );
-    } else {
-        info!(
-            target: "socks5",
-            conn_id,
-            peer = %peer,
-            client = %client,
-            destination = %target,
-            route = connected.candidate.route_label(),
-            source = connected.candidate.source,
-            raced = connected.raced,
-            "SOCKS5 CONNECT route selected"
-        );
-    }
 
-    // Ответ SOCKS5: успех, BND=0.0.0.0:0
-    if let Err(e) = tcp
-        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+    // Attempt to establish a connection, with a single immediate fallback if the first route fails silently.
+    let mut attempt = 1;
+    let max_attempts = 2;
+    let mut last_error: Option<EngineError> = None;
+
+    while attempt <= max_attempts {
+        let mut connected = match connect_via_best_route(
+            conn_id,
+            outbound.clone(),
+            &relay_opts,
+            &target_endpoint,
+            &target,
+        )
         .await
-    {
-        if is_expected_disconnect(&e) {
+        {
+            Ok(v) => v,
+            Err(e) => {
+                if attempt == max_attempts {
+                    if !silent_drop {
+                        let _ = tcp
+                            .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                            .await;
+                        let _ = tcp.shutdown().await;
+                    }
+                    return Err(e);
+                }
+                last_error = Some(e);
+                attempt += 1;
+                continue;
+            }
+        };
+
+        if connected.candidate.kind == RouteKind::Bypass {
             info!(
                 target: "socks5",
                 conn_id,
                 peer = %peer,
                 client = %client,
                 destination = %target,
-                error = %e,
-                "SOCKS5 client disconnected before connect reply"
+                route = connected.candidate.route_label(),
+                source = connected.candidate.source,
+                bypass = ?connected.candidate.bypass_addr,
+                bypass_profile = connected.candidate.bypass_profile_idx + 1,
+                bypass_profiles = connected.candidate.bypass_profile_total,
+                raced = connected.raced,
+                attempt,
+                "SOCKS5 CONNECT route selected"
             );
-            return Ok(());
+        } else {
+            info!(
+                target: "socks5",
+                conn_id,
+                peer = %peer,
+                client = %client,
+                destination = %target,
+                route = connected.candidate.route_label(),
+                source = connected.candidate.source,
+                raced = connected.raced,
+                attempt,
+                "SOCKS5 CONNECT route selected"
+            );
         }
-        return Err(e.into());
-    }
 
-    if connected.candidate.kind == RouteKind::Bypass {
-        info!(
-            target: "socks5",
-            conn_id,
-            destination = %target,
-            bypass = ?connected.candidate.bypass_addr,
-            bypass_profile = connected.candidate.bypass_profile_idx + 1,
-            bypass_profiles = connected.candidate.bypass_profile_total,
-            "bypass tunnel established"
-        );
-        let bypass_tunnel_started = Instant::now();
-        match tokio::io::copy_bidirectional(&mut tcp, &mut connected.stream).await {
-            Ok((c2u, u2c)) => {
-                let lifetime_ms = bypass_tunnel_started.elapsed().as_millis() as u64;
-                info!(
-                    target: "socks5",
-                    conn_id,
-                    destination = %target,
-                    bytes_client_to_bypass = c2u,
-                    bytes_bypass_to_client = u2c,
-                    session_lifetime_ms = lifetime_ms,
-                    bypass_profile = connected.candidate.bypass_profile_idx + 1,
-                    bypass_profiles = connected.candidate.bypass_profile_total,
-                    "bypass tunnel closed"
-                );
-                if should_skip_empty_session_scoring(c2u, u2c) {
-                    if should_mark_empty_bypass_session_as_soft_failure(&connected.candidate, port)
-                    {
-                        record_route_failure(
-                            &connected.route_key,
-                            &connected.candidate,
-                            "zero-reply-soft",
-                        );
-                        warn!(
-                            target: "socks5.route",
-                            conn_id,
-                            route_key = %connected.route_key,
-                            route = connected.candidate.route_label(),
-                            destination = %target,
-                            "adaptive route marked empty bypass session as soft failure"
-                        );
-                    } else {
-                        info!(
-                            target: "socks5.route",
-                            conn_id,
-                            route_key = %connected.route_key,
-                            route = connected.candidate.route_label(),
-                            destination = %target,
-                            "adaptive route skipped scoring for empty bypass session"
-                        );
+        // Ответ SOCKS5: успех, BND=0.0.0.0:0 (only on first successful route selection)
+        if attempt == 1 || last_error.is_some() {
+            if let Err(e) = tcp
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+            {
+                if is_expected_disconnect(&e) {
+                    return Ok(());
+                }
+                return Err(e.into());
+            }
+        }
+
+        if connected.candidate.kind == RouteKind::Bypass {
+            let bypass_tunnel_started = Instant::now();
+            match tokio::io::copy_bidirectional(&mut tcp, &mut connected.stream).await {
+                Ok((c2u, u2c)) => {
+                    let lifetime_ms = bypass_tunnel_started.elapsed().as_millis() as u64;
+                    if c2u == 0 && u2c == 0 && attempt < max_attempts {
+                        // Silent failure of bypass route: mark as weak and try next attempt.
+                        warn!(target: "socks5.route", conn_id, destination = %target, route = %connected.candidate.route_id(), "bypass failed with zero bytes, trying fallback");
+                        record_route_failure(&connected.route_key, &connected.candidate, "zero-reply-soft");
+                        attempt += 1;
+                        continue;
                     }
-                } else if should_mark_bypass_profile_failure(
-                    port,
-                    c2u,
-                    u2c,
-                    relay_opts.suspicious_zero_reply_min_c2u as u64,
-                ) {
-                    record_bypass_profile_failure(
-                        &target,
-                        connected.candidate.bypass_profile_idx,
-                        connected.candidate.bypass_profile_total,
-                        "suspicious-zero-reply",
-                    );
-                    record_route_failure(
-                        &connected.route_key,
-                        &connected.candidate,
-                        "suspicious-zero-reply",
-                    );
-                    warn!(
+
+                    info!(
                         target: "socks5",
                         conn_id,
                         destination = %target,
                         bytes_client_to_bypass = c2u,
                         bytes_bypass_to_client = u2c,
+                        session_lifetime_ms = lifetime_ms,
                         bypass_profile = connected.candidate.bypass_profile_idx + 1,
                         bypass_profiles = connected.candidate.bypass_profile_total,
-                        "bypass profile marked as weak for destination"
+                        "bypass tunnel closed"
                     );
-                } else if should_mark_bypass_zero_reply_soft(port, c2u, u2c, lifetime_ms) {
+                    if should_skip_empty_session_scoring(c2u, u2c) {
+                        if should_mark_empty_bypass_session_as_soft_failure(&connected.candidate, port)
+                        {
+                            record_route_failure(
+                                &connected.route_key,
+                                &connected.candidate,
+                                "zero-reply-soft",
+                            );
+                        }
+                    } else if should_mark_bypass_profile_failure(
+                        port,
+                        c2u,
+                        u2c,
+                        relay_opts.suspicious_zero_reply_min_c2u as u64,
+                    ) {
+                        record_bypass_profile_failure(
+                            &target,
+                            connected.candidate.bypass_profile_idx,
+                            connected.candidate.bypass_profile_total,
+                            "suspicious-zero-reply",
+                        );
+                        record_route_failure(
+                            &connected.route_key,
+                            &connected.candidate,
+                            "suspicious-zero-reply",
+                        );
+                    } else if should_mark_bypass_zero_reply_soft(port, c2u, u2c, lifetime_ms) {
+                        record_route_failure(
+                            &connected.route_key,
+                            &connected.candidate,
+                            "zero-reply-soft",
+                        );
+                    } else {
+                        record_bypass_profile_success(&target, connected.candidate.bypass_profile_idx);
+                        record_route_success(&connected.route_key, &connected.candidate);
+                    }
+                    return Ok(());
+                }
+                Err(e) if is_expected_disconnect(&e) => {
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!(
+                        target: "socks5",
+                        conn_id,
+                        destination = %target,
+                        error = %e,
+                        "bypass tunnel error"
+                    );
+                    record_bypass_profile_failure(
+                        &target,
+                        connected.candidate.bypass_profile_idx,
+                        connected.candidate.bypass_profile_total,
+                        "io-error",
+                    );
+                    record_route_failure(&connected.route_key, &connected.candidate, "io-error");
+                    return Ok(());
+                }
+            }
+        }
+
+        let tuned = tune_relay_for_target(relay_opts.clone(), port, &target, false);
+        match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options.clone()).await {
+            Ok((bytes_client_to_upstream, bytes_upstream_to_client)) => {
+                if bytes_client_to_upstream == 0 && bytes_upstream_to_client == 0 && attempt < max_attempts {
+                     warn!(target: "socks5.route", conn_id, destination = %target, "direct relay failed with zero bytes, trying fallback");
+                     attempt += 1;
+                     continue;
+                }
+
+                if should_skip_empty_session_scoring(bytes_client_to_upstream, bytes_upstream_to_client)
+                {
+                    // No-op
+                } else if should_mark_suspicious_zero_reply(
+                    port,
+                    bytes_client_to_upstream,
+                    bytes_upstream_to_client,
+                    tuned.options.suspicious_zero_reply_min_c2u,
+                ) {
+                    record_destination_failure(
+                        &target,
+                        BlockingSignal::SuspiciousZeroReply,
+                        tuned.options.classifier_emit_interval_secs,
+                        tuned.stage,
+                    );
+                    record_route_failure(
+                        &connected.route_key,
+                        &connected.candidate,
+                        "suspicious-zero-reply",
+                    );
+                } else if should_mark_route_soft_zero_reply(
+                    port,
+                    bytes_client_to_upstream,
+                    bytes_upstream_to_client,
+                ) {
                     record_route_failure(
                         &connected.route_key,
                         &connected.candidate,
                         "zero-reply-soft",
                     );
-                    warn!(
-                        target: "socks5.route",
-                        conn_id,
-                        route_key = %connected.route_key,
-                        route = connected.candidate.route_label(),
-                        destination = %target,
-                        bytes_client_to_bypass = c2u,
-                        bytes_bypass_to_client = u2c,
-                        session_lifetime_ms = lifetime_ms,
-                        "adaptive route observed soft zero-reply; winner confidence reduced"
-                    );
                 } else {
-                    record_bypass_profile_success(&target, connected.candidate.bypass_profile_idx);
+                    record_destination_success(&target, tuned.stage, tuned.source);
                     record_route_success(&connected.route_key, &connected.candidate);
                 }
-            }
-            Err(e) if is_expected_disconnect(&e) => {
-                let _ = e;
-            }
-            Err(e) => {
-                warn!(
-                    target: "socks5",
-                    conn_id,
-                    destination = %target,
-                    error = %e,
-                    "bypass tunnel error"
-                );
-                record_bypass_profile_failure(
-                    &target,
-                    connected.candidate.bypass_profile_idx,
-                    connected.candidate.bypass_profile_total,
-                    "io-error",
-                );
-                record_route_failure(&connected.route_key, &connected.candidate, "io-error");
-            }
-        }
-        return Ok(());
-    }
-
-    let tuned = tune_relay_for_target(relay_opts, port, &target, false);
-    match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options.clone()).await {
-        Ok((bytes_client_to_upstream, bytes_upstream_to_client)) => {
-            if should_skip_empty_session_scoring(bytes_client_to_upstream, bytes_upstream_to_client)
-            {
                 info!(
-                    target: "socks5.route",
-                    conn_id,
-                    route_key = %connected.route_key,
-                    route = connected.candidate.route_label(),
-                    destination = %target,
-                    "adaptive route skipped scoring for empty direct session"
-                );
-            } else if should_mark_suspicious_zero_reply(
-                port,
-                bytes_client_to_upstream,
-                bytes_upstream_to_client,
-                tuned.options.suspicious_zero_reply_min_c2u,
-            ) {
-                record_destination_failure(
-                    &target,
-                    BlockingSignal::SuspiciousZeroReply,
-                    tuned.options.classifier_emit_interval_secs,
-                    tuned.stage,
-                );
-                warn!(
                     target: "socks5",
                     conn_id,
                     peer = %peer,
@@ -503,85 +500,55 @@ async fn handle_client(
                     destination = %target,
                     bytes_client_to_upstream,
                     bytes_upstream_to_client,
-                    "SOCKS5 suspicious early close (no upstream bytes) classified as potential blocking"
+                    "SOCKS5 session closed"
+                );
+            }
+            Err(e) if is_expected_disconnect(&e) => {
+                info!(
+                    target: "socks5",
+                    conn_id,
+                    peer = %peer,
+                    client = %client,
+                    destination = %target,
+                    error = %e,
+                    "SOCKS5 relay closed by peer"
+                );
+            }
+            Err(e) => {
+                if attempt < max_attempts && (e.kind() == ErrorKind::ConnectionReset || e.kind() == ErrorKind::BrokenPipe) {
+                    warn!(target: "socks5.route", conn_id, destination = %target, error = %e, "direct relay reset early, trying fallback");
+                    attempt += 1;
+                    continue;
+                }
+
+                let signal = classify_io_error(&e);
+                record_destination_failure(
+                    &target,
+                    signal,
+                    tuned.options.classifier_emit_interval_secs,
+                    tuned.stage,
                 );
                 record_route_failure(
                     &connected.route_key,
                     &connected.candidate,
-                    "suspicious-zero-reply",
-                );
-            } else if should_mark_route_soft_zero_reply(
-                port,
-                bytes_client_to_upstream,
-                bytes_upstream_to_client,
-            ) {
-                record_route_failure(
-                    &connected.route_key,
-                    &connected.candidate,
-                    "zero-reply-soft",
+                    blocking_signal_label(signal),
                 );
                 warn!(
-                    target: "socks5.route",
+                    target: "socks5",
                     conn_id,
-                    route_key = %connected.route_key,
-                    route = connected.candidate.route_label(),
+                    peer = %peer,
+                    client = %client,
                     destination = %target,
-                    bytes_client_to_upstream,
-                    bytes_upstream_to_client,
-                    "adaptive route observed soft zero-reply; winner confidence reduced"
+                    error = %e,
+                    "SOCKS5 relay interrupted"
                 );
-            } else {
-                record_destination_success(&target, tuned.stage, tuned.source);
-                record_route_success(&connected.route_key, &connected.candidate);
             }
-            info!(
-                target: "socks5",
-                conn_id,
-                peer = %peer,
-                client = %client,
-                destination = %target,
-                bytes_client_to_upstream,
-                bytes_upstream_to_client,
-                "SOCKS5 session closed"
-            );
         }
-        Err(e) if is_expected_disconnect(&e) => {
-            info!(
-                target: "socks5",
-                conn_id,
-                peer = %peer,
-                client = %client,
-                destination = %target,
-                error = %e,
-                "SOCKS5 relay closed by peer"
-            );
-        }
-        Err(e) => {
-            let signal = classify_io_error(&e);
-            record_destination_failure(
-                &target,
-                signal,
-                tuned.options.classifier_emit_interval_secs,
-                tuned.stage,
-            );
-            record_route_failure(
-                &connected.route_key,
-                &connected.candidate,
-                blocking_signal_label(signal),
-            );
-            warn!(
-                target: "socks5",
-                conn_id,
-                peer = %peer,
-                client = %client,
-                destination = %target,
-                error = %e,
-                "SOCKS5 relay interrupted"
-            );
-        }
+        return Ok(());
     }
     Ok(())
 }
+
 
 async fn silent_or_err(tcp: &mut TcpStream, silent_drop: bool, msg: &str) -> Result<()> {
     if silent_drop {

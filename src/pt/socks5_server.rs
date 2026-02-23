@@ -6,4 +6,5 @@ include!("socks5_server_parts/protocol_socks4.rs");
 include!("socks5_server_parts/route_scoring.rs");
 include!("socks5_server_parts/classifier_and_persistence.rs");
 include!("socks5_server_parts/relay_and_io_helpers.rs");
+include!("socks5_server_parts/evasion_tests.rs");
 include!("socks5_server_parts/tests.rs");

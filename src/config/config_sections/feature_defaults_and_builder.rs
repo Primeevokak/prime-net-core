@@ -138,11 +138,11 @@ pub enum EvasionStrategy {
 }
 
 fn default_fragment_size_min() -> usize {
-    1
+    16
 }
 
 fn default_fragment_size_max() -> usize {
-    64
+    128
 }
 
 fn default_randomize_fragment_size() -> bool {
@@ -150,7 +150,7 @@ fn default_randomize_fragment_size() -> bool {
 }
 
 fn default_fragment_sleep_ms() -> u64 {
-    10
+    1
 }
 
 fn default_fake_ttl() -> u8 {

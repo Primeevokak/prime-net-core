@@ -310,13 +310,19 @@ impl UniversalDnsResolver {
                     Ok(resolver) => match resolver.lookup_ip(domain).await {
                         Ok(lookup) => {
                             let mut ips: Vec<IpAddr> = lookup.iter().collect();
+                            
+                            // Filter out loopback IPs for public domains (DNS poisoning protection)
+                            if !domain.ends_with(".local") && !domain.contains("localhost") {
+                                ips.retain(|ip| !ip.is_loopback());
+                            }
+
                             ips.sort_unstable();
                             ips.dedup();
                             if !ips.is_empty() {
                                 return Ok(ips);
                             }
                             last_err = Some(EngineError::Internal(format!(
-                                "dns lookup for '{domain}' using {kind:?} returned no addresses"
+                                "dns lookup for '{domain}' using {kind:?} returned no valid addresses (all filtered or empty)"
                             )));
                         }
                         Err(e) => {
@@ -365,9 +371,11 @@ impl UniversalDnsResolver {
     #[cfg(feature = "hickory-dns")]
     fn resolver_opts(&self) -> ResolverOpts {
         let mut opts = ResolverOpts::default();
-        // Force disable validation by default to avoid issues seen in logs
-        let validate = self.config.enable_dnssec; 
-        opts.validate = validate;
+        // Force-disable DNSSEC validation. In censored environments, 
+        // validation often triggers infinite recursion or deep loops (see logs).
+        // Since we use DoH/DoT, we rely on the secure transport layer.
+        opts.validate = false;
+        opts.recursion_desired = true;
         opts.cache_size = self.config.cache_size.max(16);
         opts.timeout = if self.config.query_timeout.as_secs() == 0 {
             Duration::from_secs(1)

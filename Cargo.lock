@@ -2648,7 +2648,7 @@ dependencies = [
 
 [[package]]
 name = "prime-net-engine"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "arboard",
  "assert_cmd",
@@ -2662,6 +2662,7 @@ dependencies = [
  "gpgme",
  "h3",
  "h3-quinn",
+ "hex",
  "hickory-resolver",
  "http 1.4.0",
  "http-body-util",

@@ -58,6 +58,10 @@ impl ResolverChain {
             return Ok(vec![ip]);
         }
 
+        if self.cfg.dns_parallel_racing && self.chain.len() > 1 {
+            return self.resolve_parallel(domain).await;
+        }
+
         let mut last_err: Option<EngineError> = None;
         for kind in &self.chain {
             match self.resolve_kind(kind, domain).await {
@@ -79,6 +83,47 @@ impl ResolverChain {
             )),
         }
     }
+
+    async fn resolve_parallel(&self, domain: &str) -> Result<Vec<IpAddr>> {
+        use tokio::task::JoinSet;
+        let mut set = JoinSet::new();
+
+        for kind in &self.chain {
+            let self_clone = self.clone();
+            let kind = kind.clone();
+            let domain = domain.to_owned();
+            set.spawn(async move {
+                let res = self_clone.resolve_kind(&kind, &domain).await;
+                (kind, res)
+            });
+        }
+
+        let mut last_err: Option<EngineError> = None;
+
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((_kind, Ok(ips))) if !ips.is_empty() => {
+                    set.abort_all();
+                    return Ok(ips);
+                }
+                Ok((kind, Ok(_))) => {
+                    last_err = Some(EngineError::Internal(format!(
+                        "{} returned no addresses for '{domain}'",
+                        kind_name(&kind)
+                    )));
+                }
+                Ok((_, Err(e))) => last_err = Some(e),
+                Err(e) => {
+                    last_err = Some(EngineError::Internal(format!("DNS race task error: {e}")));
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            EngineError::Internal(format!("DNS parallel resolution failed for {domain}"))
+        }))
+    }
+
 
     /// Best-effort fetch of ECHConfigList bytes for `domain` via DNS HTTPS RR.
     ///

@@ -220,7 +220,7 @@ fn global_bypass_profile_score(candidate: &RouteCandidate, now: u64) -> i64 {
 fn bypass_profile_score_from_health(health: &BypassProfileHealth, now: u64) -> i64 {
     let mut score = (health.successes as i64 * 5) - (health.failures as i64 * 6);
     score -= health.connect_failures as i64 * 8;
-    score -= health.soft_zero_replies as i64 * 10;
+    score -= health.soft_zero_replies as i64 * 30; // Increased penalty to ban broken profiles faster
     score -= health.io_errors as i64 * 7;
     if health.last_success_unix > 0 && now.saturating_sub(health.last_success_unix) <= 5 * 60 {
         score += 3;
@@ -663,6 +663,8 @@ fn should_mark_bypass_zero_reply_soft(
     bytes_bypass_to_client: u64,
     session_lifetime_ms: u64,
 ) -> bool {
+    // Only mark as soft failure if the connection stayed open for a while but never got a reply.
+    // Short zero-reply sessions are often just connection probes or pre-connects.
     port == 443
         && bytes_bypass_to_client == 0
         && bytes_client_to_bypass >= ROUTE_SOFT_ZERO_REPLY_MIN_C2U
@@ -673,9 +675,16 @@ fn should_mark_empty_bypass_session_as_soft_failure(candidate: &RouteCandidate, 
     if port != 443 || candidate.kind != RouteKind::Bypass {
         return false;
     }
+    // Don't mark built-in rules as soft failures just because they are empty (0/0).
+    // Built-in rules are usually there because we know the domain is blocked, 
+    // so empty sessions are likely just app behavior, not a bypass failure.
+    if matches!(candidate.source, "builtin") {
+        return false;
+    }
+    
     matches!(
         candidate.source,
-        "builtin" | "learned-domain" | "learned-ip"
+        "learned-domain" | "learned-ip"
     )
 }
 

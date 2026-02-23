@@ -35,11 +35,11 @@ pub struct FragmentConfig {
 impl Default for FragmentConfig {
     fn default() -> Self {
         Self {
-            first_write_max: 64,
+            first_write_max: 128,
             first_write_plan: None,
-            fragment_size_min: 1,
-            fragment_size_max: 64,
-            sleep_ms: 10,
+            fragment_size_min: 4,
+            fragment_size_max: 128,
+            sleep_ms: 1,
             jitter_ms: None,
             randomize_fragment_size: false,
             split_at_sni: false,
@@ -136,17 +136,29 @@ impl<T> FragmentingIo<T> {
         let buf_len = buf.len();
         if self.first_write && self.cfg.split_at_sni && !self.sni_plan_initialized {
             self.sni_plan_initialized = true;
-            if let Some(sni_off) = find_sni_offset(buf) {
+            if let Some((sni_off, sni_len)) = find_sni_info(buf) {
                 let mut plan = Vec::new();
                 if sni_off > 0 {
                     plan.push(sni_off);
                 }
-                if sni_off < buf_len {
+                
+                // Агрессивный разрез внутри SNI (разрезаем на части по 2 байта и остаток)
+                if sni_len > 4 {
+                    plan.push(2); 
+                    plan.push(2); 
+                    plan.push(sni_len - 4); 
+                } else if sni_len > 0 {
                     plan.push(1);
+                    if sni_len > 1 {
+                        plan.push(sni_len - 1);
+                    }
                 }
-                if sni_off + 1 < buf_len {
-                    plan.push(buf_len - (sni_off + 1));
+
+                let consumed = sni_off + sni_len;
+                if consumed < buf_len {
+                    plan.push(buf_len - consumed);
                 }
+                
                 if !plan.is_empty() {
                     self.cfg.first_write_plan = Some(plan);
                 }
@@ -186,7 +198,7 @@ impl<T> FragmentingIo<T> {
     }
 }
 
-fn find_sni_offset(client_hello: &[u8]) -> Option<usize> {
+fn find_sni_info(client_hello: &[u8]) -> Option<(usize, usize)> {
     let b = client_hello;
     if b.len() < 5 {
         return None;
@@ -249,7 +261,9 @@ fn find_sni_offset(client_hello: &[u8]) -> Option<usize> {
             return None;
         }
         if ext_type == 0x0000 {
-            return Some(pos);
+            // Found SNI extension. 
+            // Structure: Type(2) | Len(2) | ListLen(2) | NameType(1) | NameLen(2) | Name(N)
+            return Some((pos, 4 + ext_len));
         }
         pos = next;
     }

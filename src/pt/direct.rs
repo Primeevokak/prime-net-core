@@ -25,7 +25,7 @@ pub struct DirectOutbound {
 impl DirectOutbound {
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
     const MAX_DOMAIN_IP_ATTEMPTS: usize = 8;
-    const HAPPY_EYEBALLS_FALLBACK_DELAY: Duration = Duration::from_millis(200);
+    const HAPPY_EYEBALLS_FALLBACK_DELAY: Duration = Duration::from_millis(50);
 
     pub fn new(resolver: Arc<ResolverChain>) -> Self {
         Self {
@@ -147,15 +147,29 @@ impl DirectOutbound {
                     return Ok(stream);
                 }
                 Ok((idx, addr, Err(e))) => {
+                    let is_unreachable = if let EngineError::Io(ref io_err) = e {
+                        io_err.raw_os_error() == Some(10051)
+                    } else {
+                        false
+                    };
+
                     warn!(
                         target: "outbound.direct",
                         destination = %target_label,
                         upstream = %addr,
                         attempt = idx + 1,
+                        unreachable = is_unreachable,
                         error = %e,
                         "Direct outbound attempt failed"
                     );
+                    
                     last_err = Some(e);
+                    
+                    if is_unreachable {
+                        // If network is unreachable (os error 10051), 
+                        // we should ideally trigger the next attempt immediately if not already running.
+                        // For now, just continue the loop; join_next will pick up other tasks.
+                    }
                 }
                 Err(e) => {
                     last_err = Some(EngineError::Internal(format!(
@@ -392,7 +406,9 @@ fn filter_sinkhole_ips(ips: Vec<IpAddr>) -> (Vec<IpAddr>, usize) {
     let mut out = Vec::with_capacity(ips.len());
     let mut dropped = 0usize;
     for ip in ips {
-        if is_unspecified_ip(ip) {
+        // Drop unspecified (0.0.0.0) and loopback (127.0.0.1) IPs.
+        // Public domains should never resolve to these unless the DNS is poisoned.
+        if ip.is_unspecified() || ip.is_loopback() {
             dropped += 1;
             continue;
         }

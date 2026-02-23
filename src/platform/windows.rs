@@ -304,6 +304,137 @@ impl WindowsProxyManager {
     }
 }
 
+pub fn get_process_id_by_connection(local: std::net::SocketAddr, remote: std::net::SocketAddr) -> Option<u32> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, TCP_TABLE_OWNER_PID_ALL,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+
+    let mut dw_size = 0;
+    let family = if local.is_ipv4() { AF_INET as u32 } else { AF_INET6 as u32 };
+
+    // Initial call to get required size
+    unsafe {
+        GetExtendedTcpTable(std::ptr::null_mut(), &mut dw_size, 0, family, TCP_TABLE_OWNER_PID_ALL, 0);
+    }
+
+    let mut buffer = vec![0u8; dw_size as usize];
+    let ret = unsafe {
+        GetExtendedTcpTable(buffer.as_mut_ptr() as *mut _, &mut dw_size, 0, family, TCP_TABLE_OWNER_PID_ALL, 0)
+    };
+
+    if ret != 0 {
+        return None;
+    }
+
+    if local.is_ipv4() {
+        let table = buffer.as_ptr() as *const MIB_TCPTABLE_OWNER_PID;
+        let num_entries = unsafe { (*table).dwNumEntries };
+        let entries = unsafe { std::slice::from_raw_parts((*table).table.as_ptr(), num_entries as usize) };
+
+        for entry in entries {
+            let entry_local_addr = std::net::Ipv4Addr::from(u32::from_be(entry.dwLocalAddr));
+            let entry_local_port = u16::from_be(entry.dwLocalPort as u16);
+            let entry_remote_addr = std::net::Ipv4Addr::from(u32::from_be(entry.dwRemoteAddr));
+            let entry_remote_port = u16::from_be(entry.dwRemotePort as u16);
+
+            if let (std::net::SocketAddr::V4(l), std::net::SocketAddr::V4(r)) = (local, remote) {
+                if entry_local_addr == *l.ip() && entry_local_port == l.port() &&
+                   entry_remote_addr == *r.ip() && entry_remote_port == r.port() {
+                    return Some(entry.dwOwningPid);
+                }
+            }
+        }
+    } else {
+        let table = buffer.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID;
+        let num_entries = unsafe { (*table).dwNumEntries };
+        let entries = unsafe { std::slice::from_raw_parts((*table).table.as_ptr(), num_entries as usize) };
+
+        for entry in entries {
+            let entry_local_addr = std::net::Ipv6Addr::from(entry.ucLocalAddr);
+            let entry_local_port = u16::from_be(entry.dwLocalPort as u16);
+            let entry_remote_addr = std::net::Ipv6Addr::from(entry.ucRemoteAddr);
+            let entry_remote_port = u16::from_be(entry.dwRemotePort as u16);
+
+            if let (std::net::SocketAddr::V6(l), std::net::SocketAddr::V6(r)) = (local, remote) {
+                if entry_local_addr == *l.ip() && entry_local_port == l.port() &&
+                   entry_remote_addr == *r.ip() && entry_remote_port == r.port() {
+                    return Some(entry.dwOwningPid);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+pub fn get_process_name_by_pid(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let handle: HANDLE = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle == std::ptr::null_mut() || handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let mut buffer = [0u16; 1024];
+    let mut size = buffer.len() as u32;
+    let res = unsafe {
+        QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut size)
+    };
+
+    unsafe { CloseHandle(handle) };
+
+    if res == 0 {
+        return None;
+    }
+
+    let path = String::from_utf16_lossy(&buffer[..size as usize]);
+    std::path::Path::new(&path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+}
+
+#[repr(C)]
+#[allow(non_snake_case)]
+struct MIB_TCPROW_OWNER_PID {
+    dwState: u32,
+    dwLocalAddr: u32,
+    dwLocalPort: u32,
+    dwRemoteAddr: u32,
+    dwRemotePort: u32,
+    dwOwningPid: u32,
+}
+
+#[repr(C)]
+#[allow(non_snake_case)]
+struct MIB_TCPTABLE_OWNER_PID {
+    dwNumEntries: u32,
+    table: [MIB_TCPROW_OWNER_PID; 1],
+}
+
+#[repr(C)]
+#[allow(non_snake_case)]
+struct MIB_TCP6ROW_OWNER_PID {
+    ucLocalAddr: [u8; 16],
+    dwLocalScopeId: u32,
+    dwLocalPort: u32,
+    ucRemoteAddr: [u8; 16],
+    dwRemoteScopeId: u32,
+    dwRemotePort: u32,
+    dwState: u32,
+    dwOwningPid: u32,
+}
+
+#[repr(C)]
+#[allow(non_snake_case)]
+struct MIB_TCP6TABLE_OWNER_PID {
+    dwNumEntries: u32,
+    table: [MIB_TCP6ROW_OWNER_PID; 1],
+}
+
 impl ProxyManager for WindowsProxyManager {
     fn enable(&self, socks_endpoint: &str) -> Result<()> {
         self.save_backup_if_missing()?;
