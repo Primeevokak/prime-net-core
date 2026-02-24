@@ -3,7 +3,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::{timeout, Duration};
 
-use prime_net_engine_core::config::EvasionConfig;
 use prime_net_engine_core::pt::socks5_server::{start_socks5_server, RelayOptions};
 use prime_net_engine_core::pt::direct::DirectOutbound;
 use prime_net_engine_core::anticensorship::ResolverChain;

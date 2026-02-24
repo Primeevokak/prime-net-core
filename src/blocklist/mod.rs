@@ -13,6 +13,8 @@ pub struct BlocklistCache {
     pub source: String,
     pub updated_at_unix: u64,
     pub domains: Vec<String>,
+    #[serde(default)]
+    pub ips: Vec<String>,
 }
 
 impl BlocklistCache {
@@ -56,11 +58,22 @@ impl BlocklistCache {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let ips = value
+            .get("ips")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(|v| v.to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         Ok(Some(BlocklistCache {
             source,
             updated_at_unix,
             domains,
+            ips,
         }))
     }
 
@@ -84,14 +97,16 @@ pub async fn update_blocklist(source: &str, cache_path: &Path) -> Result<Blockli
 
     let bytes = client.get(source).send().await?.bytes().await?;
     let body = String::from_utf8_lossy(&bytes);
-    let mut domains = parse_domains_from_text(&body);
-    if domains.is_empty() {
+    let (mut domains, mut ips) = parse_entities_from_text(&body);
+    if domains.is_empty() && ips.is_empty() {
         return Err(EngineError::Internal(
-            "blocklist source returned no valid domains".to_owned(),
+            "blocklist source returned no valid domains or IPs".to_owned(),
         ));
     }
     domains.sort();
     domains.dedup();
+    ips.sort();
+    ips.dedup();
 
     let updated_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -101,6 +116,7 @@ pub async fn update_blocklist(source: &str, cache_path: &Path) -> Result<Blockli
         source: source.to_owned(),
         updated_at_unix,
         domains,
+        ips,
     };
     cache.save(cache_path)?;
     Ok(cache)
@@ -128,40 +144,42 @@ fn looks_like_domain(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
 }
 
-fn parse_domains_from_text(body: &str) -> Vec<String> {
-    let semicolon = parse_domains_csv(body, b';');
-    let comma = parse_domains_csv(body, b',');
+#[allow(clippy::expect_used)]
+fn parse_entities_from_text(body: &str) -> (Vec<String>, Vec<String>) {
+    let (mut d1, mut i1) = parse_entities_csv(body, b';');
+    let (d2, i2) = parse_entities_csv(body, b',');
 
-    let mut domains = if semicolon.len() >= comma.len() {
-        semicolon
-    } else {
-        comma
-    };
+    if d2.len() > d1.len() { d1 = d2; }
+    if i2.len() > i1.len() { i1 = i2; }
 
-    // Fallback: if we got very few domains from a large body, use regex to extract everything that looks like a domain.
-    // 10000 is a safe threshold because known blocklists (z-i, antizapret) are much larger.
-    if domains.len() < 10000 && body.len() > 1024 * 1024 {
-        let re = regex::Regex::new(r"(?i)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}").unwrap();
-        let mut regex_domains = Vec::new();
-        for cap in re.captures_iter(body) {
+    // Fallback: if we got few domains from a large body, use regex
+    if d1.len() < 20000 && body.len() > 1024 * 1024 {
+        let re_domain = regex::Regex::new(r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\b").expect("valid regex");
+        for cap in re_domain.captures_iter(body) {
             let d = cap[0].to_ascii_lowercase();
             if looks_like_domain(&d) {
-                regex_domains.push(d);
+                d1.push(d);
             }
         }
-        if regex_domains.len() > domains.len() {
-            domains = regex_domains;
+        
+        let re_ip = regex::Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").expect("valid regex");
+        for cap in re_ip.captures_iter(body) {
+            let ip = cap[0].to_owned();
+            if ip.parse::<std::net::IpAddr>().is_ok() {
+                i1.push(ip);
+            }
         }
     }
 
-    if domains.is_empty() {
-        return parse_domains_legacy(body);
+    if d1.is_empty() && i1.is_empty() {
+        return parse_entities_legacy(body);
     }
-    domains
+    (d1, i1)
 }
 
-fn parse_domains_csv(body: &str, delimiter: u8) -> Vec<String> {
+fn parse_entities_csv(body: &str, delimiter: u8) -> (Vec<String>, Vec<String>) {
     let mut domains = Vec::new();
+    let mut ips = Vec::new();
     let mut rdr = ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
@@ -171,24 +189,29 @@ fn parse_domains_csv(body: &str, delimiter: u8) -> Vec<String> {
         .from_reader(body.as_bytes());
 
     for record in rdr.records().flatten() {
-        domains.extend(pick_domains_from_record(&record));
+        let (d, i) = pick_entities_from_record(&record);
+        domains.extend(d);
+        ips.extend(i);
     }
-    domains
+    (domains, ips)
 }
 
-fn pick_domains_from_record(record: &csv::StringRecord) -> Vec<String> {
+fn pick_entities_from_record(record: &csv::StringRecord) -> (Vec<String>, Vec<String>) {
     let mut domains = Vec::new();
+    let mut ips = Vec::new();
     for field in record.iter() {
         let candidate = normalize_domain_candidate(field);
-        // Split by pipe OR whitespace to catch multiple domains in one field
         for part in candidate.split(|c: char| c == '|' || c.is_whitespace()) {
-            let sub_candidate = normalize_domain_candidate(part);
-            if looks_like_domain(&sub_candidate) {
-                domains.push(sub_candidate);
+            let sub = normalize_domain_candidate(part);
+            if sub.is_empty() { continue; }
+            if sub.parse::<std::net::IpAddr>().is_ok() {
+                ips.push(sub);
+            } else if looks_like_domain(&sub) {
+                domains.push(sub);
             }
         }
     }
-    domains
+    (domains, ips)
 }
 
 fn normalize_domain_candidate(value: &str) -> String {
@@ -200,17 +223,21 @@ fn normalize_domain_candidate(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn parse_domains_legacy(body: &str) -> Vec<String> {
+fn parse_entities_legacy(body: &str) -> (Vec<String>, Vec<String>) {
     let mut domains = Vec::new();
+    let mut ips = Vec::new();
     for line in body.lines() {
         for field in line.split_whitespace() {
-            let domain = normalize_domain_candidate(field);
-            if looks_like_domain(&domain) {
-                domains.push(domain);
+            let sub = normalize_domain_candidate(field);
+            if sub.is_empty() { continue; }
+            if sub.parse::<std::net::IpAddr>().is_ok() {
+                ips.push(sub);
+            } else if looks_like_domain(&sub) {
+                domains.push(sub);
             }
         }
     }
-    domains
+    (domains, ips)
 }
 
 #[cfg(test)]
@@ -218,38 +245,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_domains_handles_semicolon_csv_with_quotes_and_multiline_fields() {
+    fn parse_entities_handles_semicolon_csv_with_quotes_and_multiline_fields() {
         let body = concat!(
             "\"example.com\";\"1.1.1.1\";\"Org A\"\n",
             "\"sub.example.org\";\"2.2.2.2\";\"Org with, comma\"\n",
             "\"example.net\";\"3.3.3.3\";\"Org with\nmultiline field\"\n",
             "\"not_a_domain\";\"4.4.4.4\";\"bad\"\n"
         );
-        let domains = parse_domains_from_text(body);
+        let (domains, ips) = parse_entities_from_text(body);
         assert!(domains.contains(&"example.com".to_owned()));
         assert!(domains.contains(&"sub.example.org".to_owned()));
         assert!(domains.contains(&"example.net".to_owned()));
         assert!(!domains.contains(&"not_a_domain".to_owned()));
+        assert!(ips.contains(&"1.1.1.1".to_owned()));
+        assert!(ips.contains(&"2.2.2.2".to_owned()));
+        assert!(ips.contains(&"3.3.3.3".to_owned()));
+        assert!(ips.contains(&"4.4.4.4".to_owned()));
     }
 
     #[test]
-    fn parse_domains_handles_comma_csv() {
+    fn parse_entities_handles_comma_csv() {
         let body = "example.com,1.1.1.1,Org\napi.example.org,2.2.2.2,Org B\n";
-        let domains = parse_domains_from_text(body);
+        let (domains, ips) = parse_entities_from_text(body);
         assert_eq!(domains, vec!["example.com", "api.example.org"]);
+        assert_eq!(ips, vec!["1.1.1.1", "2.2.2.2"]);
     }
 
     #[test]
-    fn parse_domains_legacy_whitespace_fallback() {
-        let body = "example.com\nbad_token\napi.example.org";
-        let domains = parse_domains_from_text(body);
+    fn parse_entities_legacy_whitespace_fallback() {
+        let body = "example.com\n1.2.3.4\nbad_token\napi.example.org";
+        let (domains, ips) = parse_entities_from_text(body);
         assert_eq!(domains, vec!["example.com", "api.example.org"]);
+        assert_eq!(ips, vec!["1.2.3.4"]);
     }
 
     #[test]
-    fn parse_domains_ignores_ip_literals() {
+    fn parse_entities_collects_ips_and_domains() {
         let body = "1.1.1.1,org\nexample.com,org\n8.8.8.8,org";
-        let domains = parse_domains_from_text(body);
+        let (domains, ips) = parse_entities_from_text(body);
         assert_eq!(domains, vec!["example.com"]);
+        assert_eq!(ips, vec!["1.1.1.1", "8.8.8.8"]);
     }
 }

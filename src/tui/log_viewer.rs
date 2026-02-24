@@ -12,9 +12,12 @@ use tracing::Level;
 
 use crate::error::Result;
 
+const MAX_LOGS_SIZE_BYTES: usize = 5 * 1024 * 1024;
+
 #[derive(Debug)]
 pub struct LogViewer {
     pub logs: Arc<RwLock<VecDeque<LogEntry>>>,
+    approx_size_bytes: AtomicUsize,
     filtered_cache: Mutex<Option<Vec<LogEntry>>>,
     cache_dirty: AtomicBool,
     filter_level: RwLock<Option<Level>>,
@@ -33,10 +36,17 @@ pub struct LogEntry {
     pub target: String,
 }
 
+impl LogEntry {
+    fn approx_size(&self) -> usize {
+        std::mem::size_of::<Self>() + self.message.len() + self.target.len()
+    }
+}
+
 impl LogViewer {
     pub fn new() -> Self {
         Self {
             logs: Arc::new(RwLock::new(VecDeque::with_capacity(10_000))),
+            approx_size_bytes: AtomicUsize::new(0),
             filtered_cache: Mutex::new(None),
             cache_dirty: AtomicBool::new(true),
             filter_level: RwLock::new(None),
@@ -49,16 +59,25 @@ impl LogViewer {
     }
 
     pub fn add_log(&self, entry: LogEntry) {
+        let entry_size = entry.approx_size();
         let mut logs = self.logs.write();
-        if logs.len() >= 10_000 {
-            logs.pop_front();
+        
+        let mut current_size = self.approx_size_bytes.load(Ordering::Relaxed);
+        while current_size + entry_size > MAX_LOGS_SIZE_BYTES && !logs.is_empty() {
+            if let Some(oldest) = logs.pop_front() {
+                current_size = current_size.saturating_sub(oldest.approx_size());
+            }
         }
+        
+        current_size += entry_size;
         logs.push_back(entry);
+        self.approx_size_bytes.store(current_size, Ordering::Relaxed);
         self.cache_dirty.store(true, Ordering::Relaxed);
     }
 
     pub fn clear(&self) {
         self.logs.write().clear();
+        self.approx_size_bytes.store(0, Ordering::Relaxed);
         self.cache_dirty.store(true, Ordering::Relaxed);
         self.selected_line.store(0, Ordering::Relaxed);
     }
@@ -213,6 +232,20 @@ impl LogViewer {
 
     pub fn export_to_file(&self, path: &Path) -> Result<()> {
         let mut file = File::create(path)?;
+        
+        // Dynamic system information header
+        writeln!(file, "=== PRIME NET ENGINE LOG EXPORT ===")?;
+        writeln!(
+            file,
+            "version=\"{}\" os=\"{}\" arch=\"{}\" build=\"{}\"",
+            crate::version::APP_VERSION,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            if cfg!(debug_assertions) { "debug" } else { "release" }
+        )?;
+        writeln!(file, "------------------------------------")?;
+        writeln!(file)?;
+
         for entry in self.filtered_logs() {
             let ts = format_timestamp(entry.timestamp);
             writeln!(

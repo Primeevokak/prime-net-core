@@ -23,7 +23,7 @@ pub struct DirectOutbound {
 }
 
 impl DirectOutbound {
-    const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
     const MAX_DOMAIN_IP_ATTEMPTS: usize = 8;
     const HAPPY_EYEBALLS_FALLBACK_DELAY: Duration = Duration::from_millis(50);
 

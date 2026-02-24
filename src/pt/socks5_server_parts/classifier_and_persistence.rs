@@ -16,18 +16,9 @@ fn destination_preferred_stage(destination: &str) -> u8 {
 
 fn select_race_probe_stage(destination: &str) -> u8 {
     // For the very first probe of a domain, always prefer Stage 1 (Safest).
-    // Aggressive Stage 2/3 probes can trigger resets (10054) on sensitive services like SoundCloud.
+    // Aggressive Stage 2/3 probes can trigger resets (10054) on some sensitive services.
     // Stage escalation will happen naturally if Stage 1 is detected as blocked.
-    let (host, _) = split_host_port_for_connect(destination).unwrap_or((destination.to_owned(), 443));
-    
-    // SoundCloud and some others often require aggressive SNI splitting (Stage 3) immediately to work on strict ISPs.
-    if host.contains("soundcloud") || host.contains("sndcdn") {
-        return 3;
-    }
-    
-    if host.contains("ytimg") || host.contains("discord") {
-        return 1;
-    }
+    let _ = destination;
 
     let stats = STAGE_RACE_STATS.get_or_init(|| Mutex::new(HashMap::new()));
     let Ok(guard) = stats.lock() else {
@@ -124,24 +115,17 @@ fn record_destination_failure(
                 // AUTOMATION: If we see repeated resets, clear preferred stage to force a re-probe.
                 // This handles cases where an ISP starts blocking a previously working strategy.
                 if stats.resets >= 3 {
-                    if let Ok(mut pref_guard) = DEST_PREFERRED_STAGE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
+                    if let Ok(mut pref_guard) = DEST_PREFERRED_STAGE
+                        .get_or_init(|| Mutex::new(HashMap::new()))
+                        .lock()
+                    {
                         if pref_guard.remove(destination).is_some() {
                             warn!(target: "socks5.classifier", destination, "cleared preferred stage due to repeated resets");
                         }
                     }
                     stats.resets = 0;
                 }
-
-                // Special case: if we reset on Stage 1 for a sensitive host, 
-                // it might mean fragmentation itself is being blocked. 
-                // Force Stage 0 (no fragmentation) for this host.
-                if stage == 1 && (destination.contains("soundcloud") || destination.contains("sndcdn")) {
-                    if let Ok(mut pref_guard) = DEST_PREFERRED_STAGE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
-                        pref_guard.insert(destination.to_owned(), 0);
-                        info!(target: "socks5.classifier", destination, "forced Stage 0 fallback due to Stage 1 reset");
-                    }
-                }
-            },
+            }
             BlockingSignal::Timeout => stats.timeouts = stats.timeouts.saturating_add(1),
             BlockingSignal::EarlyClose => stats.early_closes = stats.early_closes.saturating_add(1),
             BlockingSignal::BrokenPipe => stats.broken_pipes = stats.broken_pipes.saturating_add(1),

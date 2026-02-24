@@ -645,8 +645,9 @@ mod tests {
         let ordered = vec![bypass_first.clone(), direct.clone(), bypass_second.clone()];
 
         let launch = route_race_launch_candidates(&ordered);
-        assert_eq!(launch[0].route_id(), direct.route_id());
-        assert_eq!(launch[1].route_id(), bypass_first.route_id());
+        // NEW: Now we respect the ordered list exactly.
+        assert_eq!(launch[0].route_id(), bypass_first.route_id());
+        assert_eq!(launch[1].route_id(), direct.route_id());
         assert_eq!(launch[2].route_id(), bypass_second.route_id());
     }
 
@@ -663,20 +664,22 @@ mod tests {
         );
         let bypass_3 =
             RouteCandidate::bypass("builtin", "127.0.0.1:19082".parse().expect("addr"), 2, 4);
-        let bypass_4 = RouteCandidate::bypass(
-            "learned-domain",
-            "127.0.0.1:19083".parse().expect("addr"),
-            3,
-            4,
-        );
-        let ordered = vec![direct.clone(), bypass_1.clone(), bypass_2.clone(), bypass_3, bypass_4];
+        let bypass_4 =
+            RouteCandidate::bypass("learned-domain", "127.0.0.1:19083".parse().expect("addr"), 3, 4);
+        let ordered = vec![
+            direct.clone(),
+            bypass_1.clone(),
+            bypass_2.clone(),
+            bypass_3,
+            bypass_4,
+        ];
 
         let launch = route_race_launch_candidates(&ordered);
-        assert_eq!(launch.len(), ROUTE_RACE_MAX_CANDIDATES + 1);
+        // NEW: Max capped at ROUTE_RACE_MAX_CANDIDATES (usually 3 or 4)
+        assert_eq!(launch.len(), ROUTE_RACE_MAX_CANDIDATES);
         assert_eq!(launch[0].route_id(), direct.route_id());
         assert_eq!(launch[1].route_id(), bypass_1.route_id());
         assert_eq!(launch[2].route_id(), bypass_2.route_id());
-        assert_eq!(launch[3].route_id(), "bypass:3");
     }
 
     #[test]

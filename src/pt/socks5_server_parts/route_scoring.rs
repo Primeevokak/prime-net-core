@@ -102,6 +102,11 @@ fn select_bypass_source(
             None
         }
         TargetAddr::Ip(ip) => {
+            if let Some(check_fn) = relay_opts.bypass_domain_check {
+                if check_fn(&ip.to_string()) {
+                    return Some("builtin");
+                }
+            }
             if should_bypass_by_classifier_ip(*ip, port) {
                 return Some("learned-ip");
             }
@@ -196,6 +201,15 @@ fn route_health_score(route_key: &str, candidate: &RouteCandidate, now: u64) -> 
                 bonus += 10;
             }
             _ => {}
+        }
+
+        // Domain-specific "Meta" routing bonuses
+        if route_key.contains("discord") && candidate.bypass_profile_idx == 0 {
+            bonus += 50000; // Force discord-power
+        } else if route_key.contains("instagram") && candidate.bypass_profile_idx == 1 {
+            bonus += 50000; // Force insta-power
+        } else if (route_key.contains("fbcdn") || route_key.contains("facebook")) && candidate.bypass_profile_idx == 2 {
+            bonus += 50000; // Force meta-combo
         }
     }
 
@@ -321,14 +335,32 @@ fn ordered_route_candidates(
 ) -> Vec<RouteCandidate> {
     let now = now_unix_secs();
     let winner = route_winner_for_key(route_key);
+    
+    // Sort candidates by health score first so we can use the score in the filter if needed.
+    // However, we need to calculate score for each.
+    
     let mut filtered: Vec<RouteCandidate> = candidates
         .iter()
         .filter(|c| route_capability_is_available(c.kind, c.family, now))
         .filter(|c| !route_is_temporarily_weak(route_key, &c.route_id(), now))
         .filter(|c| {
-            // Strictly exclude bypass profiles that are globally failing
+            // Strictly exclude bypass profiles that are globally failing, 
+            // UNLESS they have a significant domain bonus (meaning they are the designated "power" profile for this service).
             if c.kind == RouteKind::Bypass {
-                return global_bypass_profile_score(c, now) > GLOBAL_BYPASS_HARD_WEAK_SCORE;
+                let score = global_bypass_profile_score(c, now);
+                if score > GLOBAL_BYPASS_HARD_WEAK_SCORE {
+                    return true;
+                }
+                
+                // If it's a domain-specific profile (has high bonus), allow it despite global failure.
+                // We use a simplified version of the bonus check here.
+                if (route_key.contains("discord") && c.bypass_profile_idx == 0) ||
+                   (route_key.contains("instagram") && c.bypass_profile_idx == 1) ||
+                   ((route_key.contains("fbcdn") || route_key.contains("facebook")) && c.bypass_profile_idx == 2) {
+                    return true; 
+                }
+                
+                return false;
             }
             true
         })

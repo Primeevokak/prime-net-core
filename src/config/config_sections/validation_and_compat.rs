@@ -663,6 +663,7 @@ pub struct AntiCensorshipConfig {
 }
 
 impl Default for AntiCensorshipConfig {
+    #[allow(clippy::expect_used)]
     fn default() -> Self {
         Self {
             doh_enabled: true,
@@ -672,7 +673,20 @@ impl Default for AntiCensorshipConfig {
                 "quad9".to_owned(),
             ],
             doh_cache_ttl_secs: 300,
-            bootstrap_ips: Vec::new(),
+            bootstrap_ips: vec![
+                // Google
+                "8.8.8.8".parse().expect("valid IP"),
+                "8.8.4.4".parse().expect("valid IP"),
+                // Cloudflare
+                "1.1.1.1".parse().expect("valid IP"),
+                "1.0.0.1".parse().expect("valid IP"),
+                // Quad9
+                "9.9.9.9".parse().expect("valid IP"),
+                "149.112.112.112".parse().expect("valid IP"),
+                // AdGuard
+                "94.140.14.14".parse().expect("valid IP"),
+                "94.140.15.15".parse().expect("valid IP"),
+            ],
             dnssec_enabled: true,
             dns_cache_size: default_dns_cache_size(),
             dns_query_timeout_secs: default_dns_timeout_secs(),

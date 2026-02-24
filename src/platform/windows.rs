@@ -375,7 +375,7 @@ pub fn get_process_name_by_pid(pid: u32) -> Option<String> {
     };
 
     let handle: HANDLE = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle == std::ptr::null_mut() || handle == INVALID_HANDLE_VALUE {
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         return None;
     }
 

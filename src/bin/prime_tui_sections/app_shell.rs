@@ -172,11 +172,21 @@ impl App {
             .system_proxy
             .socks_endpoint
             .clone();
+        
+        let packet_bypass_enabled = self.config_editor.config.evasion.packet_bypass_enabled;
+        
         if self.config_editor.config.pt.is_none() {
-            out.push(DiagnosticResult::warn(
-                "Транспорт обхода отключен (шаблон PT = direct)",
-                "Установите шаблон trojan/shadowsocks в Конфиг -> Системный прокси",
-            ));
+            if packet_bypass_enabled {
+                out.push(DiagnosticResult::info(
+                    "Активен локальный обход (PT не требуется)",
+                    "Трафик заблокированных доменов идет через встроенные средства обхода",
+                ));
+            } else {
+                out.push(DiagnosticResult::warn(
+                    "Транспорт обхода отключен (шаблон PT = direct)",
+                    "Установите шаблон trojan/shadowsocks в Конфиг -> Системный прокси",
+                ));
+            }
         }
         let status = system_proxy_manager().status();
         if let Ok(status) = status {
@@ -483,8 +493,7 @@ fn tab_bar(tab: Tab, mode: UserMode) -> Paragraph<'static> {
         UserMode::Simple => vec![
             (Tab::Config, "1 Конфиг"),
             (Tab::Privacy, "2 Приватность"),
-            (Tab::PrivacyHeaders, "3 Заголовки приватности"),
-            (Tab::Proxy, "4 Прокси"),
+            (Tab::Proxy, "3 Прокси"),
         ],
         UserMode::Advanced => vec![
             (Tab::Config, "1 Конфиг"),
@@ -807,10 +816,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         app.tab = match app.user_mode {
             UserMode::Simple => match app.tab {
                 Tab::Config => Tab::Privacy,
-                Tab::Privacy => Tab::PrivacyHeaders,
-                Tab::PrivacyHeaders => Tab::Proxy,
+                Tab::Privacy => Tab::Proxy,
                 Tab::Proxy => Tab::Config,
-                Tab::Monitor | Tab::Logs => Tab::Config,
+                _ => Tab::Config,
             },
             UserMode::Advanced => match app.tab {
                 Tab::Config => Tab::Monitor,
@@ -834,14 +842,13 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         }
         KeyCode::Char('3') => {
             app.tab = match app.user_mode {
-                UserMode::Simple => Tab::PrivacyHeaders,
+                UserMode::Simple => Tab::Proxy,
                 UserMode::Advanced => Tab::Privacy,
             }
         }
         KeyCode::Char('4') => {
-            app.tab = match app.user_mode {
-                UserMode::Simple => Tab::Proxy,
-                UserMode::Advanced => Tab::PrivacyHeaders,
+            if app.user_mode == UserMode::Advanced {
+                app.tab = Tab::PrivacyHeaders;
             }
         }
         KeyCode::Char('5') => {
@@ -960,7 +967,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 
 fn tabs_for_mode(mode: UserMode) -> Vec<Tab> {
     match mode {
-        UserMode::Simple => vec![Tab::Config, Tab::Privacy, Tab::PrivacyHeaders, Tab::Proxy],
+        UserMode::Simple => vec![Tab::Config, Tab::Privacy, Tab::Proxy],
         UserMode::Advanced => vec![
             Tab::Config,
             Tab::Monitor,

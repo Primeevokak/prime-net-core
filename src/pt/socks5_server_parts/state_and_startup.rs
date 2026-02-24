@@ -10,7 +10,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinSet;
 use tokio::time::Duration;
@@ -46,8 +46,6 @@ static CLASSIFIER_STORE_LOADED: AtomicBool = AtomicBool::new(false);
 static CLASSIFIER_STORE_DIRTY: AtomicBool = AtomicBool::new(false);
 static CLASSIFIER_STORE_LAST_FLUSH_UNIX: AtomicU64 = AtomicU64::new(0);
 const CLASSIFIER_PERSIST_DEBOUNCE_SECS: u64 = 30;
-const UDP_POLICY_DISABLE_THRESHOLD: u64 = 6;
-const UDP_POLICY_DISABLE_SECS: u64 = 120;
 const LEARNED_BYPASS_MIN_FAILURES_DOMAIN: u8 = 2;
 const LEARNED_BYPASS_MIN_FAILURES_IP: u8 = 1;
 const ROUTE_WINNER_TTL_SECS: u64 = 15 * 60;
@@ -80,6 +78,8 @@ pub struct RelayOptions {
     pub tcp_window_size: u32,
     pub tcp_window_trick: bool,
     pub sni_spoofing: bool,
+    pub sni_case_toggle: bool,
+    pub block_quic: bool,
     pub udp_padding_range: Option<(usize, usize)>,
     pub stage1_failures: u8,
     pub stage2_failures: u8,
@@ -111,6 +111,8 @@ impl Default for RelayOptions {
             tcp_window_size: 0,
             tcp_window_trick: false,
             sni_spoofing: false,
+            sni_case_toggle: false,
+            block_quic: true,
             udp_padding_range: None,
             stage1_failures: 1,
             stage2_failures: 2,
@@ -370,6 +372,7 @@ struct RouteCapabilities {
 struct ConnectedRoute {
     candidate: RouteCandidate,
     stream: BoxStream,
+    shadow_stream: Option<BoxStream>,
     route_key: String,
     raced: bool,
 }
@@ -485,12 +488,29 @@ async fn connect_bypass_upstream(
     bypass_addr: SocketAddr,
     bypass_profile_idx: u8,
     bypass_profile_total: u8,
-    _resolver: Option<Arc<ResolverChain>>,
+    resolver: Option<Arc<ResolverChain>>,
 ) -> Result<TcpStream> {
-    // We intentionally DO NOT resolve the domain to an IP here.
-    // Instead, we pass the original TargetAddr (which may be a domain) to the upstream SOCKS5.
-    // This allows CIADPI (ByeDPI) to perform its own resolution or SNI-based evasion on the domain name.
-    
+    // DNS Resolution for Bypass:
+    // Use our internal resolver (DoH) to get an IP, then pass that IP to the bypass proxy.
+    // This prevents the bypass proxy from using poisoned system DNS.
+    let resolved_target_addr = if let TargetAddr::Domain(host) = &target.addr {
+        if let Some(r) = &resolver {
+            match r.resolve(host).await {
+                Ok(ips) if !ips.is_empty() => {
+                    debug!(target: "socks5", conn_id, host, ip = %ips[0], "resolved domain for bypass via internal resolver");
+                    Some(TargetAddr::Ip(ips[0]))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let addr_to_send = resolved_target_addr.as_ref().unwrap_or(&target.addr);
+
     let mut bypass = None;
     let mut last_e = None;
     for retry in 0..3 {
@@ -503,10 +523,14 @@ async fn connect_bypass_upstream(
             }
             Ok(Err(e)) => {
                 last_e = Some(e);
-                if retry < 2 { tokio::time::sleep(Duration::from_millis(100)).await; }
+                if retry < 2 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
             }
             Err(_) => {
-                if retry < 2 { tokio::time::sleep(Duration::from_millis(100)).await; }
+                if retry < 2 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
             }
         }
     }
@@ -514,7 +538,9 @@ async fn connect_bypass_upstream(
     let mut bypass = match bypass {
         Some(s) => s,
         None => {
-            let e = last_e.unwrap_or_else(|| std::io::Error::new(ErrorKind::TimedOut, "bypass connect timeout"));
+            let e = last_e.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "bypass connect timeout")
+            });
             warn!(
                 target: "socks5",
                 conn_id,
@@ -567,7 +593,7 @@ async fn connect_bypass_upstream(
     }
 
     let mut req: Vec<u8> = vec![0x05, 0x01, 0x00];
-    match &target.addr {
+    match addr_to_send {
         TargetAddr::Domain(host) => {
             let b = host.as_bytes();
             if b.len() > 255 {

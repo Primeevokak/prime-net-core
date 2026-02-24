@@ -1,28 +1,7 @@
 #[cfg(test)]
 mod evasion_integration_tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
     use rand::Rng;
-
-    #[tokio::test]
-    async fn test_send_fake_sni_probe_writes_correct_data() {
-        let (mut client, server) = tokio::io::duplex(1024);
-        let mut server_box: BoxStream = Box::new(server);
-        
-        // Spawn the probe sender
-        tokio::spawn(async move {
-            let _ = send_fake_sni_probe(&mut server_box, 2).await;
-        });
-
-        let mut buf = vec![0u8; 1024];
-        let n = client.read(&mut buf).await.expect("read failed");
-        
-        // Check if it's a TLS handshake (0x16) and contains "max.ru"
-        assert!(n > 0);
-        assert_eq!(buf[0], 0x16);
-        let content = String::from_utf8_lossy(&buf[..n]);
-        assert!(content.contains("max.ru"));
-    }
 
     #[test]
     fn test_is_tls_client_hello_detection() {

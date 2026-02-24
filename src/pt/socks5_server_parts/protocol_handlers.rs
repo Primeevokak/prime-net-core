@@ -145,9 +145,16 @@ async fn handle_http_proxy(
                 "bypass tunnel established"
             );
             let bypass_tunnel_started = Instant::now();
-            match tokio::io::copy_bidirectional(&mut tcp, &mut connected.stream).await {
+            let tuned = tune_relay_for_target(relay_opts.clone(), port, &destination, false, true);
+            match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options.clone()).await {
                 Ok((c2u, u2c)) => {
                     let lifetime_ms = bypass_tunnel_started.elapsed().as_millis() as u64;
+                    let evasion_tag = if tuned.options.fragment_client_hello {
+                        " (double-evasion active)"
+                    } else {
+                        ""
+                    };
+
                     info!(
                         target: "socks5",
                         conn_id,
@@ -157,7 +164,8 @@ async fn handle_http_proxy(
                         session_lifetime_ms = lifetime_ms,
                         bypass_profile = connected.candidate.bypass_profile_idx + 1,
                         bypass_profiles = connected.candidate.bypass_profile_total,
-                        "bypass tunnel closed"
+                        "bypass tunnel closed{}",
+                        evasion_tag
                     );
                     if should_skip_empty_session_scoring(c2u, u2c) {
                         if should_mark_empty_bypass_session_as_soft_failure(&connected.candidate, port)
@@ -167,24 +175,22 @@ async fn handle_http_proxy(
                                 &connected.candidate,
                                 "zero-reply-soft",
                             );
-                            warn!(
-                                target: "socks5.route",
-                                conn_id,
-                                route_key = %connected.route_key,
-                                route = connected.candidate.route_label(),
-                                destination = %destination,
-                                "adaptive route marked empty bypass session as soft failure"
-                            );
-                        } else {
-                            info!(
-                                target: "socks5.route",
-                                conn_id,
-                                route_key = %connected.route_key,
-                                route = connected.candidate.route_label(),
-                                destination = %destination,
-                                "adaptive route skipped scoring for empty bypass session"
-                            );
                         }
+                    } else if u2c < 20 && lifetime_ms < 1000 {
+                        // Very short session with almost no data is likely a TLS handshake failure 
+                        // disguised as a successful TCP connect.
+                        record_route_failure(
+                            &connected.route_key,
+                            &connected.candidate,
+                            "zero-reply-soft",
+                        );
+                        warn!(
+                            target: "socks5.route",
+                            conn_id,
+                            destination = %destination,
+                            bytes_u2c = u2c,
+                            "bypass session too short/empty, marked as weak"
+                        );
                     } else if should_mark_bypass_profile_failure(
                         port,
                         c2u,
@@ -514,31 +520,23 @@ async fn handle_http_proxy(
     Ok(())
 }
 
-fn is_meta_service(destination: &str) -> bool {
-    let d = destination.to_ascii_lowercase();
-    d.contains("facebook.com") || d.contains("instagram.com") || d.contains("fbcdn.net") || d.contains("cdninstagram.com")
-}
-
 fn tune_relay_for_target(
-    base: RelayOptions,
+    mut base: RelayOptions,
     port: u16,
     destination: &str,
     socks4_flow: bool,
     is_bypass: bool,
 ) -> TunedRelay {
-    if is_bypass || is_meta_service(destination) {
-        // Double-evasion or Meta service mode.
-        // Use extremely aggressive fragmentation.
+    if is_bypass {
+        // In bypass mode (external tool like ciadpi), we should NOT force internal fragmentation.
+        // Doing so often breaks the connection because ciadpi already applies its own evasion.
+        // We use base options but explicitly disable our own fragmentation to avoid "double-evasion".
         let mut opts = base.clone();
-        opts.fragment_client_hello = true;
-        opts.split_at_sni = true;
-        // Split at very small offsets to confuse DPI
-        opts.client_hello_split_offsets = vec![1, 2, 3, 4, 5, 8, 16, 32];
-        opts.fragment_size_max = 1; // Force 1-byte chunks for the budget
-        opts.fragment_sleep_ms = opts.fragment_sleep_ms.max(10);
+        opts.fragment_client_hello = false;
+        
         return TunedRelay {
             options: opts,
-            stage: 4,
+            stage: 0,
             source: StageSelectionSource::Adaptive,
         };
     }
@@ -557,18 +555,28 @@ fn tune_relay_for_target(
             source: StageSelectionSource::Adaptive,
         };
     }
-    let mut stage = if socks4_flow { 1u8 } else { 0u8 };
-    let preferred = destination_preferred_stage(destination);
-    let mut source = StageSelectionSource::Adaptive;
-    if preferred > 0 {
-        stage = stage.max(preferred);
-        source = StageSelectionSource::Cache;
-    }
-    let failures = destination_failures(destination);
+        let mut stage = if socks4_flow { 1u8 } else { 0u8 };
+        let preferred = destination_preferred_stage(destination);
+        let mut source = StageSelectionSource::Adaptive;
+        if preferred > 0 {
+            stage = stage.max(preferred);
+            source = StageSelectionSource::Cache;
+        }
+        
+        let failures = destination_failures(destination);
     if preferred == 0 && failures == 0 && base.strategy_race_enabled && !socks4_flow {
         stage = select_race_probe_stage(destination);
         source = StageSelectionSource::Probe;
     }
+    
+        // Fast-track for domains known to be very sensitive to DPI.
+        // On Windows, we still use Stage 4 for these, but our internal relay will randomize it (1-2 bytes).
+        if destination.contains("discord") || destination.contains("instagram") || destination.contains("facebook") ||
+           destination.contains("fbcdn") {
+            stage = stage.max(4);
+            base.tcp_window_trick = true;
+        }
+
     if failures >= base.stage1_failures {
         stage += 1;
     }
@@ -581,6 +589,7 @@ fn tune_relay_for_target(
     if failures >= base.stage4_failures {
         stage += 1;
     }
+    
     stage = stage.min(4);
 
     if socks4_flow && !WARNED_SOCKS4_AGGRESSIVE.swap(true, Ordering::Relaxed) {
@@ -608,7 +617,7 @@ fn tune_relay_for_target(
         2 => RelayOptions {
             fragment_client_hello: true,
             fragment_size_min: base.fragment_size_min.clamp(1, 16),
-            fragment_size_max: base.fragment_size_max.clamp(1, 32),
+            fragment_size_max: base.fragment_size_max.clamp(4, 32),
             fragment_sleep_ms: base.fragment_sleep_ms.min(2),
             fragment_budget_bytes: base.fragment_budget_bytes.clamp(4096, 8192),
             client_hello_split_offsets: vec![1, 5],
@@ -616,21 +625,29 @@ fn tune_relay_for_target(
         },
         3 => RelayOptions {
             fragment_client_hello: true,
-            fragment_size_min: base.fragment_size_min.clamp(1, 4),
-            fragment_size_max: base.fragment_size_max.clamp(1, 8),
-            fragment_sleep_ms: base.fragment_sleep_ms.min(5),
-            fragment_budget_bytes: base.fragment_budget_bytes.clamp(8192, 16384),
-            client_hello_split_offsets: vec![1, 5, 32, 48],
+            fragment_size_min: base.fragment_size_min.clamp(2, 4),
+            fragment_size_max: base.fragment_size_max.clamp(4, 8),
+            fragment_sleep_ms: base.fragment_sleep_ms.min(1),
+            fragment_budget_bytes: base.fragment_budget_bytes.clamp(2048, 4096),
+            client_hello_split_offsets: vec![1, 5, 32],
+            sni_case_toggle: true,
             ..base
         },
         _ => RelayOptions {
             fragment_client_hello: true,
+            #[cfg(windows)]
+            fragment_size_min: 16,
+            #[cfg(windows)]
+            fragment_size_max: 32,
+            #[cfg(not(windows))]
             fragment_size_min: 1,
-            fragment_size_max: 2,
-            fragment_sleep_ms: base.fragment_sleep_ms.min(10),
-            fragment_budget_bytes: base.fragment_budget_bytes.clamp(8192, 32768),
-            client_hello_split_offsets: vec![1, 3, 5, 32, 48, 64],
-            sni_spoofing: true, // Enable fake SNI probe for the most aggressive stage
+            #[cfg(not(windows))]
+            fragment_size_max: 1,
+            fragment_sleep_ms: base.fragment_sleep_ms.min(1), 
+            fragment_budget_bytes: base.fragment_budget_bytes.clamp(4096, 8192),
+            client_hello_split_offsets: vec![1, 5, 32, 48, 64],
+            sni_spoofing: true,
+            sni_case_toggle: true,
             ..base
         },
     };

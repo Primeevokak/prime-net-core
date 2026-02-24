@@ -23,6 +23,7 @@ pub fn generate_fake_client_hello() -> Vec<u8> {
 }
 
 /// Constructs a minimal TLS 1.2+ ClientHello record with the specified SNI.
+#[allow(clippy::expect_used)]
 pub fn build_client_hello_for_domain(domain: &str) -> Vec<u8> {
     let host = domain.as_bytes();
     let sni_name_len = host.len() as u16;
@@ -30,7 +31,7 @@ pub fn build_client_hello_for_domain(domain: &str) -> Vec<u8> {
     let sni_ext_len = 2 + sni_list_len;
 
     // Supported Versions (TLS 1.2, 1.3)
-    let supported_versions_ext = hex::decode("002b00050403040303").unwrap();
+    let supported_versions_ext = hex::decode("002b00050403040303").expect("valid hex");
 
     let mut exts = Vec::new();
     // SNI Extension

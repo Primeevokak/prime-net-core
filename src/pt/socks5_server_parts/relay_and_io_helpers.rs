@@ -34,12 +34,16 @@ async fn relay_bidirectional(
             }
             total += n as u64;
 
-            let current_buf = &buf[..n];
-
             if maybe_tls.is_none() {
-                let is_ch = is_tls_client_hello(current_buf);
+                let is_ch = is_tls_client_hello(&buf[..n]);
+                if is_ch {
+                    // Apply SNI-based evasion before any fragmentation
+                    apply_sni_evasion(&mut buf[..n], &c2u_opts);
+                }
                 maybe_tls = Some(is_ch);
             }
+
+            let current_buf = &buf[..n];
 
             let elapsed = started.elapsed();
             let responded = upstream_seen_c2u.load(Ordering::Relaxed);
@@ -49,43 +53,79 @@ async fn relay_bidirectional(
                 && !responded;
 
             if use_fragmentation {
-                let sni_info = find_sni_info(current_buf);
+                let mut p = 0;
+                let sni_info = if c2u_opts.split_at_sni { find_sni_info(current_buf) } else { None };
+
                 if let Some((off, len)) = sni_info {
-                    // Aggressive 4-way SNI split: Before, Type, Len, Data
-                    // 1. Everything before the SNI extension
-                    upstream_w.write_all(&current_buf[..off]).await?;
-                    tokio::time::sleep(Duration::from_millis(15)).await;
-                    
-                    if len >= 4 {
-                        // 2. SNI Extension Type (2 bytes)
-                        upstream_w.write_all(&current_buf[off..off+2]).await?;
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        
-                        // 3. SNI Extension Length (2 bytes)
-                        upstream_w.write_all(&current_buf[off+2..off+4]).await?;
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        
-                        // 4. SNI Extension Data
-                        upstream_w.write_all(&current_buf[off+4..off+len]).await?;
-                    } else {
-                        upstream_w.write_all(&current_buf[off..off+len]).await?;
+                    // Effective SNI split: Type (2) | Len (2) | Data (N)
+                    // Minimal sleeps for maximum speed.
+                    if off > 0 && off < n {
+                        upstream_w.write_all(&current_buf[..off]).await?;
+                        p = off;
+                        sleep_with_jitter(Duration::from_millis(2)).await;
                     }
                     
-                    // 5. Everything after the SNI extension
-                    if off + len < n {
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                        upstream_w.write_all(&current_buf[off+len..]).await?;
-                    }
-                } else {
-                    let chunk_size = c2u_opts.fragment_size_max.min(n).max(1);
-                    let mut p = 0;
-                    while p < n {
-                        let end = (p + chunk_size).min(n);
+                    let end = (off + len).min(n);
+                    if len >= 4 && p + 4 <= n {
+                        // 1. SNI Extension Type (2 bytes)
+                        upstream_w.write_all(&current_buf[p..p+2]).await?;
+                        p += 2;
+                        sleep_with_jitter(Duration::from_millis(1)).await;
+                        
+                        // 2. SNI Extension Length (2 bytes)
+                        upstream_w.write_all(&current_buf[p..p+2]).await?;
+                        p += 2;
+                        sleep_with_jitter(Duration::from_millis(1)).await;
+                        
+                        // 3. SNI Extension Data
                         upstream_w.write_all(&current_buf[p..end]).await?;
                         p = end;
-                        if p < n { 
-                            tokio::time::sleep(Duration::from_millis(1)).await; 
+                    } else if p < end {
+                        upstream_w.write_all(&current_buf[p..end]).await?;
+                        p = end;
+                    }
+                    
+                    if p < n {
+                        sleep_with_jitter(Duration::from_millis(1)).await;
+                    }
+                } else if !c2u_opts.client_hello_split_offsets.is_empty() {
+                    // Respect explicit split offsets
+                    let mut offsets = c2u_opts.client_hello_split_offsets.clone();
+                    offsets.sort_unstable();
+                    for offset in offsets {
+                        if offset > p && offset < n {
+                            upstream_w.write_all(&current_buf[p..offset]).await?;
+                            p = offset;
+                            sleep_with_jitter(Duration::from_millis(c2u_opts.fragment_sleep_ms.max(1))).await;
                         }
+                    }
+                }
+
+                // Fragment the rest of the buffer safely
+                while p < n {
+                    let remaining = n - p;
+                    let max_chunk = c2u_opts.fragment_size_max.min(remaining);
+                    let min_chunk = c2u_opts.fragment_size_min.min(max_chunk).max(1);
+                    
+                    let chunk_size = if c2u_opts.randomize_fragment_size && max_chunk > min_chunk {
+                        rand::thread_rng().gen_range(min_chunk..=max_chunk)
+                    } else {
+                        max_chunk
+                    };
+
+                    let end = p + chunk_size;
+                    // Final safety check to prevent panic at all costs
+                    let actual_end = end.min(n);
+                    if p < actual_end {
+                        upstream_w.write_all(&current_buf[p..actual_end]).await?;
+                        p = actual_end;
+                        
+                        if p < n { 
+                            let sleep_ms = c2u_opts.fragment_sleep_ms.max(2);
+                            sleep_with_jitter(Duration::from_millis(sleep_ms)).await; 
+                        }
+                    } else {
+                        break;
                     }
                 }
                 budget = budget.saturating_sub(n);
@@ -158,11 +198,56 @@ fn find_sni_info(buf: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
+fn apply_sni_evasion(buf: &mut [u8], opts: &RelayOptions) {
+    if !opts.sni_case_toggle && !opts.sni_spoofing {
+        return;
+    }
+    if let Some((off, _len)) = find_sni_info(buf) {
+        // SNI Extension structure:
+        // Type(2) | Len(2) | ListLen(2) | NameType(1) | NameLen(2) | Name(N)
+        let name_len_pos = off + 7;
+        if name_len_pos + 2 > buf.len() {
+            return;
+        }
+        let name_len = u16::from_be_bytes([buf[name_len_pos], buf[name_len_pos + 1]]) as usize;
+        let name_start = off + 9;
+        let name_end = name_start + name_len;
+        if name_end > buf.len() {
+            return;
+        }
+
+        if opts.sni_case_toggle {
+            for i in name_start..name_end {
+                let c = buf[i];
+                if c.is_ascii_alphabetic() {
+                    // Toggle case of some characters. 
+                    // This is generally safe as DNS names are case-insensitive.
+                    if i % 2 == 0 {
+                        buf[i] = if c.is_ascii_lowercase() {
+                            c.to_ascii_uppercase()
+                        } else {
+                            c.to_ascii_lowercase()
+                        };
+                    }
+                }
+            }
+        }
+        
+        if opts.sni_spoofing {
+            // If spoofing is requested but we don't have a target domain, 
+            // we can apply a different trick, like slightly modifying the SNI extension
+            // in a way that remains valid but looks different to DPI.
+            // For now, case-toggle already provides good evasion.
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_socks5_udp_associate(
-    conn_id: u64,
+    _conn_id: u64,
     mut tcp: TcpStream,
     peer: SocketAddr,
-    client: String,
+    _client: String,
     request_addr: TargetAddr,
     request_port: u16,
     silent_drop: bool,
@@ -203,13 +288,25 @@ async fn handle_socks5_udp_associate(
                     }
                     let key = format_target(&target_addr, target_port);
                     let policy = policies.entry(key.clone()).or_default();
-                    if now_unix_secs() < policy.disabled_until_unix { continue; }
+                    if now_unix_secs() < policy.disabled_until_unix {
+                        continue;
+                    }
+                    
+                    // QUIC Blocking: 
+                    // Force fallback to TCP by dropping UDP 443 packets.
+                    // This allows our TCP-based DPI bypass logic to work.
+                    if target_port == 443 && relay_opts.block_quic {
+                        continue;
+                    }
+
                     let target = match resolve_udp_target_addr(&target_addr, target_port).await {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                    if policy.sent == 0 && target_port == 443 {
-                        let junk: [u8; 8] = rand::random();
+                    if policy.sent == 0 {
+                        // Larger junk packet for better UDP evasion
+                        let mut junk = vec![0u8; 128];
+                        rand::thread_rng().fill(&mut junk[..]);
                         let _ = udp.send_to(&junk, target).await;
                     }
                     if udp.send_to(&payload, target).await.is_ok() {
@@ -301,7 +398,7 @@ async fn resolve_udp_target_addr(addr: &TargetAddr, port: u16) -> std::io::Resul
 }
 
 fn is_client_udp_packet(src: SocketAddr, peer: SocketAddr, hint: Option<SocketAddr>) -> bool {
-    src.ip() == peer.ip() && hint.map_or(true, |h| src.port() == h.port())
+    src.ip() == peer.ip() && hint.is_none_or(|h| src.port() == h.port())
 }
 
 fn parse_socks5_udp_request(packet: &[u8]) -> Option<(TargetAddr, u16, usize)> {
@@ -340,6 +437,13 @@ fn is_expected_disconnect(e: &std::io::Error) -> bool {
         e.kind(),
         ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe
     )
+}
+
+async fn sleep_with_jitter(base: Duration) {
+    if base.is_zero() { return; }
+    let ms = base.as_millis() as u64;
+    let jitter = rand::thread_rng().gen_range(0..=(ms / 4).max(1));
+    tokio::time::sleep(Duration::from_millis(ms + jitter)).await;
 }
 
 fn find_http_header_end(buf: &[u8]) -> Option<usize> {
@@ -451,18 +555,3 @@ fn split_host_port_with_default(target: &str, default_port: u16) -> Option<(Stri
     None
 }
 
-async fn send_fake_sni_probe(upstream: &mut BoxStream, ttl: u8) -> std::io::Result<()> {
-    // Construct a fake TLS ClientHello with SNI max.ru
-    let mut probe = hex::decode("16030100510100004d0303").unwrap();
-    // Random 32 bytes
-    probe.extend((0..32).map(|_| rand::random::<u8>()));
-    probe.push(0x00); // session id len
-    probe.extend_from_slice(&hex::decode("00021301010000240000000b00090000066d61782e7275").unwrap());
-    
-    // In a real scenario we'd set TTL here, but BoxStream doesn't support it directly.
-    // For now we just write the probe.
-    let _ = ttl;
-    upstream.write_all(&probe).await?;
-    upstream.flush().await?;
-    Ok(())
-}

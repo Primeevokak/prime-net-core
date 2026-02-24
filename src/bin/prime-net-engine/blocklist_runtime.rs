@@ -19,6 +19,7 @@ pub struct RuntimeBlocklistStats {
     pub enabled: bool,
     pub source: String,
     pub domains_loaded: usize,
+    pub ips_loaded: usize,
     pub cache_updated: bool,
     pub pt_tools_path: Option<PathBuf>,
 }
@@ -26,29 +27,36 @@ pub struct RuntimeBlocklistStats {
 #[derive(Debug, Default)]
 struct DomainMatcher {
     domains: HashSet<String>,
+    ips: HashSet<String>,
 }
 
 impl DomainMatcher {
-    fn from_domains(domains: &[String]) -> Self {
-        let mut set = HashSet::with_capacity(domains.len());
+    fn from_entities(domains: &[String], ips: &[String]) -> Self {
+        let mut d_set = HashSet::with_capacity(domains.len());
         for domain in domains {
             let normalized = normalize_domain(domain);
-            if normalized.is_empty() {
-                continue;
+            if !normalized.is_empty() {
+                d_set.insert(normalized);
             }
-            set.insert(normalized);
         }
-        Self { domains: set }
+        let mut i_set = HashSet::with_capacity(ips.len());
+        for ip in ips {
+            i_set.insert(ip.trim().to_owned());
+        }
+        Self { domains: d_set, ips: i_set }
     }
 
     fn contains_host_or_suffix(&self, host: &str) -> bool {
-        if self.domains.is_empty() {
-            return false;
-        }
         let host = normalize_domain(host);
         if host.is_empty() {
             return false;
         }
+        
+        // If it's an IP literal, check the IP set
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            return self.ips.contains(&host);
+        }
+
         if self.domains.contains(&host) {
             return true;
         }
@@ -71,6 +79,7 @@ pub async fn initialize_runtime_blocklist(cfg: &BlocklistConfig) -> Result<Runti
             enabled: false,
             source: cfg.source.clone(),
             domains_loaded: 0,
+            ips_loaded: 0,
             cache_updated: false,
             pt_tools_path: None,
         });
@@ -79,7 +88,7 @@ pub async fn initialize_runtime_blocklist(cfg: &BlocklistConfig) -> Result<Runti
     let cache_path = expand_tilde(&cfg.cache_path);
     let mut cache = BlocklistCache::status(&cache_path)?;
     
-    // Invalidate suspiciously small cache for large known sources to force re-parsing with improved logic
+    // Invalidate suspiciously small cache for large known sources
     if let Some(ref c) = cache {
         if c.domains.len() < 5000 && (c.source.contains("zapret-info") || c.source.contains("z-i")) {
             warn!(target: "socks_cmd", domains = c.domains.len(), "cached blocklist is suspiciously small; invalidating to force full re-parse");
@@ -107,18 +116,22 @@ pub async fn initialize_runtime_blocklist(cfg: &BlocklistConfig) -> Result<Runti
         }
     }
 
-    let mut domains = cache
+    let (mut domains, mut ips) = cache
         .as_ref()
-        .map(|c| c.domains.clone())
+        .map(|c| (c.domains.clone(), c.ips.clone()))
         .unwrap_or_default();
-    if domains.is_empty() {
+    
+    if domains.is_empty() && ips.is_empty() {
         domains = load_domains_from_pt_tools().unwrap_or_default();
     }
     domains.sort();
     domains.dedup();
+    ips.sort();
+    ips.dedup();
 
-    let matcher = DomainMatcher::from_domains(&domains);
+    let matcher = DomainMatcher::from_entities(&domains, &ips);
     let domains_loaded = matcher.domains.len();
+    let ips_loaded = matcher.ips.len();
     let _ = RUNTIME_MATCHER.set(matcher);
 
     let pt_tools_path = if domains.is_empty() {
@@ -141,6 +154,7 @@ pub async fn initialize_runtime_blocklist(cfg: &BlocklistConfig) -> Result<Runti
         enabled: true,
         source: cfg.source.clone(),
         domains_loaded,
+        ips_loaded,
         cache_updated,
         pt_tools_path,
     })
@@ -233,6 +247,7 @@ pub fn log_runtime_blocklist_stats(stats: &RuntimeBlocklistStats) {
         target: "socks_cmd",
         source = %stats.source,
         domains = stats.domains_loaded,
+        ips = stats.ips_loaded,
         cache_updated = stats.cache_updated,
         pt_tools = stats.pt_tools_path.as_ref().map(|p| p.display().to_string()),
         "runtime blocklist feed loaded"
@@ -250,12 +265,15 @@ mod tests {
             "*.foo.bar".to_owned(),
             "discord.gg".to_owned(),
         ];
-        let matcher = DomainMatcher::from_domains(&domains);
+        let ips = vec!["1.1.1.1".to_owned()];
+        let matcher = DomainMatcher::from_entities(&domains, &ips);
         assert!(matcher.contains_host_or_suffix("example.com"));
         assert!(matcher.contains_host_or_suffix("api.example.com"));
         assert!(matcher.contains_host_or_suffix("a.b.foo.bar"));
         assert!(matcher.contains_host_or_suffix("gateway.discord.gg"));
+        assert!(matcher.contains_host_or_suffix("1.1.1.1"));
         assert!(!matcher.contains_host_or_suffix("example.org"));
+        assert!(!matcher.contains_host_or_suffix("8.8.8.8"));
     }
 
     #[test]
