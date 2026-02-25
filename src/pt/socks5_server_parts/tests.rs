@@ -310,13 +310,14 @@ mod tests {
     }
 
     #[test]
-    fn bypass_profile_rotation_is_host_specific() {
+    fn bypass_profile_rotation_propagates_to_service() {
         clear_bypass_profile_state_for_test();
         record_bypass_profile_failure("api.github.com:443", 0, 3, "unit-test");
         assert_eq!(destination_bypass_profile_idx("api.github.com:443", 3), 1);
+        // NEW: Other subdomains of github.com should now also use index 1
         assert_eq!(
             destination_bypass_profile_idx("collector.github.com:443", 3),
-            0
+            1
         );
         clear_bypass_profile_state_for_test();
     }
@@ -612,21 +613,21 @@ mod tests {
             0,
             1,
         );
-        assert_eq!(route_race_candidate_delay_ms(0, &direct, true), 0);
+        assert_eq!(route_race_candidate_delay_ms(0, &direct, true, "example.com"), 0);
         assert_eq!(
-            route_race_candidate_delay_ms(1, &bypass, true),
+            route_race_candidate_delay_ms(1, &bypass, true, "example.com"),
             ROUTE_RACE_BASE_DELAY_MS
                 + ROUTE_RACE_DIRECT_HEADSTART_MS
                 + ROUTE_RACE_BYPASS_EXTRA_DELAY_BUILTIN_MS
         );
         assert_eq!(
-            route_race_candidate_delay_ms(1, &bypass_adaptive, true),
+            route_race_candidate_delay_ms(1, &bypass_adaptive, true, "example.com"),
             ROUTE_RACE_BASE_DELAY_MS
                 + ROUTE_RACE_DIRECT_HEADSTART_MS
                 + ROUTE_RACE_BYPASS_EXTRA_DELAY_MS
         );
         assert_eq!(
-            route_race_candidate_delay_ms(1, &bypass, false),
+            route_race_candidate_delay_ms(1, &bypass, false, "example.com"),
             ROUTE_RACE_BASE_DELAY_MS
         );
     }

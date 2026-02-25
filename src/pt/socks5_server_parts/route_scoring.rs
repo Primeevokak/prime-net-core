@@ -195,17 +195,21 @@ fn route_health_score(route_key: &str, candidate: &RouteCandidate, now: u64) -> 
     if candidate.kind == RouteKind::Bypass {
         match candidate.source {
             "builtin" | "learned-domain" | "learned-ip" => {
-                bonus += 1000;
+                bonus += 5000; // Increased from 1000
             }
             "adaptive-race" => {
-                bonus += 10;
+                bonus += 100; // Increased from 10
             }
             _ => {}
         }
 
         // Domain-specific "Meta" routing bonuses
-        if route_key.contains("discord") && candidate.bypass_profile_idx == 0 {
-            bonus += 50000; // Force discord-power
+        if (route_key.contains("discord") || route_key.contains("discordapp") || route_key.contains("discord.gg")) && 
+           candidate.bypass_profile_idx == 0 {
+            bonus += 50000; // Force discord-robust
+        } else if (route_key.contains("youtube") || route_key.contains("ytimg") || route_key.contains("googlevideo")) && 
+                  candidate.bypass_profile_idx == 1 {
+            bonus += 50000; // Force youtube-optimized (now index 1)
         } else if route_key.contains("instagram") && candidate.bypass_profile_idx == 1 {
             bonus += 50000; // Force insta-power
         } else if (route_key.contains("fbcdn") || route_key.contains("facebook")) && candidate.bypass_profile_idx == 2 {
@@ -280,7 +284,7 @@ fn bypass_profile_score_from_health(health: &BypassProfileHealth, now: u64) -> i
     let mut score = (health.successes as i64 * 5) - (health.failures as i64 * 6);
     score -= health.connect_failures as i64 * 8;
     score -= health.soft_zero_replies as i64 * 30; // Increased penalty to ban broken profiles faster
-    score -= health.io_errors as i64 * 7;
+    score -= health.io_errors as i64 * 25; // Increased from 7
     if health.last_success_unix > 0 && now.saturating_sub(health.last_success_unix) <= 5 * 60 {
         score += 3;
     }
@@ -322,11 +326,20 @@ fn route_winner_for_key(route_key: &str) -> Option<RouteWinner> {
     let Ok(guard) = map.lock() else {
         return None;
     };
+    
+    // 1. Exact match
     if let Some(winner) = guard.get(route_key).cloned() {
         return Some(winner);
     }
-    let service_key = route_service_key(route_key)?;
-    guard.get(&service_key).cloned()
+    
+    // 2. Service-level match (subdomain inheritance)
+    if let Some(service_key) = route_service_key(route_key) {
+        if let Some(winner) = guard.get(&service_key).cloned() {
+            return Some(winner);
+        }
+    }
+    
+    None
 }
 
 fn ordered_route_candidates(
@@ -604,6 +617,15 @@ fn record_route_failure(route_key: &str, candidate: &RouteCandidate, reason: &'s
                 .min(ROUTE_WEAK_MAX_SECS);
             entry.weak_until_unix = now.saturating_add(penalty);
         }
+        
+        // Service-level failure propagation
+        if let Some(service_key) = route_service_key(route_key) {
+            if service_key != route_key {
+                let entry_service = guard.entry(service_key).or_default().entry(route_id.clone()).or_default();
+                entry_service.failures = entry_service.failures.saturating_add(1);
+                // Don't mark weak globally yet, but increment failure counter to influence future races
+            }
+        }
     }
     if let Ok(mut guard) = DEST_ROUTE_WINNER
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -785,6 +807,7 @@ fn record_bypass_profile_failure(
         return;
     }
     let key = bypass_profile_key(destination);
+    let service_key = bypass_profile_legacy_service_key(destination);
     let next_idx = if total > 1 {
         (current_idx + 1) % total
     } else {
@@ -793,12 +816,20 @@ fn record_bypass_profile_failure(
     let idx_map = DEST_BYPASS_PROFILE_IDX.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut guard) = idx_map.lock() {
         guard.insert(key.clone(), next_idx);
+        if service_key != key {
+            guard.insert(service_key.clone(), next_idx);
+        }
     }
     let fail_map = DEST_BYPASS_PROFILE_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
     let failures = if let Ok(mut guard) = fail_map.lock() {
         let entry = guard.entry(key.clone()).or_insert(0);
         *entry = entry.saturating_add(1);
-        *entry
+        let val = *entry;
+        if service_key != key {
+            let service_entry = guard.entry(service_key).or_insert(0);
+            *service_entry = service_entry.saturating_add(1);
+        }
+        val
     } else {
         0
     };
@@ -818,9 +849,13 @@ fn record_bypass_profile_failure(
 
 fn record_bypass_profile_success(destination: &str, idx: u8) {
     let key = bypass_profile_key(destination);
+    let service_key = bypass_profile_legacy_service_key(destination);
     let idx_map = DEST_BYPASS_PROFILE_IDX.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut guard) = idx_map.lock() {
         guard.insert(key.clone(), idx);
+        if service_key != key {
+            guard.insert(service_key.clone(), idx);
+        }
     }
     let fail_map = DEST_BYPASS_PROFILE_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut guard) = fail_map.lock() {
@@ -828,6 +863,14 @@ fn record_bypass_profile_success(destination: &str, idx: u8) {
             *entry = entry.saturating_sub(1);
             if *entry == 0 {
                 guard.remove(&key);
+            }
+        }
+        if service_key != key {
+            if let Some(entry) = guard.get_mut(&service_key) {
+                *entry = entry.saturating_sub(1);
+                if *entry == 0 {
+                    guard.remove(&service_key);
+                }
             }
         }
     }

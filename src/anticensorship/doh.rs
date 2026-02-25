@@ -148,13 +148,38 @@ impl DoHResolver {
     }
 
     pub async fn resolve(&self, domain: &str) -> Result<Vec<IpAddr>> {
-        if let Some(entry) = self.cache.read().get(domain).cloned() {
-            if entry.expires_at > Instant::now() {
-                return Ok(entry.ips);
+        let (ips, needs_refresh) = {
+            let cache = self.cache.read();
+            if let Some(entry) = cache.get(domain) {
+                let now = Instant::now();
+                if entry.expires_at > now {
+                    // Pre-fetching: if 30% or less of TTL remains, refresh in background
+                    let ttl_remaining = entry.expires_at.duration_since(now);
+                    let needs_refresh = ttl_remaining < self.default_ttl / 3;
+                    (Some(entry.ips.clone()), needs_refresh)
+                } else {
+                    (None, true)
+                }
+            } else {
+                (None, true)
             }
-            self.cache.write().remove(domain);
+        };
+
+        if let Some(ips) = ips {
+            if needs_refresh {
+                let self_clone = self.clone();
+                let domain_clone = domain.to_owned();
+                tokio::spawn(async move {
+                    let _ = self_clone.refresh_cache(&domain_clone).await;
+                });
+            }
+            return Ok(ips);
         }
 
+        self.refresh_cache(domain).await
+    }
+
+    async fn refresh_cache(&self, domain: &str) -> Result<Vec<IpAddr>> {
         for provider in &self.providers {
             if let Ok(answer) = self.query_doh_provider(provider, domain, false).await {
                 if !answer.ips.is_empty() {
@@ -170,7 +195,15 @@ impl DoHResolver {
             }
         }
 
-        self.system_resolve(domain).await
+        let ips = self.system_resolve(domain).await?;
+        self.cache.write().insert(
+            domain.to_owned(),
+            CachedDnsEntry {
+                expires_at: Instant::now() + self.default_ttl,
+                ips: ips.clone(),
+            },
+        );
+        Ok(ips)
     }
 
     pub async fn resolve_with_dnssec(&self, domain: &str) -> Result<(Vec<IpAddr>, bool)> {

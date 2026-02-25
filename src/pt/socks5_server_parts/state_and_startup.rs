@@ -40,6 +40,7 @@ static STAGE_RACE_STATS: OnceLock<Mutex<HashMap<u8, StageRaceStats>>> = OnceLock
 static RACE_SOURCE_COUNTERS: OnceLock<Mutex<RaceSourceCounters>> = OnceLock::new();
 static ROUTE_METRICS: OnceLock<Mutex<RouteMetrics>> = OnceLock::new();
 static ROUTE_CAPABILITIES: OnceLock<Mutex<RouteCapabilities>> = OnceLock::new();
+static BYPASS_POOL: OnceLock<Mutex<HashMap<SocketAddr, Vec<TcpStream>>>> = OnceLock::new();
 static LAST_CLASSIFIER_EMIT_UNIX: AtomicU64 = AtomicU64::new(0);
 static CLASSIFIER_STORE_CFG: OnceLock<Option<ClassifierStoreConfig>> = OnceLock::new();
 static CLASSIFIER_STORE_LOADED: AtomicBool = AtomicBool::new(false);
@@ -54,16 +55,16 @@ const ROUTE_WEAK_MAX_SECS: u64 = 5 * 60;
 const ROUTE_FAILS_BEFORE_WEAK: u8 = 2;
 const ROUTE_SOFT_ZERO_REPLY_MIN_C2U: u64 = 256;
 const ROUTE_SOFT_ZERO_REPLY_MIN_LIFETIME_MS: u64 = 2000;
-const ROUTE_CAPABILITY_NET_UNREACHABLE_SECS: u64 = 3 * 60;
+const ROUTE_CAPABILITY_NET_UNREACHABLE_SECS: u64 = 30 * 60;
 const ROUTE_CAPABILITY_BYPASS_REP03_SECS: u64 = 10 * 60;
 const ROUTE_CAPABILITY_BYPASS_REP_OTHER_SECS: u64 = 4 * 60;
 const GLOBAL_BYPASS_HARD_WEAK_SCORE: i64 = -80;
 const ROUTE_RACE_BASE_DELAY_MS: u64 = 20;
-const ROUTE_RACE_DIRECT_HEADSTART_MS: u64 = 40;
+const ROUTE_RACE_DIRECT_HEADSTART_MS: u64 = 20;
 const ROUTE_RACE_BYPASS_EXTRA_DELAY_MS: u64 = 60;
 const ROUTE_RACE_BYPASS_EXTRA_DELAY_BUILTIN_MS: u64 = 20;
 const ROUTE_RACE_BYPASS_EXTRA_DELAY_LEARNED_MS: u64 = 10;
-const ROUTE_RACE_MAX_CANDIDATES: usize = 3;
+const ROUTE_RACE_MAX_CANDIDATES: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct RelayOptions {
@@ -490,6 +491,94 @@ async fn connect_bypass_upstream(
     bypass_profile_total: u8,
     resolver: Option<Arc<ResolverChain>>,
 ) -> Result<TcpStream> {
+    // 1. Try to get a connection from the pool
+    let pooled = {
+        let pool_map = BYPASS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Ok(mut guard) = pool_map.lock() {
+            if let Some(list) = guard.get_mut(&bypass_addr) {
+                list.pop()
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    let mut bypass = if let Some(s) = pooled {
+        debug!(target: "socks5", conn_id, bypass = %bypass_addr, "reusing pooled bypass connection");
+        s
+    } else {
+        // Background refill if pool is empty
+        let pool_addr = bypass_addr;
+        tokio::spawn(async move {
+            let pool_map = BYPASS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
+            let needs_refill = if let Ok(guard) = pool_map.lock() {
+                guard.get(&pool_addr).map(|l| l.len()).unwrap_or(0) < 2
+            } else {
+                false
+            };
+            if needs_refill {
+                if let Ok(Ok(s)) = tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(pool_addr)).await {
+                    let _ = s.set_nodelay(true);
+                    if let Ok(mut guard) = pool_map.lock() {
+                        guard.entry(pool_addr).or_default().push(s);
+                    }
+                }
+            }
+        });
+
+        let mut s_opt = None;
+        let mut last_e = None;
+        for retry in 0..3 {
+            let connect =
+                tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(bypass_addr)).await;
+            match connect {
+                Ok(Ok(s)) => {
+                    s_opt = Some(s);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    last_e = Some(e);
+                    if retry < 2 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+                Err(_) => {
+                    if retry < 2 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
+
+        match s_opt {
+            Some(s) => s,
+            None => {
+                let e = last_e.unwrap_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "bypass connect timeout")
+                });
+                warn!(
+                    target: "socks5",
+                    conn_id,
+                    destination = %target_label,
+                    bypass = %bypass_addr,
+                    error = %e,
+                    "bypass connect failed after retries"
+                );
+                record_bypass_profile_failure(
+                    target_label,
+                    bypass_profile_idx,
+                    bypass_profile_total,
+                    "connect-failed",
+                );
+                return Err(e.into());
+            }
+        }
+    };
+
+    let _ = bypass.set_nodelay(true);
+
     // DNS Resolution for Bypass:
     // Use our internal resolver (DoH) to get an IP, then pass that IP to the bypass proxy.
     // This prevents the bypass proxy from using poisoned system DNS.
@@ -510,55 +599,6 @@ async fn connect_bypass_upstream(
     };
 
     let addr_to_send = resolved_target_addr.as_ref().unwrap_or(&target.addr);
-
-    let mut bypass = None;
-    let mut last_e = None;
-    for retry in 0..3 {
-        let connect =
-            tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(bypass_addr)).await;
-        match connect {
-            Ok(Ok(s)) => {
-                bypass = Some(s);
-                break;
-            }
-            Ok(Err(e)) => {
-                last_e = Some(e);
-                if retry < 2 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }
-            Err(_) => {
-                if retry < 2 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }
-        }
-    }
-
-    let mut bypass = match bypass {
-        Some(s) => s,
-        None => {
-            let e = last_e.unwrap_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, "bypass connect timeout")
-            });
-            warn!(
-                target: "socks5",
-                conn_id,
-                destination = %target_label,
-                bypass = %bypass_addr,
-                error = %e,
-                "bypass connect failed after retries"
-            );
-            record_bypass_profile_failure(
-                target_label,
-                bypass_profile_idx,
-                bypass_profile_total,
-                "connect-failed",
-            );
-            return Err(e.into());
-        }
-    };
-    let _ = bypass.set_nodelay(true);
 
     if let Err(e) = bypass.write_all(&[0x05, 0x01, 0x00]).await {
         record_bypass_profile_failure(
@@ -788,6 +828,11 @@ fn maybe_mark_route_capability_failure(candidate: &RouteCandidate, err: &EngineE
     }
 
     if engine_error_is_network_unreachable(err) {
+        warn!(
+            target: "socks5.route",
+            family = candidate.family.label(),
+            "network unreachable (os error 10051/10065); disabling this IP family for 30 minutes"
+        );
         mark_route_capability_weak(
             candidate.kind,
             candidate.family,

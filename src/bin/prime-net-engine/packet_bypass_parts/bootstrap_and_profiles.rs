@@ -326,6 +326,19 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
     {
         let mut profiles = vec![
             PacketBypassProfile {
+                name: "discord-robust".to_owned(),
+                args: vec![
+                    "--port".to_owned(),
+                    find_free_port().to_string(),
+                    "--split".to_owned(),
+                    "1".to_owned(),
+                    "--tlsrec".to_owned(),
+                    "1+s".to_owned(),
+                    "--timeout".to_owned(),
+                    "10".to_owned(),
+                ],
+            },
+            PacketBypassProfile {
                 name: "clean-split-1".to_owned(),
                 args: vec![
                     "--port".to_owned(),
@@ -339,23 +352,12 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                 ],
             },
             PacketBypassProfile {
-                name: "clean-split-2".to_owned(),
+                name: "discord-optimized".to_owned(),
                 args: vec![
                     "--port".to_owned(),
                     find_free_port().to_string(),
                     "--split".to_owned(),
                     "2".to_owned(),
-                    "--tlsrec".to_owned(),
-                    "1+s".to_owned(),
-                    "--timeout".to_owned(),
-                    "10".to_owned(),
-                ],
-            },
-            PacketBypassProfile {
-                name: "tls-frag-only".to_owned(),
-                args: vec![
-                    "--port".to_owned(),
-                    find_free_port().to_string(),
                     "--tlsrec".to_owned(),
                     "1+s".to_owned(),
                     "--timeout".to_owned(),

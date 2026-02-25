@@ -37,7 +37,7 @@ async fn connect_via_best_route(
             let outbound = outbound.clone();
             let target = target_endpoint.clone();
             let destination = destination.to_owned();
-            let launch_delay_ms = route_race_candidate_delay_ms(idx, &candidate, has_direct);
+            let launch_delay_ms = route_race_candidate_delay_ms(idx, &candidate, has_direct, &destination);
             set.spawn(async move {
                 if launch_delay_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(launch_delay_ms)).await;
@@ -181,10 +181,21 @@ async fn connect_via_best_route(
     }))
 }
 
-fn route_race_candidate_delay_ms(idx: usize, candidate: &RouteCandidate, has_direct: bool) -> u64 {
-    let base = ROUTE_RACE_BASE_DELAY_MS.saturating_mul(idx as u64);
+fn route_race_candidate_delay_ms(idx: usize, candidate: &RouteCandidate, has_direct: bool, destination: &str) -> u64 {
+    let mut base = ROUTE_RACE_BASE_DELAY_MS.saturating_mul(idx as u64);
+    
+    // ACCELERATION: For YouTube and previews, reduce delay even further to avoid client-side timeouts (10053)
+    if destination.contains("ytimg") || destination.contains("googlevideo") || destination.contains("ggpht") {
+        base = base / 2;
+    }
+
     if has_direct && candidate.kind == RouteKind::Bypass {
-        base.saturating_add(ROUTE_RACE_DIRECT_HEADSTART_MS)
+        let headstart = if destination.contains("youtube") || destination.contains("discord") {
+            ROUTE_RACE_DIRECT_HEADSTART_MS / 2
+        } else {
+            ROUTE_RACE_DIRECT_HEADSTART_MS
+        };
+        base.saturating_add(headstart)
             .saturating_add(route_race_bypass_extra_delay_ms(candidate.source))
     } else {
         base

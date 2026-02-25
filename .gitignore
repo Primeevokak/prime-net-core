@@ -1,4 +1,5 @@
 /target
+/dist
 /.cargo-local
 /.cargo-local-test
 /.cargo-home-test
@@ -7,6 +8,23 @@
 .env
 .env.*
 !.env.example
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json.tmp
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Gemini CLI / Temp
+.gemini/
+/.home-tmp/
 
 # OS junk
 .DS_Store
