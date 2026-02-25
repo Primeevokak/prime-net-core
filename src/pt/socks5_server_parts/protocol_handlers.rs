@@ -266,7 +266,18 @@ async fn handle_http_proxy(
             return Ok(());
         }
 
-        let tuned = tune_relay_for_target(relay_opts, port, &destination, false, false);
+        let is_bypass = connected.candidate.kind == RouteKind::Bypass;
+        let mut tuned = tune_relay_for_target(relay_opts, port, &destination, false, false);
+        
+        // CRITICAL: If we are using a Bypass route, disable internal evasion to avoid "double fragmentation"
+        // which triggers antivirus resets and breaks Discord/Cloudflare.
+        if is_bypass {
+            tuned.options.fragment_client_hello = false;
+            tuned.options.tcp_window_trick = false;
+            tuned.options.sni_spoofing = false;
+            tuned.options.sni_case_toggle = false;
+        }
+
         match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options.clone()).await {
             Ok((bytes_client_to_upstream, bytes_upstream_to_client)) => {
                 if should_skip_empty_session_scoring(bytes_client_to_upstream, bytes_upstream_to_client)
@@ -574,7 +585,8 @@ fn tune_relay_for_target(
                                destination.contains("youtube") || destination.contains("ytimg") ||
                                destination.contains("googlevideo") || destination.contains("ggpht") ||
                                destination.contains("google.com") || destination.contains("discordapp") ||
-                               destination.contains("discord.gg");
+                               destination.contains("discord.gg") || destination.contains("cloudflare") ||
+                               destination.contains("aka.ms") || destination.contains("windowsupdate");
                                
         if is_very_sensitive {
             base.tcp_window_trick = true;

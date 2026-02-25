@@ -375,9 +375,20 @@ impl ResolverChain {
                 continue;
             }
 
-            if !self.cfg.bootstrap_ips.is_empty() {
+            let mut provider_bootstrap_ips = self.cfg.bootstrap_ips.clone();
+            
+            // Hardcoded safe fallbacks for common providers to avoid system DNS dependency
+            if host == "dns.google" && provider_bootstrap_ips.is_empty() {
+                provider_bootstrap_ips.extend(["8.8.8.8".parse::<IpAddr>().unwrap(), "8.8.4.4".parse::<IpAddr>().unwrap()]);
+            } else if host == "cloudflare-dns.com" && provider_bootstrap_ips.is_empty() {
+                provider_bootstrap_ips.extend(["1.1.1.1".parse::<IpAddr>().unwrap(), "1.0.0.1".parse::<IpAddr>().unwrap()]);
+            } else if host == "dns.quad9.net" && provider_bootstrap_ips.is_empty() {
+                provider_bootstrap_ips.extend(["9.9.9.9".parse::<IpAddr>().unwrap(), "149.112.112.112".parse::<IpAddr>().unwrap()]);
+            }
+
+            if !provider_bootstrap_ips.is_empty() {
                 // Prefer explicit bootstrap IPs to avoid leaking upstream resolution to system DNS.
-                for ip in self.cfg.bootstrap_ips.iter().copied() {
+                for ip in provider_bootstrap_ips.iter().copied() {
                     let mut ns =
                         NameServerConfig::new(std::net::SocketAddr::new(ip, 443), Protocol::Https);
                     ns.tls_dns_name = Some(host.clone());

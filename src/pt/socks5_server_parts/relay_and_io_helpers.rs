@@ -4,7 +4,7 @@ async fn relay_bidirectional(
     relay_opts: RelayOptions,
 ) -> std::io::Result<(u64, u64)> {
     if relay_opts.tcp_window_trick {
-        let _ = apply_tcp_window_size(client, 4096); // Increased from 512
+        let _ = apply_tcp_window_size(client, 8192); // Increased from 4096
     } else if relay_opts.tcp_window_size > 0 {
         let _ = apply_tcp_window_size(client, relay_opts.tcp_window_size);
     }
