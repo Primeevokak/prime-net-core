@@ -1,46 +1,21 @@
-use std::collections::HashMap;
-use std::fs;
-use std::io::ErrorKind;
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
-use rand::Rng;
-use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
-use tokio::task::JoinSet;
-use tokio::time::Duration;
-use tracing::{debug, error, info, warn};
-
-use crate::blocklist::expand_tilde;
-use crate::error::{EngineError, Result};
-use std::sync::Arc;
-use crate::anticensorship::ResolverChain;
-
-use super::{BoxStream, DynOutbound, TargetAddr, TargetEndpoint};
-
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 static WARNED_SOCKS4_LIMITATIONS: AtomicBool = AtomicBool::new(false);
 static WARNED_SOCKS4_AGGRESSIVE: AtomicBool = AtomicBool::new(false);
-static DEST_FAILURES: OnceLock<Mutex<HashMap<String, u8>>> = OnceLock::new();
-static DEST_PREFERRED_STAGE: OnceLock<Mutex<HashMap<String, u8>>> = OnceLock::new();
-static DEST_CLASSIFIER: OnceLock<Mutex<HashMap<String, DestinationClassifier>>> = OnceLock::new();
-static DEST_BYPASS_PROFILE_IDX: OnceLock<Mutex<HashMap<String, u8>>> = OnceLock::new();
-static DEST_BYPASS_PROFILE_FAILURES: OnceLock<Mutex<HashMap<String, u8>>> = OnceLock::new();
-static GLOBAL_BYPASS_PROFILE_HEALTH: OnceLock<Mutex<HashMap<String, BypassProfileHealth>>> =
+static DEST_FAILURES: OnceLock<DashMap<String, u8>> = OnceLock::new();
+static DEST_PREFERRED_STAGE: OnceLock<DashMap<String, u8>> = OnceLock::new();
+static DEST_CLASSIFIER: OnceLock<DashMap<String, DestinationClassifier>> = OnceLock::new();
+static DEST_BYPASS_PROFILE_IDX: OnceLock<DashMap<String, u8>> = OnceLock::new();
+static DEST_BYPASS_PROFILE_FAILURES: OnceLock<DashMap<String, u8>> = OnceLock::new();
+static GLOBAL_BYPASS_PROFILE_HEALTH: OnceLock<DashMap<String, BypassProfileHealth>> =
     OnceLock::new();
-static DEST_ROUTE_WINNER: OnceLock<Mutex<HashMap<String, RouteWinner>>> = OnceLock::new();
-static DEST_ROUTE_HEALTH: OnceLock<Mutex<HashMap<String, HashMap<String, RouteHealth>>>> =
+static DEST_ROUTE_WINNER: OnceLock<DashMap<String, RouteWinner>> = OnceLock::new();
+static DEST_ROUTE_HEALTH: OnceLock<DashMap<String, DashMap<String, RouteHealth>>> =
     OnceLock::new();
-static STAGE_RACE_STATS: OnceLock<Mutex<HashMap<u8, StageRaceStats>>> = OnceLock::new();
-static RACE_SOURCE_COUNTERS: OnceLock<Mutex<RaceSourceCounters>> = OnceLock::new();
-static ROUTE_METRICS: OnceLock<Mutex<RouteMetrics>> = OnceLock::new();
-static ROUTE_CAPABILITIES: OnceLock<Mutex<RouteCapabilities>> = OnceLock::new();
-static BYPASS_POOL: OnceLock<Mutex<HashMap<SocketAddr, Vec<TcpStream>>>> = OnceLock::new();
+static STAGE_RACE_STATS: OnceLock<DashMap<u8, StageRaceStats>> = OnceLock::new();
+static RACE_SOURCE_COUNTERS: OnceLock<RaceSourceCounters> = OnceLock::new();
+static ROUTE_METRICS: OnceLock<RwLock<RouteMetrics>> = OnceLock::new();
+static ROUTE_CAPABILITIES: OnceLock<RwLock<RouteCapabilities>> = OnceLock::new();
+static BYPASS_POOL: OnceLock<DashMap<SocketAddr, Vec<TcpStream>>> = OnceLock::new();
 static LAST_CLASSIFIER_EMIT_UNIX: AtomicU64 = AtomicU64::new(0);
 static CLASSIFIER_STORE_CFG: OnceLock<Option<ClassifierStoreConfig>> = OnceLock::new();
 static CLASSIFIER_STORE_LOADED: AtomicBool = AtomicBool::new(false);
@@ -214,11 +189,11 @@ struct StageRaceStats {
     failures: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 struct RaceSourceCounters {
-    cache: u64,
-    probe: u64,
-    adaptive: u64,
+    cache: AtomicU64,
+    probe: AtomicU64,
+    adaptive: AtomicU64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -492,38 +467,57 @@ async fn connect_bypass_upstream(
     resolver: Option<Arc<ResolverChain>>,
 ) -> Result<TcpStream> {
     // 1. Try to get a connection from the pool
-    let pooled = {
-        let pool_map = BYPASS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Ok(mut guard) = pool_map.lock() {
-            if let Some(list) = guard.get_mut(&bypass_addr) {
-                list.pop()
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    };
+    let mut pooled_bypass = None;
+    let pool_map = BYPASS_POOL.get_or_init(DashMap::new);
+    
+    loop {
+        let s_opt = pool_map.get_mut(&bypass_addr).and_then(|mut list| list.pop());
+        
+        let s = match s_opt {
+            Some(s) => s,
+            None => break,
+        };
 
-    let mut bypass = if let Some(s) = pooled {
-        debug!(target: "socks5", conn_id, bypass = %bypass_addr, "reusing pooled bypass connection");
+        // Liveness check: peek the socket to see if it's still alive.
+        // We use a micro-timeout to avoid hanging on empty sockets.
+        let mut buf = [0u8; 1];
+        match tokio::time::timeout(std::time::Duration::from_millis(1), s.peek(&mut buf)).await {
+            Ok(Ok(0)) => {
+                // Connection closed by peer
+                debug!(target: "socks5", conn_id, bypass = %bypass_addr, "discarding dead pooled connection");
+                continue;
+            }
+            Ok(Ok(_)) => {
+                // Has data - shouldn't happen for fresh SOCKS5, but it's alive
+                pooled_bypass = Some(s);
+                break;
+            }
+            Ok(Err(e)) => {
+                debug!(target: "socks5", conn_id, bypass = %bypass_addr, error = %e, "discarding unusable pooled connection");
+                continue;
+            }
+            Err(_) => {
+                // Timeout reached - this means the socket is alive and idle (EMPTY).
+                // This is exactly what we want for a pooled connection!
+                pooled_bypass = Some(s);
+                break;
+            }
+        }
+    }
+
+    let mut bypass = if let Some(s) = pooled_bypass {
+        debug!(target: "socks5", conn_id, bypass = %bypass_addr, "reusing live pooled bypass connection");
         s
     } else {
         // Background refill if pool is empty
         let pool_addr = bypass_addr;
         tokio::spawn(async move {
-            let pool_map = BYPASS_POOL.get_or_init(|| Mutex::new(HashMap::new()));
-            let needs_refill = if let Ok(guard) = pool_map.lock() {
-                guard.get(&pool_addr).map(|l| l.len()).unwrap_or(0) < 2
-            } else {
-                false
-            };
-            if needs_refill {
+            let pool_map = BYPASS_POOL.get_or_init(DashMap::new);
+            let current_len = pool_map.get(&pool_addr).map(|l| l.len()).unwrap_or(0);
+            if current_len < 4 { // Cap at 4 connections per bypass proxy
                 if let Ok(Ok(s)) = tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(pool_addr)).await {
                     let _ = s.set_nodelay(true);
-                    if let Ok(mut guard) = pool_map.lock() {
-                        guard.entry(pool_addr).or_default().push(s);
-                    }
+                    pool_map.entry(pool_addr).or_default().push(s);
                 }
             }
         });

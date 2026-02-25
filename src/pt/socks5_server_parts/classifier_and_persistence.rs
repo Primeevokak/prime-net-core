@@ -1,35 +1,28 @@
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn destination_failures(destination: &str) -> u8 {
-    let map = DEST_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
-    let Ok(guard) = map.lock() else {
-        return 0;
-    };
-    guard.get(destination).copied().unwrap_or(0)
+    let map = DEST_FAILURES.get_or_init(DashMap::new);
+    map.get(destination).map(|r| *r).unwrap_or(0)
 }
 
 fn destination_preferred_stage(destination: &str) -> u8 {
-    let map = DEST_PREFERRED_STAGE.get_or_init(|| Mutex::new(HashMap::new()));
-    let Ok(guard) = map.lock() else {
-        return 0;
-    };
-    guard.get(destination).copied().unwrap_or(0).min(4)
+    let map = DEST_PREFERRED_STAGE.get_or_init(DashMap::new);
+    map.get(destination).map(|r| *r).unwrap_or(0).min(4)
 }
 
 fn select_race_probe_stage(destination: &str) -> u8 {
-    // For the very first probe of a domain, always prefer Stage 1 (Safest).
-    // Aggressive Stage 2/3 probes can trigger resets (10054) on some sensitive services.
-    // Stage escalation will happen naturally if Stage 1 is detected as blocked.
     let _ = destination;
-
-    let stats = STAGE_RACE_STATS.get_or_init(|| Mutex::new(HashMap::new()));
-    let Ok(guard) = stats.lock() else {
-        return 1;
-    };
+    let stats = STAGE_RACE_STATS.get_or_init(DashMap::new);
     
-    // For new domains, never probe with Stage 3 or 4. They are too aggressive.
     let mut candidates = vec![1u8, 2u8]; 
     candidates.sort_by(|a, b| {
-        let sa = guard.get(a).cloned().unwrap_or_default();
-        let sb = guard.get(b).cloned().unwrap_or_default();
+        let sa = stats.get(a).map(|r| r.clone()).unwrap_or_default();
+        let sb = stats.get(b).map(|r| r.clone()).unwrap_or_default();
         let ra = stage_penalty(sa.successes, sa.failures);
         let rb = stage_penalty(sb.successes, sb.failures);
         ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
@@ -60,14 +53,12 @@ fn stable_hash(input: &str) -> u64 {
 }
 
 fn record_stage_source_selected(source: StageSelectionSource) {
-    let counters = RACE_SOURCE_COUNTERS.get_or_init(|| Mutex::new(RaceSourceCounters::default()));
-    if let Ok(mut guard) = counters.lock() {
-        match source {
-            StageSelectionSource::Cache => guard.cache = guard.cache.saturating_add(1),
-            StageSelectionSource::Probe => guard.probe = guard.probe.saturating_add(1),
-            StageSelectionSource::Adaptive => guard.adaptive = guard.adaptive.saturating_add(1),
-        }
-    }
+    let counters = RACE_SOURCE_COUNTERS.get_or_init(RaceSourceCounters::default);
+    match source {
+        StageSelectionSource::Cache => counters.cache.fetch_add(1, Ordering::Relaxed),
+        StageSelectionSource::Probe => counters.probe.fetch_add(1, Ordering::Relaxed),
+        StageSelectionSource::Adaptive => counters.adaptive.fetch_add(1, Ordering::Relaxed),
+    };
 }
 
 fn record_destination_failure(
@@ -77,13 +68,13 @@ fn record_destination_failure(
     stage: u8,
 ) {
     let now = now_unix_secs();
-    let map = DEST_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut failures_after_update = 0u8;
-    if let Ok(mut guard) = map.lock() {
-        let entry = guard.entry(destination.to_owned()).or_insert(0);
+    let failures_after_update = {
+        let map = DEST_FAILURES.get_or_init(DashMap::new);
+        let mut entry = map.entry(destination.to_owned()).or_insert(0);
         *entry = entry.saturating_add(1).min(8);
-        failures_after_update = *entry;
-    }
+        *entry
+    };
+
     if let Some(threshold) = learned_bypass_threshold(destination) {
         if failures_after_update == threshold {
             if let Some((host, port)) = split_host_port_for_connect(destination) {
@@ -104,26 +95,19 @@ fn record_destination_failure(
             }
         }
     }
-    let map = DEST_CLASSIFIER.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut guard) = map.lock() {
-        let stats = guard.entry(destination.to_owned()).or_default();
+
+    {
+        let map = DEST_CLASSIFIER.get_or_init(DashMap::new);
+        let mut stats = map.entry(destination.to_owned()).or_default();
         stats.failures = stats.failures.saturating_add(1);
         match signal {
             BlockingSignal::Reset => {
                 stats.resets = stats.resets.saturating_add(1);
-                
-                // AUTOMATION: If we see repeated resets, clear preferred stage to force a re-probe.
-                // This handles cases where an ISP starts blocking a previously working strategy,
-                // OR when a strategy is too aggressive and triggers a server-side reset (e.g. Stage 4).
                 let threshold = if stage >= 4 { 2 } else { 3 };
                 if stats.resets >= threshold {
-                    if let Ok(mut pref_guard) = DEST_PREFERRED_STAGE
-                        .get_or_init(|| Mutex::new(HashMap::new()))
-                        .lock()
-                    {
-                        if pref_guard.remove(destination).is_some() {
-                            warn!(target: "socks5.classifier", destination, stage, resets = stats.resets, "cleared preferred stage due to repeated resets (possibly strategy too aggressive)");
-                        }
+                    let pref_map = DEST_PREFERRED_STAGE.get_or_init(DashMap::new);
+                    if pref_map.remove(destination).is_some() {
+                        warn!(target: "socks5.classifier", destination, stage, resets = stats.resets, "cleared preferred stage due to repeated resets (possibly strategy too aggressive)");
                     }
                     stats.resets = 0;
                 }
@@ -145,22 +129,23 @@ fn record_destination_failure(
 
 fn record_destination_success(destination: &str, stage: u8, _source: StageSelectionSource) {
     let now = now_unix_secs();
-    let map = DEST_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut guard) = map.lock() {
-        if let Some(entry) = guard.get_mut(destination) {
+    {
+        let map = DEST_FAILURES.get_or_init(DashMap::new);
+        if let Some(mut entry) = map.get_mut(destination) {
             *entry = entry.saturating_sub(1);
             if *entry == 0 {
-                guard.remove(destination);
+                drop(entry);
+                map.remove(destination);
             }
         }
     }
-    let map = DEST_PREFERRED_STAGE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut guard) = map.lock() {
-        guard.insert(destination.to_owned(), stage.min(4));
+    {
+        let map = DEST_PREFERRED_STAGE.get_or_init(DashMap::new);
+        map.insert(destination.to_owned(), stage.min(4));
     }
-    let map = DEST_CLASSIFIER.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut guard) = map.lock() {
-        let stats = guard.entry(destination.to_owned()).or_default();
+    {
+        let map = DEST_CLASSIFIER.get_or_init(DashMap::new);
+        let mut stats = map.entry(destination.to_owned()).or_default();
         stats.successes = stats.successes.saturating_add(1);
         stats.last_seen_unix = now;
     }
@@ -172,14 +157,12 @@ fn record_stage_outcome(stage: u8, success: bool) {
     if stage == 0 {
         return;
     }
-    let stats = STAGE_RACE_STATS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut guard) = stats.lock() {
-        let entry = guard.entry(stage.min(4)).or_default();
-        if success {
-            entry.successes = entry.successes.saturating_add(1);
-        } else {
-            entry.failures = entry.failures.saturating_add(1);
-        }
+    let stats = STAGE_RACE_STATS.get_or_init(DashMap::new);
+    let mut entry = stats.entry(stage.min(4)).or_default();
+    if success {
+        entry.successes = entry.successes.saturating_add(1);
+    } else {
+        entry.failures = entry.failures.saturating_add(1);
     }
 }
 
@@ -228,52 +211,53 @@ fn maybe_emit_classifier_summary(interval_secs: u64) {
     {
         return;
     }
-    let map = DEST_CLASSIFIER.get_or_init(|| Mutex::new(HashMap::new()));
-    let Ok(guard) = map.lock() else {
-        return;
-    };
-    if !guard.is_empty() {
-        let mut entries: Vec<(&String, &DestinationClassifier)> = guard.iter().collect();
-        entries.sort_by_key(|(_, s)| std::cmp::Reverse(s.failures));
-        let top = entries.into_iter().take(3).collect::<Vec<_>>();
-        for (destination, s) in top {
-            info!(
-                target: "socks5.classifier",
-                destination = %destination,
-                failures = s.failures,
-                resets = s.resets,
-                timeouts = s.timeouts,
-                silent_drops = s.silent_drops,
-                early_closes = s.early_closes,
-                broken_pipes = s.broken_pipes,
-                suspicious_zero_replies = s.suspicious_zero_replies,
-                successes = s.successes,
-                "blocking classifier summary"
-            );
+    
+    {
+        let map = DEST_CLASSIFIER.get_or_init(DashMap::new);
+        if !map.is_empty() {
+            let mut entries: Vec<(String, DestinationClassifier)> = map.iter().map(|r| (r.key().clone(), r.value().clone())).collect();
+            entries.sort_by_key(|(_, s)| std::cmp::Reverse(s.failures));
+            let top = entries.into_iter().take(3).collect::<Vec<_>>();
+            for (destination, s) in top {
+                info!(
+                    target: "socks5.classifier",
+                    destination = %destination,
+                    failures = s.failures,
+                    resets = s.resets,
+                    timeouts = s.timeouts,
+                    silent_drops = s.silent_drops,
+                    early_closes = s.early_closes,
+                    broken_pipes = s.broken_pipes,
+                    suspicious_zero_replies = s.suspicious_zero_replies,
+                    successes = s.successes,
+                    "blocking classifier summary"
+                );
+            }
         }
     }
-    if let Ok(guard) = RACE_SOURCE_COUNTERS
-        .get_or_init(|| Mutex::new(RaceSourceCounters::default()))
-        .lock()
+
     {
-        let total = guard.cache + guard.probe + guard.adaptive;
+        let counters = RACE_SOURCE_COUNTERS.get_or_init(RaceSourceCounters::default);
+        let cache = counters.cache.load(Ordering::Relaxed);
+        let probe = counters.probe.load(Ordering::Relaxed);
+        let adaptive = counters.adaptive.load(Ordering::Relaxed);
+        let total = cache + probe + adaptive;
         if total > 0 {
             info!(
                 target: "socks5.classifier",
-                cache = guard.cache,
-                probe = guard.probe,
-                adaptive = guard.adaptive,
+                cache,
+                probe,
+                adaptive,
                 total,
                 "strategy selection source counters"
             );
         }
     }
-    if let Ok(guard) = STAGE_RACE_STATS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
+
     {
+        let stats_map = STAGE_RACE_STATS.get_or_init(DashMap::new);
         let mut stages: Vec<(u8, StageRaceStats)> =
-            guard.iter().map(|(k, v)| (*k, v.clone())).collect();
+            stats_map.iter().map(|r| (*r.key(), r.value().clone())).collect();
         stages.sort_by_key(|(stage, _)| *stage);
         for (stage, stats) in stages.into_iter().take(4) {
             let total = stats.successes + stats.failures;
@@ -291,9 +275,10 @@ fn maybe_emit_classifier_summary(interval_secs: u64) {
             );
         }
     }
+
     if let Ok(guard) = ROUTE_METRICS
-        .get_or_init(|| Mutex::new(RouteMetrics::default()))
-        .lock()
+        .get_or_init(|| RwLock::new(RouteMetrics::default()))
+        .read()
     {
         let selected_total = guard.route_selected_direct + guard.route_selected_bypass;
         let race_wins_total = guard.race_winner_direct + guard.race_winner_bypass;
@@ -339,22 +324,21 @@ fn maybe_emit_classifier_summary(interval_secs: u64) {
             );
         }
     }
-    if let Ok(guard) = GLOBAL_BYPASS_PROFILE_HEALTH
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
+
     {
-        if !guard.is_empty() {
-            let mut profiles: Vec<(&String, &BypassProfileHealth)> = guard.iter().collect();
+        let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(DashMap::new);
+        if !map.is_empty() {
+            let mut profiles: Vec<(String, BypassProfileHealth)> = map.iter().map(|r| (r.key().clone(), r.value().clone())).collect();
             profiles.sort_by(|a, b| {
-                let a_score = bypass_profile_score_from_health(a.1, now);
-                let b_score = bypass_profile_score_from_health(b.1, now);
-                b_score.cmp(&a_score).then_with(|| a.0.cmp(b.0))
+                let a_score = bypass_profile_score_from_health(&a.1, now);
+                let b_score = bypass_profile_score_from_health(&b.1, now);
+                b_score.cmp(&a_score).then_with(|| a.0.cmp(&b.0))
             });
             for (route_id, health) in profiles.into_iter().take(3) {
                 info!(
                     target: "socks5.classifier",
                     route = %route_id,
-                    score = bypass_profile_score_from_health(health, now),
+                    score = bypass_profile_score_from_health(&health, now),
                     successes = health.successes,
                     failures = health.failures,
                     connect_failures = health.connect_failures,
@@ -366,13 +350,6 @@ fn maybe_emit_classifier_summary(interval_secs: u64) {
         }
     }
     maybe_flush_classifier_store(false);
-}
-
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn init_classifier_store(relay_opts: &RelayOptions) {
@@ -411,38 +388,15 @@ fn load_classifier_store_if_needed() {
     };
     let now = now_unix_secs();
     let mut restored = 0usize;
-    let failures = DEST_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
-    let preferred = DEST_PREFERRED_STAGE.get_or_init(|| Mutex::new(HashMap::new()));
-    let classifier = DEST_CLASSIFIER.get_or_init(|| Mutex::new(HashMap::new()));
-    let bypass_idx = DEST_BYPASS_PROFILE_IDX.get_or_init(|| Mutex::new(HashMap::new()));
-    let bypass_failures = DEST_BYPASS_PROFILE_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
-    let route_health = DEST_ROUTE_HEALTH.get_or_init(|| Mutex::new(HashMap::new()));
-    let route_winner = DEST_ROUTE_WINNER.get_or_init(|| Mutex::new(HashMap::new()));
-    let global_bypass = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(|| Mutex::new(HashMap::new()));
-    let Ok(mut failures_guard) = failures.lock() else {
-        return;
-    };
-    let Ok(mut preferred_guard) = preferred.lock() else {
-        return;
-    };
-    let Ok(mut classifier_guard) = classifier.lock() else {
-        return;
-    };
-    let Ok(mut bypass_idx_guard) = bypass_idx.lock() else {
-        return;
-    };
-    let Ok(mut bypass_failures_guard) = bypass_failures.lock() else {
-        return;
-    };
-    let Ok(mut route_health_guard) = route_health.lock() else {
-        return;
-    };
-    let Ok(mut route_winner_guard) = route_winner.lock() else {
-        return;
-    };
-    let Ok(mut global_bypass_guard) = global_bypass.lock() else {
-        return;
-    };
+    let failures = DEST_FAILURES.get_or_init(DashMap::new);
+    let preferred = DEST_PREFERRED_STAGE.get_or_init(DashMap::new);
+    let classifier = DEST_CLASSIFIER.get_or_init(DashMap::new);
+    let bypass_idx = DEST_BYPASS_PROFILE_IDX.get_or_init(DashMap::new);
+    let bypass_failures = DEST_BYPASS_PROFILE_FAILURES.get_or_init(DashMap::new);
+    let route_health = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
+    let route_winner = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
+    let global_bypass = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(DashMap::new);
+
     let ClassifierSnapshot {
         entries,
         global_bypass_health,
@@ -455,27 +409,27 @@ fn load_classifier_store_if_needed() {
             continue;
         }
         if entry.failures > 0 {
-            failures_guard.insert(destination.clone(), entry.failures.min(8));
+            failures.insert(destination.clone(), entry.failures.min(8));
         }
         if entry.preferred_stage > 0 {
-            preferred_guard.insert(destination.clone(), entry.preferred_stage);
+            preferred.insert(destination.clone(), entry.preferred_stage);
         }
         if !destination_classifier_is_empty(&entry.stats) {
-            classifier_guard.insert(destination.clone(), entry.stats);
+            classifier.insert(destination.clone(), entry.stats);
         }
         if let Some(idx) = entry.bypass_profile_idx {
-            bypass_idx_guard.insert(destination.clone(), idx);
+            bypass_idx.insert(destination.clone(), idx);
         }
         if entry.bypass_profile_failures > 0 {
-            bypass_failures_guard.insert(destination.clone(), entry.bypass_profile_failures);
+            bypass_failures.insert(destination.clone(), entry.bypass_profile_failures);
         }
         if let Some(winner) = entry.route_winner.take() {
             if !winner.route_id.trim().is_empty() {
-                route_winner_guard.insert(destination.clone(), winner);
+                route_winner.insert(destination.clone(), winner);
             }
         }
         if !entry.route_health.is_empty() {
-            let mut per_route: HashMap<String, RouteHealth> = HashMap::new();
+            let per_route = DashMap::new();
             for (route_id, mut health) in entry.route_health {
                 let route_id = route_id.trim();
                 if route_id.is_empty() {
@@ -488,7 +442,7 @@ fn load_classifier_store_if_needed() {
                 per_route.insert(route_id.to_owned(), health);
             }
             if !per_route.is_empty() {
-                route_health_guard.insert(destination.clone(), per_route);
+                route_health.insert(destination.clone(), per_route);
             }
         }
         restored = restored.saturating_add(1);
@@ -505,7 +459,7 @@ fn load_classifier_store_if_needed() {
         if last_seen > 0 && now.saturating_sub(last_seen) > cfg.entry_ttl_secs {
             continue;
         }
-        global_bypass_guard.insert(route_id.to_owned(), health);
+        global_bypass.insert(route_id.to_owned(), health);
     }
     if restored > 0 {
         info!(
@@ -595,49 +549,24 @@ fn maybe_flush_classifier_store(force: bool) {
 }
 
 fn write_classifier_snapshot(cfg: &ClassifierStoreConfig) -> std::io::Result<()> {
-    let failures = DEST_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
-    let preferred = DEST_PREFERRED_STAGE.get_or_init(|| Mutex::new(HashMap::new()));
-    let classifier = DEST_CLASSIFIER.get_or_init(|| Mutex::new(HashMap::new()));
-    let bypass_idx = DEST_BYPASS_PROFILE_IDX.get_or_init(|| Mutex::new(HashMap::new()));
-    let bypass_failures = DEST_BYPASS_PROFILE_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
-    let route_health = DEST_ROUTE_HEALTH.get_or_init(|| Mutex::new(HashMap::new()));
-    let route_winner = DEST_ROUTE_WINNER.get_or_init(|| Mutex::new(HashMap::new()));
-    let global_bypass = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(|| Mutex::new(HashMap::new()));
-
-    let failures_guard = failures.lock().map_err(|_| {
-        std::io::Error::other("failed to lock destination failures while persisting classifier")
-    })?;
-    let preferred_guard = preferred.lock().map_err(|_| {
-        std::io::Error::other("failed to lock preferred stages while persisting classifier")
-    })?;
-    let classifier_guard = classifier.lock().map_err(|_| {
-        std::io::Error::other("failed to lock classifier stats while persisting classifier")
-    })?;
-    let bypass_idx_guard = bypass_idx.lock().map_err(|_| {
-        std::io::Error::other("failed to lock bypass profile index while persisting classifier")
-    })?;
-    let bypass_failures_guard = bypass_failures.lock().map_err(|_| {
-        std::io::Error::other("failed to lock bypass profile failures while persisting classifier")
-    })?;
-    let route_health_guard = route_health.lock().map_err(|_| {
-        std::io::Error::other("failed to lock route health while persisting classifier")
-    })?;
-    let route_winner_guard = route_winner.lock().map_err(|_| {
-        std::io::Error::other("failed to lock route winner while persisting classifier")
-    })?;
-    let global_bypass_guard = global_bypass.lock().map_err(|_| {
-        std::io::Error::other("failed to lock global bypass health while persisting classifier")
-    })?;
+    let failures = DEST_FAILURES.get_or_init(DashMap::new);
+    let preferred = DEST_PREFERRED_STAGE.get_or_init(DashMap::new);
+    let classifier = DEST_CLASSIFIER.get_or_init(DashMap::new);
+    let bypass_idx = DEST_BYPASS_PROFILE_IDX.get_or_init(DashMap::new);
+    let bypass_failures = DEST_BYPASS_PROFILE_FAILURES.get_or_init(DashMap::new);
+    let route_health = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
+    let route_winner = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
+    let global_bypass = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(DashMap::new);
 
     let now = now_unix_secs();
     let mut entries: HashMap<String, ClassifierSnapshotEntry> = HashMap::new();
-    for (destination, stats) in classifier_guard.iter() {
+    for r in classifier.iter() {
         entries.insert(
-            destination.clone(),
+            r.key().clone(),
             ClassifierSnapshotEntry {
                 failures: 0,
                 preferred_stage: 0,
-                stats: stats.clone(),
+                stats: r.value().clone(),
                 bypass_profile_idx: None,
                 bypass_profile_failures: 0,
                 route_winner: None,
@@ -645,39 +574,41 @@ fn write_classifier_snapshot(cfg: &ClassifierStoreConfig) -> std::io::Result<()>
             },
         );
     }
-    for (destination, value) in failures_guard.iter() {
-        entries.entry(destination.clone()).or_default().failures = (*value).min(8);
+    for r in failures.iter() {
+        entries.entry(r.key().clone()).or_default().failures = (*r.value()).min(8);
     }
-    for (destination, stage) in preferred_guard.iter() {
+    for r in preferred.iter() {
         entries
-            .entry(destination.clone())
+            .entry(r.key().clone())
             .or_default()
-            .preferred_stage = (*stage).min(4);
+            .preferred_stage = (*r.value()).min(4);
     }
-    for (destination, idx) in bypass_idx_guard.iter() {
+    for r in bypass_idx.iter() {
         entries
-            .entry(destination.clone())
+            .entry(r.key().clone())
             .or_default()
-            .bypass_profile_idx = Some(*idx);
+            .bypass_profile_idx = Some(*r.value());
     }
-    for (destination, value) in bypass_failures_guard.iter() {
+    for r in bypass_failures.iter() {
         entries
-            .entry(destination.clone())
+            .entry(r.key().clone())
             .or_default()
-            .bypass_profile_failures = *value;
+            .bypass_profile_failures = *r.value();
     }
-    for (destination, winner) in route_winner_guard.iter() {
-        if winner.route_id.trim().is_empty() {
+    for r in route_winner.iter() {
+        if r.value().route_id.trim().is_empty() {
             continue;
         }
-        entries.entry(destination.clone()).or_default().route_winner = Some(winner.clone());
+        entries.entry(r.key().clone()).or_default().route_winner = Some(r.value().clone());
     }
-    for (destination, per_route) in route_health_guard.iter() {
+    for r in route_health.iter() {
+        let (destination, per_route) = (r.key(), r.value());
         if per_route.is_empty() {
             continue;
         }
         let mut filtered = HashMap::new();
-        for (route_id, health) in per_route.iter() {
+        for hr in per_route.iter() {
+            let (route_id, health) = (hr.key(), hr.value());
             if route_id.trim().is_empty() || route_health_is_empty(health) {
                 continue;
             }
@@ -705,7 +636,8 @@ fn write_classifier_snapshot(cfg: &ClassifierStoreConfig) -> std::io::Result<()>
             || !entry.route_health.is_empty()
     });
     let mut global_bypass_health = HashMap::new();
-    for (route_id, health) in global_bypass_guard.iter() {
+    for r in global_bypass.iter() {
+        let (route_id, health) = (r.key(), r.value());
         let route_id = route_id.trim();
         if route_id.is_empty() || !route_id.starts_with("bypass:") {
             continue;

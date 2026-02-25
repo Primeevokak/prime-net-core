@@ -4,55 +4,34 @@ mod tests {
 
     fn clear_route_state_for_test(route_key: &str) {
         let service_key = route_service_key(route_key);
-        if let Ok(mut guard) = DEST_ROUTE_HEALTH
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-        {
-            guard.remove(route_key);
-            if let Some(service_key) = service_key.as_ref() {
-                guard.remove(service_key);
-            }
+        let health_map = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
+        health_map.remove(route_key);
+        if let Some(service_key) = service_key.as_ref() {
+            health_map.remove(service_key);
         }
-        if let Ok(mut guard) = DEST_ROUTE_WINNER
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-        {
-            guard.remove(route_key);
-            if let Some(service_key) = service_key.as_ref() {
-                guard.remove(service_key);
-            }
+        
+        let winner_map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
+        winner_map.remove(route_key);
+        if let Some(service_key) = service_key.as_ref() {
+            winner_map.remove(service_key);
         }
     }
 
     fn clear_global_bypass_health_for_test() {
-        if let Ok(mut guard) = GLOBAL_BYPASS_PROFILE_HEALTH
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-        {
-            guard.clear();
-        }
+        let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(DashMap::new);
+        map.clear();
     }
 
     fn clear_bypass_profile_state_for_test() {
-        if let Ok(mut guard) = DEST_BYPASS_PROFILE_IDX
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-        {
-            guard.clear();
-        }
-        if let Ok(mut guard) = DEST_BYPASS_PROFILE_FAILURES
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-        {
-            guard.clear();
-        }
+        let idx_map = DEST_BYPASS_PROFILE_IDX.get_or_init(DashMap::new);
+        idx_map.clear();
+        let fail_map = DEST_BYPASS_PROFILE_FAILURES.get_or_init(DashMap::new);
+        fail_map.clear();
     }
 
     fn clear_route_capabilities_for_test() {
-        if let Ok(mut guard) = ROUTE_CAPABILITIES
-            .get_or_init(|| Mutex::new(RouteCapabilities::default()))
-            .lock()
-        {
+        let map = ROUTE_CAPABILITIES.get_or_init(|| RwLock::new(RouteCapabilities::default()));
+        if let Ok(mut guard) = map.write() {
             *guard = RouteCapabilities::default();
         }
     }
@@ -170,18 +149,15 @@ mod tests {
         clear_route_state_for_test(&winner_route_key);
         clear_route_state_for_test(&probe_route_key);
         let service_key = route_service_key(&winner_route_key).expect("service key");
-        if let Ok(mut guard) = DEST_ROUTE_WINNER
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-        {
-            guard.insert(
-                service_key,
-                RouteWinner {
-                    route_id: "bypass:1".to_owned(),
-                    updated_at_unix: now_unix_secs(),
-                },
-            );
-        }
+        let winner_map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
+        winner_map.insert(
+            service_key,
+            RouteWinner {
+                route_id: "bypass:1".to_owned(),
+                updated_at_unix: now_unix_secs(),
+            },
+        );
+        
         let candidates = vec![
             RouteCandidate::direct("test"),
             RouteCandidate::bypass("test", "127.0.0.1:19080".parse().expect("addr"), 0, 1),
@@ -260,11 +236,8 @@ mod tests {
     #[test]
     fn learned_bypass_activates_after_failures_for_tls_domain() {
         let key = "learned-bypass-test.invalid:443".to_owned();
-        let map = DEST_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
-        {
-            let mut guard = map.lock().expect("lock failures map");
-            guard.insert(key.clone(), LEARNED_BYPASS_MIN_FAILURES_DOMAIN);
-        }
+        let map = DEST_FAILURES.get_or_init(DashMap::new);
+        map.insert(key.clone(), LEARNED_BYPASS_MIN_FAILURES_DOMAIN);
 
         assert!(should_bypass_by_classifier_host(
             "learned-bypass-test.invalid",
@@ -276,22 +249,16 @@ mod tests {
             80
         ));
 
-        {
-            let mut guard = map.lock().expect("lock failures map");
-            guard.remove(&key);
-        }
+        map.remove(&key);
     }
 
     #[test]
     fn learned_bypass_activates_for_public_ip_but_not_loopback() {
         let pub_key = "79.133.169.98:443".to_owned();
         let loopback_key = "127.0.0.1:443".to_owned();
-        let map = DEST_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
-        {
-            let mut guard = map.lock().expect("lock failures map");
-            guard.insert(pub_key.clone(), LEARNED_BYPASS_MIN_FAILURES_IP);
-            guard.insert(loopback_key.clone(), LEARNED_BYPASS_MIN_FAILURES_IP);
-        }
+        let map = DEST_FAILURES.get_or_init(DashMap::new);
+        map.insert(pub_key.clone(), LEARNED_BYPASS_MIN_FAILURES_IP);
+        map.insert(loopback_key.clone(), LEARNED_BYPASS_MIN_FAILURES_IP);
 
         assert!(should_bypass_by_classifier_ip(
             "79.133.169.98".parse().expect("ip"),
@@ -302,11 +269,8 @@ mod tests {
             443
         ));
 
-        {
-            let mut guard = map.lock().expect("lock failures map");
-            guard.remove(&pub_key);
-            guard.remove(&loopback_key);
-        }
+        map.remove(&pub_key);
+        map.remove(&loopback_key);
     }
 
     #[test]
@@ -326,12 +290,9 @@ mod tests {
     fn bypass_profile_index_uses_legacy_service_key_fallback() {
         clear_bypass_profile_state_for_test();
         let service_key = bypass_profile_legacy_service_key("api.github.com:443");
-        if let Ok(mut guard) = DEST_BYPASS_PROFILE_IDX
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-        {
-            guard.insert(service_key, 2);
-        }
+        let idx_map = DEST_BYPASS_PROFILE_IDX.get_or_init(DashMap::new);
+        idx_map.insert(service_key, 2);
+        
         assert_eq!(
             destination_bypass_profile_idx("collector.github.com:443", 3),
             2
@@ -406,16 +367,13 @@ mod tests {
             now_unix_secs()
         ));
 
-        if let Ok(mut guard) = DEST_ROUTE_HEALTH
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-        {
-            if let Some(per_route) = guard.get_mut(route_key) {
-                if let Some(entry) = per_route.get_mut(&candidate.route_id()) {
-                    entry.weak_until_unix = now_unix_secs().saturating_sub(1);
-                }
+        let health_map = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
+        if let Some(per_route) = health_map.get_mut(route_key) {
+            if let Some(mut entry) = per_route.get_mut(&candidate.route_id()) {
+                entry.weak_until_unix = now_unix_secs().saturating_sub(1);
             }
         }
+        
         assert!(!route_is_temporarily_weak(
             route_key,
             &candidate.route_id(),
@@ -432,18 +390,14 @@ mod tests {
     fn adaptive_route_reraces_when_cached_winner_is_unavailable() {
         let route_key = "adaptive-route-missing-winner:443";
         clear_route_state_for_test(route_key);
-        if let Ok(mut guard) = DEST_ROUTE_WINNER
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-        {
-            guard.insert(
-                route_key.to_owned(),
-                RouteWinner {
-                    route_id: "bypass:3".to_owned(),
-                    updated_at_unix: now_unix_secs(),
-                },
-            );
-        }
+        let winner_map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
+        winner_map.insert(
+            route_key.to_owned(),
+            RouteWinner {
+                route_id: "bypass:3".to_owned(),
+                updated_at_unix: now_unix_secs(),
+            },
+        );
 
         let candidates = vec![
             RouteCandidate::direct("test"),
@@ -460,18 +414,15 @@ mod tests {
     fn adaptive_route_skips_race_when_cached_winner_is_healthy() {
         let route_key = "adaptive-route-healthy-winner:443";
         clear_route_state_for_test(route_key);
-        if let Ok(mut guard) = DEST_ROUTE_WINNER
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-        {
-            guard.insert(
-                route_key.to_owned(),
-                RouteWinner {
-                    route_id: "direct".to_owned(),
-                    updated_at_unix: now_unix_secs(),
-                },
-            );
-        }
+        let winner_map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
+        winner_map.insert(
+            route_key.to_owned(),
+            RouteWinner {
+                route_id: "direct".to_owned(),
+                updated_at_unix: now_unix_secs(),
+            },
+        );
+        
         let candidates = vec![
             RouteCandidate::direct("test"),
             RouteCandidate::bypass("test", "127.0.0.1:19080".parse().expect("addr"), 0, 1),
@@ -532,28 +483,25 @@ mod tests {
     fn global_bypass_health_reorders_profiles_without_service_rules() {
         clear_global_bypass_health_for_test();
         let now = now_unix_secs();
-        if let Ok(mut guard) = GLOBAL_BYPASS_PROFILE_HEALTH
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-        {
-            guard.insert(
-                "bypass:1".to_owned(),
-                BypassProfileHealth {
-                    failures: 5,
-                    connect_failures: 2,
-                    last_failure_unix: now,
-                    ..BypassProfileHealth::default()
-                },
-            );
-            guard.insert(
-                "bypass:2".to_owned(),
-                BypassProfileHealth {
-                    successes: 6,
-                    last_success_unix: now,
-                    ..BypassProfileHealth::default()
-                },
-            );
-        }
+        let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(DashMap::new);
+        map.insert(
+            "bypass:1".to_owned(),
+            BypassProfileHealth {
+                failures: 5,
+                connect_failures: 2,
+                last_failure_unix: now,
+                ..BypassProfileHealth::default()
+            },
+        );
+        map.insert(
+            "bypass:2".to_owned(),
+            BypassProfileHealth {
+                successes: 6,
+                last_success_unix: now,
+                ..BypassProfileHealth::default()
+            },
+        );
+        
         let route_key = "global-bypass-health:443";
         clear_route_state_for_test(route_key);
         let candidates = vec![
@@ -687,29 +635,26 @@ mod tests {
     fn hard_weak_global_bypass_profiles_are_pruned_when_healthier_exists() {
         clear_global_bypass_health_for_test();
         let now = now_unix_secs();
-        if let Ok(mut guard) = GLOBAL_BYPASS_PROFILE_HEALTH
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-        {
-            guard.insert(
-                "bypass:1".to_owned(),
-                BypassProfileHealth {
-                    successes: 5,
-                    last_success_unix: now,
-                    ..BypassProfileHealth::default()
-                },
-            );
-            guard.insert(
-                "bypass:2".to_owned(),
-                BypassProfileHealth {
-                    failures: 40,
-                    connect_failures: 20,
-                    soft_zero_replies: 20,
-                    last_failure_unix: now,
-                    ..BypassProfileHealth::default()
-                },
-            );
-        }
+        let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(DashMap::new);
+        map.insert(
+            "bypass:1".to_owned(),
+            BypassProfileHealth {
+                successes: 5,
+                last_success_unix: now,
+                ..BypassProfileHealth::default()
+            },
+        );
+        map.insert(
+            "bypass:2".to_owned(),
+            BypassProfileHealth {
+                failures: 40,
+                connect_failures: 20,
+                soft_zero_replies: 20,
+                last_failure_unix: now,
+                ..BypassProfileHealth::default()
+            },
+        );
+        
         let route_key = "hard-weak-prune:443";
         clear_route_state_for_test(route_key);
         let candidates = vec![

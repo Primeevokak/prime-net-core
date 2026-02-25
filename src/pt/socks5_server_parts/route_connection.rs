@@ -195,11 +195,25 @@ fn route_race_candidate_delay_ms(idx: usize, candidate: &RouteCandidate, has_dir
         } else {
             ROUTE_RACE_DIRECT_HEADSTART_MS
         };
-        base.saturating_add(headstart)
-            .saturating_add(route_race_bypass_extra_delay_ms(candidate.source))
-    } else {
-        base
+        base = base.saturating_add(headstart)
+            .saturating_add(route_race_bypass_extra_delay_ms(candidate.source));
     }
+
+    // EXTRA PROTECTION: If multiple bypass profiles are in the race, give the "learned" one a headstart.
+    // Otherwise, a broken profile that handshakes fast will always win the race but fail the data phase.
+    if candidate.kind == RouteKind::Bypass {
+        let preferred_idx = destination_bypass_profile_idx(destination, candidate.bypass_profile_total);
+        if candidate.bypass_profile_idx != preferred_idx {
+            let penalty = if destination.contains("discord") || destination.contains("youtube") || destination.contains("google") {
+                500 // Strong preference for learned profile in critical groups
+            } else {
+                150
+            };
+            base = base.saturating_add(penalty);
+        }
+    }
+
+    base
 }
 
 fn route_race_launch_candidates(ordered: &[RouteCandidate]) -> Vec<RouteCandidate> {

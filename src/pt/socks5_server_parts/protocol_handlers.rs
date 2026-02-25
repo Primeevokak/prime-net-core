@@ -586,7 +586,8 @@ fn tune_relay_for_target(
                                destination.contains("googlevideo") || destination.contains("ggpht") ||
                                destination.contains("google.com") || destination.contains("discordapp") ||
                                destination.contains("discord.gg") || destination.contains("cloudflare") ||
-                               destination.contains("aka.ms") || destination.contains("windowsupdate");
+                               destination.contains("aka.ms") || destination.contains("windowsupdate") ||
+                               destination.contains("spotify");
                                
         if is_very_sensitive {
             base.tcp_window_trick = true;
@@ -789,8 +790,8 @@ fn route_capability_slot_mut(
 }
 
 fn route_capability_is_available(kind: RouteKind, family: RouteIpFamily, now: u64) -> bool {
-    let map = ROUTE_CAPABILITIES.get_or_init(|| Mutex::new(RouteCapabilities::default()));
-    let Ok(guard) = map.lock() else {
+    let map = ROUTE_CAPABILITIES.get_or_init(|| std::sync::RwLock::new(RouteCapabilities::default()));
+    let Ok(guard) = map.read() else {
         return true;
     };
     let until = match (kind, family) {

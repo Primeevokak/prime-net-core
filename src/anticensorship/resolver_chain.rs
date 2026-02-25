@@ -384,6 +384,8 @@ impl ResolverChain {
                 provider_bootstrap_ips.extend(["1.1.1.1".parse::<IpAddr>().unwrap(), "1.0.0.1".parse::<IpAddr>().unwrap()]);
             } else if host == "dns.quad9.net" && provider_bootstrap_ips.is_empty() {
                 provider_bootstrap_ips.extend(["9.9.9.9".parse::<IpAddr>().unwrap(), "149.112.112.112".parse::<IpAddr>().unwrap()]);
+            } else if host == "dns.adguard.com" && provider_bootstrap_ips.is_empty() {
+                provider_bootstrap_ips.extend(["94.140.14.14".parse::<IpAddr>().unwrap(), "94.140.15.15".parse::<IpAddr>().unwrap()]);
             }
 
             if !provider_bootstrap_ips.is_empty() {

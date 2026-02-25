@@ -326,16 +326,16 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
     {
         let mut profiles = vec![
             PacketBypassProfile {
-                name: "discord-robust".to_owned(),
+                name: "av-friendly".to_owned(),
                 args: vec![
                     "--port".to_owned(),
                     find_free_port().to_string(),
                     "--split".to_owned(),
-                    "1".to_owned(),
-                    "--tlsrec".to_owned(),
                     "1+s".to_owned(),
+                    "--tlsrec".to_owned(),
+                    "3+s".to_owned(),
                     "--timeout".to_owned(),
-                    "10".to_owned(),
+                    "5".to_owned(),
                 ],
             },
             PacketBypassProfile {
@@ -348,7 +348,7 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                     "--tlsrec".to_owned(),
                     "1+s".to_owned(),
                     "--timeout".to_owned(),
-                    "10".to_owned(),
+                    "5".to_owned(),
                 ],
             },
             PacketBypassProfile {
@@ -361,7 +361,7 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                     "--tlsrec".to_owned(),
                     "1+s".to_owned(),
                     "--timeout".to_owned(),
-                    "10".to_owned(),
+                    "5".to_owned(),
                 ],
             },
             PacketBypassProfile {
@@ -372,7 +372,7 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                     "--split".to_owned(),
                     "2".to_owned(),
                     "--timeout".to_owned(),
-                    "10".to_owned(),
+                    "5".to_owned(),
                 ],
             },
             PacketBypassProfile {
@@ -383,7 +383,7 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                     "--split".to_owned(),
                     "1+s".to_owned(),
                     "--timeout".to_owned(),
-                    "10".to_owned(),
+                    "5".to_owned(),
                 ],
             },
             PacketBypassProfile {
@@ -407,31 +407,33 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                     "--split".to_owned(),
                     "1".to_owned(),
                     "--timeout".to_owned(),
-                    "10".to_owned(),
+                    "5".to_owned(),
                 ],
             },
             PacketBypassProfile {
-                name: "aggressive-clean".to_owned(),
+                name: "discord-robust".to_owned(),
                 args: vec![
                     "--port".to_owned(),
                     find_free_port().to_string(),
                     "--split".to_owned(),
-                    "1+s".to_owned(),
+                    "1".to_owned(),
                     "--tlsrec".to_owned(),
-                    "3".to_owned(),
+                    "1+s".to_owned(),
                     "--timeout".to_owned(),
-                    "10".to_owned(),
+                    "5".to_owned(),
                 ],
             },
             PacketBypassProfile {
-                name: "huge-split".to_owned(),
+                name: "discord-disorder".to_owned(),
                 args: vec![
                     "--port".to_owned(),
                     find_free_port().to_string(),
                     "--split".to_owned(),
-                    "4".to_owned(),
+                    "1".to_owned(),
+                    "--disorder".to_owned(),
+                    "1".to_owned(),
                     "--timeout".to_owned(),
-                    "10".to_owned(),
+                    "5".to_owned(),
                 ],
             },
             PacketBypassProfile {
@@ -442,18 +444,20 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                     "--tlsrec".to_owned(),
                     "2".to_owned(),
                     "--timeout".to_owned(),
-                    "10".to_owned(),
+                    "5".to_owned(),
                 ],
             },
             PacketBypassProfile {
-                name: "super-safe-split".to_owned(),
+                name: "discord-oob".to_owned(),
                 args: vec![
                     "--port".to_owned(),
                     find_free_port().to_string(),
                     "--split".to_owned(),
-                    "1+s".to_owned(),
+                    "1".to_owned(),
+                    "--oob".to_owned(),
+                    "1".to_owned(),
                     "--timeout".to_owned(),
-                    "10".to_owned(),
+                    "5".to_owned(),
                 ],
             },
             PacketBypassProfile {
@@ -464,7 +468,7 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                     "--split".to_owned(),
                     "2".to_owned(),
                     "--timeout".to_owned(),
-                    "10".to_owned(),
+                    "5".to_owned(),
                 ],
             },
         ];
