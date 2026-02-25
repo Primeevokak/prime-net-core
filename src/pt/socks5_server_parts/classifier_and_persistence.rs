@@ -1,10 +1,3 @@
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 fn destination_failures(destination: &str) -> u8 {
     let map = DEST_FAILURES.get_or_init(DashMap::new);
     map.get(destination).map(|r| *r).unwrap_or(0)
@@ -199,6 +192,8 @@ fn should_mark_suspicious_zero_reply(
     port == 443 && bytes_upstream_to_client == 0 && bytes_client_to_upstream >= min_c2u as u64
 }
 
+static LAST_CLASSIFIER_EMIT_UNIX: AtomicU64 = AtomicU64::new(0);
+
 fn maybe_emit_classifier_summary(interval_secs: u64) {
     let now = now_unix_secs();
     let last = LAST_CLASSIFIER_EMIT_UNIX.load(Ordering::Relaxed);
@@ -352,16 +347,23 @@ fn maybe_emit_classifier_summary(interval_secs: u64) {
     maybe_flush_classifier_store(false);
 }
 
+static CLASSIFIER_STORE_CFG: OnceLock<Option<ClassifierStoreConfig>> = OnceLock::new();
+static CLASSIFIER_STORE_LOADED: AtomicBool = AtomicBool::new(false);
+static CLASSIFIER_STORE_DIRTY: AtomicBool = AtomicBool::new(false);
+static CLASSIFIER_STORE_LAST_FLUSH_UNIX: AtomicU64 = AtomicU64::new(0);
+const CLASSIFIER_PERSIST_DEBOUNCE_SECS: u64 = 30;
+
 fn init_classifier_store(relay_opts: &RelayOptions) {
     let _ = CLASSIFIER_STORE_CFG.get_or_init(|| {
         if !relay_opts.classifier_persist_enabled {
             return None;
         }
-        let path = relay_opts
-            .classifier_cache_path
-            .clone()
-            .map(|p| expand_tilde(&p))
-            .unwrap_or_else(default_classifier_store_path);
+        let path_str = relay_opts.classifier_cache_path.clone();
+        let path = if path_str.is_empty() {
+            default_classifier_store_path()
+        } else {
+            expand_tilde(&path_str)
+        };
         Some(ClassifierStoreConfig {
             path,
             entry_ttl_secs: relay_opts.classifier_entry_ttl_secs.max(60),
@@ -448,8 +450,8 @@ fn load_classifier_store_if_needed() {
         restored = restored.saturating_add(1);
     }
     for (route_id, health) in global_bypass_health {
-        let route_id = route_id.trim();
-        if route_id.is_empty() || !route_id.starts_with("bypass:") {
+        let route_id_trim = route_id.trim();
+        if route_id_trim.is_empty() || !route_id_trim.starts_with("bypass:") {
             continue;
         }
         if bypass_profile_health_is_empty(&health) {
@@ -459,7 +461,7 @@ fn load_classifier_store_if_needed() {
         if last_seen > 0 && now.saturating_sub(last_seen) > cfg.entry_ttl_secs {
             continue;
         }
-        global_bypass.insert(route_id.to_owned(), health);
+        global_bypass.insert(route_id_trim.to_owned(), health);
     }
     if restored > 0 {
         info!(
@@ -638,8 +640,8 @@ fn write_classifier_snapshot(cfg: &ClassifierStoreConfig) -> std::io::Result<()>
     let mut global_bypass_health = HashMap::new();
     for r in global_bypass.iter() {
         let (route_id, health) = (r.key(), r.value());
-        let route_id = route_id.trim();
-        if route_id.is_empty() || !route_id.starts_with("bypass:") {
+        let route_id_trim = route_id.trim();
+        if route_id_trim.is_empty() || !route_id_trim.starts_with("bypass:") {
             continue;
         }
         if bypass_profile_health_is_empty(health) {
@@ -649,7 +651,7 @@ fn write_classifier_snapshot(cfg: &ClassifierStoreConfig) -> std::io::Result<()>
         if last_seen > 0 && now.saturating_sub(last_seen) > cfg.entry_ttl_secs {
             continue;
         }
-        global_bypass_health.insert(route_id.to_owned(), health.clone());
+        global_bypass_health.insert(route_id_trim.to_owned(), health.clone());
     }
 
     let snapshot = ClassifierSnapshot {

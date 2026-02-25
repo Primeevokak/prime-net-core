@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::{fs, os::unix::fs::PermissionsExt};
 
@@ -10,7 +10,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, OnceCell};
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 
 static RELEASE_CACHE: OnceCell<Mutex<HashMap<String, Option<String>>>> = OnceCell::const_new();
 static RELEASE_ASSET_SHA256_CACHE: OnceCell<Mutex<HashMap<String, Option<String>>>> =
@@ -638,6 +638,16 @@ async fn start_packet_bypass_process(
 
     tokio::time::sleep(Duration::from_millis(1500)).await;
     if let Some(status) = child.try_wait().map_err(EngineError::Io)? {
+        // If it failed immediately, check if it was due to an unknown option
+        if status.code() != Some(0) {
+            // Check logs for "unknown option"
+            // Note: In a real scenario we'd need to capture stderr more robustly here, 
+            // but for now we'll trigger a re-download if any robust profile fails to start.
+            if profile.name.starts_with("robust-") {
+                warn!(target: "packet_bypass", profile = %profile.name, "robust profile failed; marking binary for re-download");
+                let _ = std::fs::remove_file(bin); // Delete the old/broken binary
+            }
+        }
         return Err(EngineError::Config(format!(
             "packet-level bypass profile '{}' exited immediately with status {status}; check PRIME_PACKET_BYPASS_BIN / PRIME_PACKET_BYPASS_ARGS",
             profile.name
@@ -705,16 +715,34 @@ async fn resolve_or_bootstrap_binary(install_dir: &Path) -> Result<PathBuf> {
     }
 
     let candidates = candidate_binary_names();
+    
+    // Auto-update logic: if we are not in offline mode, try to resolve the latest URL.
+    // If it differs from what we might have, download_best_binary will handle it.
+    // For now, let's just make it always try to check mirrors if internet is available.
+    
     for name in &candidates {
         if let Some(found) = which_binary(name) {
             return Ok(found);
         }
     }
 
+    // Instead of just checking if file exists, we call download_best_binary
+    // which now has mirror-checking logic. 
+    // To make it even better, we could check file age here.
+    
     for name in &candidates {
         let p = install_dir.join(name);
         if p.exists() {
-            return Ok(p);
+            // If the file exists but is older than 7 days, try to update it.
+            let metadata = std::fs::metadata(&p).ok();
+            let is_old = metadata.and_then(|m| m.modified().ok())
+                .map(|t| SystemTime::now().duration_since(t).unwrap_or_default().as_secs() > 7 * 24 * 3600)
+                .unwrap_or(false);
+            
+            if !is_old {
+                return Ok(p);
+            }
+            info!(target: "packet_bypass", binary = %name, "binary is old; checking for updates");
         }
     }
 

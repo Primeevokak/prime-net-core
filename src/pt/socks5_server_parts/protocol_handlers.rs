@@ -43,7 +43,7 @@ async fn handle_http_proxy(
     let mut parts = first_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_ascii_uppercase();
     let target = parts.next().unwrap_or_default();
-    let version = parts.next().unwrap_or("HTTP/1.1");
+    let _version = parts.next().unwrap_or("HTTP/1.1");
 
     if method == "CONNECT" {
         let Some((host, port)) = split_host_port_for_connect(target) else {
@@ -65,14 +65,19 @@ async fn handle_http_proxy(
             addr: target_addr,
             port,
         };
+        let target_label = route_decision_key(&destination, &target_endpoint.addr);
+        let candidates = select_route_candidates(&relay_opts, &target_endpoint.addr, target_endpoint.port, &target_label);
+        let ordered = ordered_route_candidates(&target_label, candidates);
+
         info!(target: "socks5", conn_id, peer = %peer, client = %client, destination = %destination, "HTTP CONNECT requested");
 
         let mut connected = match connect_via_best_route(
             conn_id,
+            &target_endpoint,
+            &target_label,
+            ordered,
             outbound.clone(),
             &relay_opts,
-            &target_endpoint,
-            &destination,
         )
         .await
         {
@@ -434,14 +439,7 @@ async fn handle_http_proxy(
         }
     };
 
-    let upstream_head = rewrite_http_forward_head(
-        &method,
-        version,
-        &parsed.request_uri,
-        request.as_ref(),
-        &parsed.host,
-        parsed.port,
-    );
+    let upstream_head = rewrite_http_forward_head(request.as_ref(), &parsed);
     out.write_all(upstream_head.as_bytes()).await?;
     if !buffered_body.is_empty() {
         out.write_all(buffered_body).await?;
@@ -774,20 +772,6 @@ fn route_state_key(destination: &str) -> String {
         return format!("{normalized_host}:{port}");
     }
     destination.trim().to_ascii_lowercase()
-}
-
-fn route_capability_slot_mut(
-    caps: &mut RouteCapabilities,
-    kind: RouteKind,
-    family: RouteIpFamily,
-) -> Option<&mut u64> {
-    match (kind, family) {
-        (RouteKind::Direct, RouteIpFamily::V4) => Some(&mut caps.direct_v4_weak_until_unix),
-        (RouteKind::Direct, RouteIpFamily::V6) => Some(&mut caps.direct_v6_weak_until_unix),
-        (RouteKind::Bypass, RouteIpFamily::V4) => Some(&mut caps.bypass_v4_weak_until_unix),
-        (RouteKind::Bypass, RouteIpFamily::V6) => Some(&mut caps.bypass_v6_weak_until_unix),
-        (_, RouteIpFamily::Any) => None,
-    }
 }
 
 fn route_capability_is_available(kind: RouteKind, family: RouteIpFamily, now: u64) -> bool {

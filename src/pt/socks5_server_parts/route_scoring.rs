@@ -13,13 +13,11 @@ fn route_health_score(route_key: &str, candidate: &RouteCandidate, now: u64) -> 
             _ => {}
         }
 
-        // Domain-specific "Meta" routing bonuses
         let bucket = host_service_bucket(route_key);
         if bucket == "meta-group:discord" {
             if candidate.kind == RouteKind::Direct {
-                bonus += 2000; // Prefer stable direct over flaky bypass for Discord
+                bonus += 2000;
             } else if candidate.bypass_profile_idx < 4 {
-                // Top 4 Robust profiles get a boost, but ONLY if they are not already failing for this domain
                 let is_failing = {
                     let map = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
                     map.get(route_key)
@@ -31,7 +29,7 @@ fn route_health_score(route_key: &str, candidate: &RouteCandidate, now: u64) -> 
                 }
             }
         } else if bucket == "meta-group:youtube" {
-            if candidate.bypass_profile_idx == 4 { // index 4 is clean-split-1, proven for YouTube
+            if candidate.bypass_profile_idx == 4 {
                 bonus += 50000;
             }
         }
@@ -108,8 +106,10 @@ fn should_reset_bypass_profile_health(health: &BypassProfileHealth, now: u64) ->
             return true;
         }
     }
-    if bypass_profile_score_from_health(health, now) < GLOBAL_BYPASS_HARD_WEAK_SCORE && now.saturating_sub(health.last_failure_unix) > 1800 {
-        return true;
+    if bypass_profile_score_from_health(health, now) < GLOBAL_BYPASS_HARD_WEAK_SCORE {
+        if now.saturating_sub(health.last_failure_unix) > 1800 {
+            return true;
+        }
     }
     false
 }
@@ -123,19 +123,14 @@ fn route_is_temporarily_weak(route_key: &str, route_id: &str, now: u64) -> bool 
 
 fn route_winner_for_key(route_key: &str) -> Option<RouteWinner> {
     let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
-    
-    // 1. Exact match
     if let Some(winner) = map.get(route_key) {
         return Some(winner.clone());
     }
-    
-    // 2. Service-level match (subdomain inheritance)
     if let Some(service_key) = route_service_key(route_key) {
         if let Some(winner) = map.get(&service_key) {
             return Some(winner.clone());
         }
     }
-    
     None
 }
 
@@ -156,13 +151,11 @@ fn ordered_route_candidates(
                 if score > GLOBAL_BYPASS_HARD_WEAK_SCORE {
                     return true;
                 }
-                
                 let bucket = host_service_bucket(route_key);
-                if (bucket == "meta-group:discord" && c.bypass_profile_idx == 0) ||
-                   (bucket == "meta-group:youtube" && c.bypass_profile_idx == 1) {
+                if (bucket == "meta-group:discord" && c.bypass_profile_idx < 4) ||
+                   (bucket == "meta-group:youtube" && c.bypass_profile_idx == 4) {
                     return true; 
                 }
-                
                 return false;
             }
             true
@@ -206,7 +199,7 @@ fn ordered_route_candidates(
         b_score
             .cmp(&a_score)
             .then_with(|| a.kind_rank().cmp(&b.kind_rank()))
-            .then_with(|| a.route_label().cmp(b.route_label()))
+            .then_with(|| a.route_label().cmp(&b.route_label()))
     });
     filtered
 }
@@ -225,8 +218,6 @@ fn route_race_decision(
     }
     let now = now_unix_secs();
 
-    // 1. FAST PATH: If the winner is a high-confidence learned Bypass, and it's a Meta-Group,
-    // skip race to avoid the 300-500ms overhead for concurrent assets (like YouTube previews).
     if let Some(winner_cand) = candidates.first() {
         if winner_cand.kind == RouteKind::Bypass && 
            (winner_cand.source == "learned-domain" || winner_cand.source == "learned-ip") &&
@@ -322,9 +313,7 @@ fn record_route_failure(route_key: &str, candidate: &RouteCandidate, reason: &'s
 
     if let Some(service_key) = route_service_key(route_key) {
         if service_key != route_key {
-            let entry_service = per_route.entry(route_id.clone()).or_default();
-            // Don't mark weak globally yet, but increment counter
-            drop(entry_service);
+            let _entry_service = per_route.entry(route_id.clone()).or_default();
         }
     }
     drop(per_route);
@@ -575,6 +564,32 @@ fn bypass_profile_legacy_service_key(destination: &str) -> String {
     destination.trim().to_ascii_lowercase()
 }
 
+fn bypass_profile_health_is_empty(health: &BypassProfileHealth) -> bool {
+    health.successes == 0
+        && health.failures == 0
+        && health.connect_failures == 0
+        && health.soft_zero_replies == 0
+        && health.io_errors == 0
+        && health.last_success_unix == 0
+        && health.last_failure_unix == 0
+}
+
+fn bypass_profile_health_last_seen_unix(health: &BypassProfileHealth) -> u64 {
+    health.last_success_unix.max(health.last_failure_unix)
+}
+
+fn learned_bypass_threshold(destination: &str) -> Option<u8> {
+    let (host, port) = split_host_port_for_connect(destination)?;
+    if port != 443 { return None; }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if is_bypassable_public_ip(ip) {
+            return Some(LEARNED_BYPASS_MIN_FAILURES_IP);
+        }
+        return None;
+    }
+    Some(LEARNED_BYPASS_MIN_FAILURES_DOMAIN)
+}
+
 fn select_bypass_source(
     relay_opts: &RelayOptions,
     target: &TargetAddr,
@@ -687,164 +702,38 @@ fn mark_route_capability_healthy(kind: RouteKind, family: RouteIpFamily) {
 }
 
 fn record_route_race_decision(race: bool, reason: RouteRaceReason) {
-    with_route_metrics(|m| {
+    if let Ok(mut m) = ROUTE_METRICS.get_or_init(|| RwLock::new(RouteMetrics::default())).write() {
         if race {
             m.race_started = m.race_started.saturating_add(1);
         } else {
             m.race_skipped = m.race_skipped.saturating_add(1);
         }
         match reason {
-            RouteRaceReason::NonTlsPort => {
-                m.race_reason_non_tls = m.race_reason_non_tls.saturating_add(1)
-            }
-            RouteRaceReason::SingleCandidate => {
-                m.race_reason_single_candidate = m.race_reason_single_candidate.saturating_add(1)
-            }
-            RouteRaceReason::NoWinner => {
-                m.race_reason_no_winner = m.race_reason_no_winner.saturating_add(1);
-                m.winner_cache_misses = m.winner_cache_misses.saturating_add(1);
-            }
-            RouteRaceReason::EmptyWinner => {
-                m.race_reason_empty_winner = m.race_reason_empty_winner.saturating_add(1);
-                m.winner_cache_misses = m.winner_cache_misses.saturating_add(1);
-            }
-            RouteRaceReason::WinnerStale => {
-                m.race_reason_winner_stale = m.race_reason_winner_stale.saturating_add(1);
-                m.winner_cache_misses = m.winner_cache_misses.saturating_add(1);
-            }
-            RouteRaceReason::WinnerMissingFromCandidates => {
-                m.race_reason_winner_missing = m.race_reason_winner_missing.saturating_add(1);
-                m.winner_cache_misses = m.winner_cache_misses.saturating_add(1);
-            }
-            RouteRaceReason::WinnerWeak => {
-                m.race_reason_winner_weak = m.race_reason_winner_weak.saturating_add(1);
-                m.winner_cache_misses = m.winner_cache_misses.saturating_add(1);
-            }
-            RouteRaceReason::WinnerHealthy => {
-                m.race_reason_winner_healthy = m.race_reason_winner_healthy.saturating_add(1);
-                m.winner_cache_hits = m.winner_cache_hits.saturating_add(1);
-            }
+            RouteRaceReason::NonTlsPort => m.race_reason_non_tls = m.race_reason_non_tls.saturating_add(1),
+            RouteRaceReason::SingleCandidate => m.race_reason_single_candidate = m.race_reason_single_candidate.saturating_add(1),
+            RouteRaceReason::NoWinner => { m.race_reason_no_winner = m.race_reason_no_winner.saturating_add(1); m.winner_cache_misses = m.winner_cache_misses.saturating_add(1); },
+            RouteRaceReason::EmptyWinner => { m.race_reason_empty_winner = m.race_reason_empty_winner.saturating_add(1); m.winner_cache_misses = m.winner_cache_misses.saturating_add(1); },
+            RouteRaceReason::WinnerStale => { m.race_reason_winner_stale = m.race_reason_winner_stale.saturating_add(1); m.winner_cache_misses = m.winner_cache_misses.saturating_add(1); },
+            RouteRaceReason::WinnerMissingFromCandidates => { m.race_reason_winner_missing = m.race_reason_winner_missing.saturating_add(1); m.winner_cache_misses = m.winner_cache_misses.saturating_add(1); },
+            RouteRaceReason::WinnerWeak => { m.race_reason_winner_weak = m.race_reason_winner_weak.saturating_add(1); m.winner_cache_misses = m.winner_cache_misses.saturating_add(1); },
+            RouteRaceReason::WinnerHealthy => { m.race_reason_winner_healthy = m.race_reason_winner_healthy.saturating_add(1); m.winner_cache_hits = m.winner_cache_hits.saturating_add(1); },
         }
-    });
-}
-
-fn route_race_reason_label(reason: RouteRaceReason) -> &'static str {
-    match reason {
-        RouteRaceReason::NonTlsPort => "non-tls-port",
-        RouteRaceReason::SingleCandidate => "single-candidate",
-        RouteRaceReason::NoWinner => "no-winner",
-        RouteRaceReason::EmptyWinner => "empty-winner",
-        RouteRaceReason::WinnerStale => "winner-stale",
-        RouteRaceReason::WinnerMissingFromCandidates => "winner-missing-from-candidates",
-        RouteRaceReason::WinnerWeak => "winner-weak",
-        RouteRaceReason::WinnerHealthy => "winner-healthy",
     }
 }
 
 fn record_route_selected(candidate: &RouteCandidate, raced: bool) {
-    with_route_metrics(|m| match candidate.kind {
-        RouteKind::Direct => {
-            m.route_selected_direct = m.route_selected_direct.saturating_add(1);
-            if raced {
-                m.race_winner_direct = m.race_winner_direct.saturating_add(1);
+    if let Ok(mut m) = ROUTE_METRICS.get_or_init(|| RwLock::new(RouteMetrics::default())).write() {
+        match candidate.kind {
+            RouteKind::Direct => {
+                m.route_selected_direct = m.route_selected_direct.saturating_add(1);
+                if raced { m.race_winner_direct = m.race_winner_direct.saturating_add(1); }
             }
-        }
-        RouteKind::Bypass => {
-            m.route_selected_bypass = m.route_selected_bypass.saturating_add(1);
-            if raced {
-                m.race_winner_bypass = m.race_winner_bypass.saturating_add(1);
-            }
-        }
-    });
-}
-
-fn with_route_metrics<F>(f: F)
-where
-    F: FnOnce(&mut RouteMetrics),
-{
-    if let Ok(mut guard) = ROUTE_METRICS
-        .get_or_init(|| RwLock::new(RouteMetrics::default()))
-        .write()
-    {
-        f(&mut guard);
-    }
-}
-
-fn should_skip_empty_session_scoring(
-    bytes_client_to_upstream: u64,
-    bytes_upstream_to_client: u64,
-) -> bool {
-    bytes_client_to_upstream == 0 && bytes_upstream_to_client == 0
-}
-
-fn should_mark_empty_bypass_session_as_soft_failure(candidate: &RouteCandidate, port: u16) -> bool {
-    if port != 443 || candidate.kind != RouteKind::Bypass {
-        return false;
-    }
-    
-    matches!(
-        candidate.source,
-        "builtin" | "learned-domain" | "learned-ip"
-    )
-}
-
-fn should_mark_bypass_profile_failure(
-    port: u16,
-    bytes_client_to_bypass: u64,
-    bytes_bypass_to_client: u64,
-    min_c2u: u64,
-) -> bool {
-    port == 443 && bytes_bypass_to_client == 0 && bytes_client_to_bypass >= min_c2u
-}
-
-fn should_mark_bypass_zero_reply_soft(
-    port: u16,
-    bytes_client_to_bypass: u64,
-    bytes_bypass_to_client: u64,
-    session_lifetime_ms: u64,
-) -> bool {
-    port == 443
-        && bytes_bypass_to_client == 0
-        && bytes_client_to_bypass >= ROUTE_SOFT_ZERO_REPLY_MIN_C2U
-        && session_lifetime_ms >= ROUTE_SOFT_ZERO_REPLY_MIN_LIFETIME_MS
-}
-
-fn record_bypass_profile_success(destination: &str, idx: u8) {
-    let key = bypass_profile_key(destination);
-    let service_key = bypass_profile_legacy_service_key(destination);
-    let idx_map = DEST_BYPASS_PROFILE_IDX.get_or_init(DashMap::new);
-    idx_map.insert(key.clone(), idx);
-    if service_key != key {
-        idx_map.insert(service_key.clone(), idx);
-    }
-    let fail_map = DEST_BYPASS_PROFILE_FAILURES.get_or_init(DashMap::new);
-    if let Some(mut entry) = fail_map.get_mut(&key) {
-        *entry = entry.saturating_sub(1);
-        if *entry == 0 {
-            drop(entry);
-            fail_map.remove(&key);
-        }
-    }
-    if service_key != key {
-        if let Some(mut entry) = fail_map.get_mut(&service_key) {
-            *entry = entry.saturating_sub(1);
-            if *entry == 0 {
-                drop(entry);
-                fail_map.remove(&service_key);
+            RouteKind::Bypass => {
+                m.route_selected_bypass = m.route_selected_bypass.saturating_add(1);
+                if raced { m.race_winner_bypass = m.race_winner_bypass.saturating_add(1); }
             }
         }
     }
-    maybe_flush_classifier_store(false);
-}
-
-fn should_mark_route_soft_zero_reply(
-    port: u16,
-    bytes_client_to_upstream: u64,
-    bytes_upstream_to_client: u64,
-) -> bool {
-    port == 443
-        && bytes_upstream_to_client == 0
-        && bytes_client_to_upstream >= ROUTE_SOFT_ZERO_REPLY_MIN_C2U
 }
 
 fn should_enable_universal_bypass_domain(host: &str) -> bool {
@@ -859,30 +748,4 @@ fn should_enable_universal_bypass_domain(host: &str) -> bool {
     if host.is_empty() || host == "localhost" || host.ends_with(".local") { return false; }
     if parse_ip_literal(&host).is_some() { return false; }
     host.contains('.')
-}
-
-fn learned_bypass_threshold(destination: &str) -> Option<u8> {
-    let (host, port) = split_host_port_for_connect(destination)?;
-    if port != 443 { return None; }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if is_bypassable_public_ip(ip) {
-            return Some(LEARNED_BYPASS_MIN_FAILURES_IP);
-        }
-        return None;
-    }
-    Some(LEARNED_BYPASS_MIN_FAILURES_DOMAIN)
-}
-
-fn bypass_profile_health_is_empty(health: &BypassProfileHealth) -> bool {
-    health.successes == 0
-        && health.failures == 0
-        && health.connect_failures == 0
-        && health.soft_zero_replies == 0
-        && health.io_errors == 0
-        && health.last_success_unix == 0
-        && health.last_failure_unix == 0
-}
-
-fn bypass_profile_health_last_seen_unix(health: &BypassProfileHealth) -> u64 {
-    health.last_success_unix.max(health.last_failure_unix)
 }

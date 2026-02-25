@@ -47,7 +47,7 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
     }
     let _proxy_cleanup = SystemProxyCleanupGuard::new(maybe_auto_configure_system_proxy(&cfg));
 
-    // If PT is enabled in config, reuse it and override bind if explicitly provided.
+    // Initialize Pluggable Transports if configured
     if let Some(ref mut pt) = cfg.pt {
         info!(target: "socks_cmd", pt_kind = ?pt.kind, bind = %pt.local_socks5_bind, "starting SOCKS with pluggable transport");
         if !opts.bind.trim().is_empty() {
@@ -64,41 +64,28 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
                 println!("SOCKS5 listening on {addr}");
                 println!("Hint (TUN): run tun2socks and point it to this SOCKS5 endpoint.");
 
-                // Keep the engine (and its PT server) alive.
                 let _keep = eng;
                 wait_for_shutdown().await;
                 return Ok(());
             }
             Err(e) => {
-                warn!(
-                    target: "socks_cmd",
-                    error = %e,
-                    "failed to start pluggable transport; falling back to direct SOCKS proxy"
-                );
-                eprintln!("warning: PT startup failed: {e}. Falling back to direct SOCKS mode.");
+                warn!(target: "socks_cmd", error = %e, "failed to start pluggable transport; falling back to internal relay mode");
             }
         }
     }
 
-    // No PT configured: run a plain direct SOCKS5 proxy (useful for tun2socks).
-    warn!(
-        target: "socks_cmd",
-        "pt is disabled: running direct SOCKS proxy (no pluggable transport; blocked destinations may remain blocked)"
-    );
+    // No PT: Initialize runtime blocklist and Packet Bypass (ciadpi)
     let blocklist_stats = initialize_runtime_blocklist(&cfg.blocklist).await?;
     log_runtime_blocklist_stats(&blocklist_stats);
 
     let packet_bypass = match maybe_start_packet_bypass(cfg.evasion.packet_bypass_enabled).await {
         Ok(g) => g,
         Err(e) => {
-            warn!(
-                target: "socks_cmd",
-                error = %e,
-                "packet-level bypass backend failed to start; continuing with relay-only direct mode"
-            );
+            warn!(target: "socks_cmd", error = %e, "packet-level bypass backend failed to start; using internal relay only");
             None
         }
     };
+
     let mut relay_opts = build_direct_relay_options(&cfg);
     if let Some(addrs) = packet_bypass
         .as_ref()
@@ -115,7 +102,10 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
             backends = relay_opts.bypass_socks5_pool.len(),
             "packet bypass active: blocked domains will be tunneled through ciadpi"
         );
+    } else if !relay_opts.fragment_client_hello {
+        warn!(target: "socks_cmd", "no bypass transport or internal evasion active; running as plain SOCKS5 proxy");
     }
+
     if relay_opts.fragment_client_hello {
         info!(
             target: "socks_cmd",
@@ -123,14 +113,14 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
             fragment_size_max = relay_opts.fragment_size_max,
             fragment_sleep_ms = relay_opts.fragment_sleep_ms,
             fragment_budget_bytes = relay_opts.fragment_budget_bytes,
-            split_at_sni = relay_opts.split_at_sni,
-            split_offsets = ?relay_opts.client_hello_split_offsets,
             "prime-mode is enabled (offline DPI bypass relay)"
         );
     }
+
     let resolver = Arc::new(ResolverChain::from_config(&cfg.anticensorship)?);
     let outbound =
         Arc::new(DirectOutbound::new(resolver).with_first_packet_ttl(cfg.evasion.first_packet_ttl));
+    
     let guard = start_socks5_server(&opts.bind, outbound, opts.silent_drop, relay_opts).await?;
     println!("SOCKS5 listening on {}", guard.listen_addr());
     println!("Hint (TUN): run tun2socks and point it to this SOCKS5 endpoint.");

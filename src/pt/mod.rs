@@ -24,10 +24,25 @@ pub enum TargetAddr {
     Domain(String),
 }
 
+impl std::fmt::Display for TargetAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ip(ip) => write!(f, "{}", ip),
+            Self::Domain(domain) => write!(f, "{}", domain),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TargetEndpoint {
     pub addr: TargetAddr,
     pub port: u16,
+}
+
+impl std::fmt::Display for TargetEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.addr, self.port)
+    }
 }
 
 pub trait OutboundConnector: Send + Sync {

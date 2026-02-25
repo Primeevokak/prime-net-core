@@ -27,7 +27,7 @@ use prime_net_engine_core::platform::diagnostics::{
 };
 use prime_net_engine_core::platform::system_proxy_manager;
 use prime_net_engine_core::platform::ProxyMode;
-use prime_net_engine_core::privacy::{privacy_level, PrivacyLevel};
+use prime_net_engine_core::privacy::{PrivacyLevel, privacy_level};
 use prime_net_engine_core::telemetry::tui_layer::TuiLayer;
 use prime_net_engine_core::tui::config_editor::{Action as ConfigAction, ConfigEditor, UxMode};
 use prime_net_engine_core::tui::connection_monitor::ConnectionMonitor;
@@ -69,7 +69,7 @@ enum UserMode {
 
 const AUTHOR_TELEGRAM_URL: &str = "https://t.me/o00000000i";
 
-struct App {
+pub(crate) struct App {
     tab: Tab,
     config_path: PathBuf,
     config_editor: ConfigEditor,
@@ -178,8 +178,8 @@ impl App {
         if self.config_editor.config.pt.is_none() {
             if packet_bypass_enabled {
                 out.push(DiagnosticResult::info(
-                    "Активен локальный обход (PT не требуется)",
-                    "Трафик заблокированных доменов идет через встроенные средства обхода",
+                    "Активен обход через Packet Bypass (ciadpi)",
+                    "Движок использует внешний бэкенд для десинхронизации пакетов",
                 ));
             } else {
                 out.push(DiagnosticResult::warn(

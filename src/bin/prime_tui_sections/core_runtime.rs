@@ -721,50 +721,42 @@ fn export_filtered_logs(app: &App, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn compose_status_line(app: &App) -> String {
-    let privacy = match privacy_level(&app.config_editor.config.privacy) {
-        PrivacyLevel::Low => "низкий",
-        PrivacyLevel::Medium => "средний",
-        PrivacyLevel::High => "высокий",
-    };
-    format!(
-        "{} | конфиг={} | пресет={} | приватность={}",
-        app.status_line,
-        app.config_path.display(),
-        detect_preset(&app.config_editor.config),
-        privacy
-    )
-}
+fn compose_status_line(app: &App) -> Line<'static> {
+    let mut spans = Vec::new();
+    
+    // 1. Core Process Status
+    let core_running = app.core_process.is_some();
+    if core_running {
+        spans.push(Span::styled(" ЯДРО: ВКЛ ", Style::default().bg(Color::Green).fg(Color::Black)));
+    } else {
+        spans.push(Span::styled(" ЯДРО: ВЫКЛ ", Style::default().bg(Color::Red).fg(Color::White)));
+    }
+    spans.push(Span::raw("  "));
 
-fn detect_preset(cfg: &EngineConfig) -> &'static str {
-    if cfg.privacy.tracker_blocker.enabled
-        && cfg.privacy.referer.enabled
-        && matches!(
-            cfg.privacy.referer.mode,
-            prime_net_engine_core::config::RefererMode::Strip
-        )
-    {
-        return "strict-privacy";
+    // 2. Mode Status
+    let cfg = &app.config_editor.config;
+    let pt_active = cfg.pt.is_some();
+    
+    // Check if we actually have active bypass backends in the log history or process state
+    // For now, we'll use a slightly smarter heuristic for the TUI
+    let packet_bypass_configured = cfg.evasion.packet_bypass_enabled;
+    let internal_relay_active = cfg.evasion.prime_mode || cfg.evasion.strategy.is_some();
+
+    if core_running && pt_active {
+        spans.push(Span::styled(" PT: АКТИВЕН ", Style::default().fg(Color::Cyan)));
+    } else if core_running && packet_bypass_configured {
+        // If it's configured but maybe failed, we show it in yellow to indicate 'trying' or 'fallback'
+        spans.push(Span::styled(" PACKET BYPASS: ВКЛ ", Style::default().fg(Color::Magenta)));
+    } else if core_running && internal_relay_active {
+        spans.push(Span::styled(" РЕЛЕ: АКТИВНО ", Style::default().fg(Color::Yellow)));
+    } else if core_running {
+        spans.push(Span::styled(" ПРОКСИ: DIRECT ", Style::default().fg(Color::Gray)));
     }
-    if cfg.privacy.referer.enabled
-        && matches!(
-            cfg.privacy.referer.mode,
-            prime_net_engine_core::config::RefererMode::OriginOnly
-        )
-        && !cfg.privacy.tracker_blocker.enabled
-    {
-        return "balanced-privacy";
-    }
-    if matches!(cfg.evasion.strategy, Some(EvasionStrategy::Auto))
-        && cfg.anticensorship.dot_enabled
-        && cfg.anticensorship.doq_enabled
-    {
-        return "aggressive-evasion";
-    }
-    if cfg.evasion.strategy.is_none() && cfg.anticensorship.system_dns_enabled {
-        return "max-compatibility";
-    }
-    "custom"
+
+    spans.push(Span::raw(" | "));
+    spans.push(Span::raw(app.status_line.clone()));
+
+    Line::from(spans)
 }
 
 fn parse_config_path(args: Vec<String>) -> Result<PathBuf> {
