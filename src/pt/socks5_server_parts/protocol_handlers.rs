@@ -566,41 +566,42 @@ fn tune_relay_for_target(
             source: StageSelectionSource::Adaptive,
         };
     }
-        let mut stage = if socks4_flow { 1u8 } else { 0u8 };
-        let preferred = destination_preferred_stage(destination);
-        let mut source = StageSelectionSource::Adaptive;
-        if preferred > 0 {
-            stage = stage.max(preferred);
-            source = StageSelectionSource::Cache;
-        }
-        
-        let failures = destination_failures(destination);
+    let mut stage = if socks4_flow { 1u8 } else { 0u8 };
+    let preferred = destination_preferred_stage(destination);
+    let mut source = StageSelectionSource::Adaptive;
+    if preferred > 0 {
+        stage = stage.max(preferred);
+        source = StageSelectionSource::Cache;
+    }
+    
+    let failures = destination_failures(destination);
     if preferred == 0 && failures == 0 && base.strategy_race_enabled && !socks4_flow {
         stage = select_race_probe_stage(destination);
         source = StageSelectionSource::Probe;
     }
     
-        let is_very_sensitive = destination.contains("discord") || destination.contains("instagram") || 
-                               destination.contains("facebook") || destination.contains("fbcdn") ||
-                               destination.contains("youtube") || destination.contains("ytimg") ||
-                               destination.contains("googlevideo") || destination.contains("ggpht") ||
-                               destination.contains("google.com") || destination.contains("discordapp") ||
-                               destination.contains("discord.gg") || destination.contains("cloudflare") ||
-                               destination.contains("aka.ms") || destination.contains("windowsupdate") ||
-                               destination.contains("spotify");
-                               
-        if is_very_sensitive {
-            base.tcp_window_trick = true;
-            if failures == 0 {
-                // Discord doesn't like Stage 4 fragmentation on some ISPs/AVs.
-                // Keep it at Stage 2 for Discord initially to be safe but effective.
-                if destination.contains("discord") {
-                    stage = stage.max(2);
-                } else {
-                    stage = stage.max(4);
-                }
+    let is_very_sensitive = destination.contains("discord") || destination.contains("instagram") || 
+                           destination.contains("facebook") || destination.contains("fbcdn") ||
+                           destination.contains("youtube") || destination.contains("ytimg") ||
+                           destination.contains("googlevideo") || destination.contains("ggpht") ||
+                           destination.contains("google.com") || destination.contains("discordapp") ||
+                           destination.contains("discord.gg") || destination.contains("cloudflare") ||
+                           destination.contains("aka.ms") || destination.contains("windowsupdate") ||
+                           destination.contains("spotify");
+                           
+    if is_very_sensitive {
+        base.tcp_window_trick = true;
+        if failures == 0 {
+            // Discord doesn't like Stage 4 fragmentation on some ISPs/AVs.
+            // Keep it at Stage 2 for Discord initially to be safe but effective.
+            // CRITICAL: For Discord, STICK to Stage 2. Do not escalate to 3 or 4.
+            if destination.contains("discord") || destination.contains("discordapp") || destination.contains("discord.gg") {
+                stage = 2; 
+            } else {
+                stage = stage.max(4);
             }
         }
+    }
 
     if failures >= base.stage1_failures {
         stage = stage.max(2); // Jump to Stage 2 immediately if Stage 1 failed
@@ -640,7 +641,7 @@ fn tune_relay_for_target(
             fragment_client_hello: true,
             fragment_size_min: 64,
             fragment_size_max: 128,
-            fragment_sleep_ms: base.fragment_sleep_ms.min(2),
+            fragment_sleep_ms: base.fragment_sleep_ms.max(5), // Increased sleep for stability
             fragment_budget_bytes: base.fragment_budget_bytes.clamp(4096, 8192),
             client_hello_split_offsets: vec![16, 32],
             ..base

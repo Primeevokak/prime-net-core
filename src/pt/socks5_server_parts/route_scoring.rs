@@ -15,10 +15,25 @@ fn route_health_score(route_key: &str, candidate: &RouteCandidate, now: u64) -> 
 
         // Domain-specific "Meta" routing bonuses
         let bucket = host_service_bucket(route_key);
-        if bucket == "meta-group:discord" && candidate.bypass_profile_idx == 0 {
-            bonus += 50000; // Force discord-robust
-        } else if bucket == "meta-group:youtube" && candidate.bypass_profile_idx == 1 {
-            bonus += 50000; // Force youtube-optimized
+        if bucket == "meta-group:discord" {
+            if candidate.kind == RouteKind::Direct {
+                bonus += 2000; // Prefer stable direct over flaky bypass for Discord
+            } else if candidate.bypass_profile_idx < 4 {
+                // Top 4 Robust profiles get a boost, but ONLY if they are not already failing for this domain
+                let is_failing = {
+                    let map = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
+                    map.get(route_key)
+                        .and_then(|m| m.get(&candidate.route_id()).map(|h| h.consecutive_failures >= 3))
+                        .unwrap_or(false)
+                };
+                if !is_failing {
+                    bonus += 50000; 
+                }
+            }
+        } else if bucket == "meta-group:youtube" {
+            if candidate.bypass_profile_idx == 4 { // index 4 is clean-split-1, proven for YouTube
+                bonus += 50000;
+            }
         }
     }
 
