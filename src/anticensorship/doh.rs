@@ -224,7 +224,7 @@ impl DoHResolver {
         dnssec_ok: bool,
     ) -> Result<DoHResolved> {
         let endpoint = provider.endpoint_url();
-        
+
         let (a_res, aaaa_res) = tokio::join!(
             self.query_record(&endpoint, domain, "A", dnssec_ok),
             self.query_record(&endpoint, domain, "AAAA", dnssec_ok)

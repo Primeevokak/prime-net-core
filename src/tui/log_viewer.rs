@@ -61,17 +61,18 @@ impl LogViewer {
     pub fn add_log(&self, entry: LogEntry) {
         let entry_size = entry.approx_size();
         let mut logs = self.logs.write();
-        
+
         let mut current_size = self.approx_size_bytes.load(Ordering::Relaxed);
         while current_size + entry_size > MAX_LOGS_SIZE_BYTES && !logs.is_empty() {
             if let Some(oldest) = logs.pop_front() {
                 current_size = current_size.saturating_sub(oldest.approx_size());
             }
         }
-        
+
         current_size += entry_size;
         logs.push_back(entry);
-        self.approx_size_bytes.store(current_size, Ordering::Relaxed);
+        self.approx_size_bytes
+            .store(current_size, Ordering::Relaxed);
         self.cache_dirty.store(true, Ordering::Relaxed);
     }
 
@@ -232,7 +233,7 @@ impl LogViewer {
 
     pub fn export_to_file(&self, path: &Path) -> Result<()> {
         let mut file = File::create(path)?;
-        
+
         // Dynamic system information header
         writeln!(file, "=== PRIME NET ENGINE LOG EXPORT ===")?;
         writeln!(
@@ -241,7 +242,11 @@ impl LogViewer {
             crate::version::APP_VERSION,
             std::env::consts::OS,
             std::env::consts::ARCH,
-            if cfg!(debug_assertions) { "debug" } else { "release" }
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
         )?;
         writeln!(file, "------------------------------------")?;
         writeln!(file)?;

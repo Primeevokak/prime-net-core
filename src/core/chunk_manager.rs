@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_RANGE, RANGE};
 use tokio::sync::Semaphore;
@@ -167,13 +167,42 @@ async fn download_chunk_with_retry(
     max_retries: usize,
 ) -> Result<Vec<u8>> {
     let mut last_error: Option<EngineError> = None;
-    for _ in 0..=max_retries {
+    for attempt in 0..=max_retries {
         match download_range(client, request, chunk).await {
             Ok(data) => return Ok(data),
-            Err(err) => last_error = Some(err),
+            Err(err) => {
+                let retryable = is_retryable_chunk_error(&err);
+                last_error = Some(err);
+                if !retryable || attempt >= max_retries {
+                    break;
+                }
+                tokio::time::sleep(chunk_retry_delay(attempt)).await;
+            }
         }
     }
     Err(last_error.unwrap_or_else(|| EngineError::Internal("chunk download failed".to_owned())))
+}
+
+fn is_retryable_chunk_error(err: &EngineError) -> bool {
+    match err {
+        EngineError::Http(e) => e.is_timeout() || e.is_connect() || e.is_request(),
+        EngineError::Io(e) => matches!(
+            e.kind(),
+            std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::WouldBlock
+        ),
+        _ => false,
+    }
+}
+
+fn chunk_retry_delay(attempt: usize) -> Duration {
+    let exp = 1u64 << attempt.min(5);
+    Duration::from_millis((100u64.saturating_mul(exp)).min(2_000))
 }
 
 async fn download_range(
@@ -261,5 +290,22 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_RANGE, HeaderValue::from_static("items 10-19/100"));
         assert!(parse_content_range(&headers).is_none());
+    }
+
+    #[test]
+    fn chunk_retry_delay_backoff_is_capped() {
+        assert_eq!(chunk_retry_delay(0), Duration::from_millis(100));
+        assert_eq!(chunk_retry_delay(1), Duration::from_millis(200));
+        assert_eq!(chunk_retry_delay(5), Duration::from_millis(2_000));
+        assert_eq!(chunk_retry_delay(10), Duration::from_millis(2_000));
+    }
+
+    #[test]
+    fn retryable_chunk_error_detection_matches_transient_io() {
+        let timeout_err =
+            EngineError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"));
+        let bad_input = EngineError::InvalidInput("bad".to_owned());
+        assert!(is_retryable_chunk_error(&timeout_err));
+        assert!(!is_retryable_chunk_error(&bad_input));
     }
 }

@@ -167,7 +167,7 @@ async fn download_to_path_supports_chunked_and_resume_parts() {
     // Pre-create the first part so the engine should resume (skip it).
     let parts_dir = PathBuf::from(format!("{}.prime.parts", out_path.to_string_lossy()));
     std::fs::create_dir_all(&parts_dir).expect("create parts dir");
-    
+
     // Create the resume.key that chunked download expects
     let mut hasher = sha2::Sha256::new();
     let url = format!("http://{addr}/file");
@@ -175,8 +175,12 @@ async fn download_to_path_supports_chunked_and_resume_parts() {
     hasher.update(b"\n");
     hasher.update((total_len as u64).to_le_bytes());
     let digest = hasher.finalize();
-    let resume_key = digest.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-    std::fs::write(parts_dir.join("resume.key"), format!("{}\n", resume_key)).expect("write resume key");
+    let resume_key = digest
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<String>();
+    std::fs::write(parts_dir.join("resume.key"), format!("{}\n", resume_key))
+        .expect("write resume key");
 
     let first_part_path = parts_dir.join("00000000.part");
     std::fs::write(&first_part_path, &data_arc[..1024 * 1024]).expect("write first part");

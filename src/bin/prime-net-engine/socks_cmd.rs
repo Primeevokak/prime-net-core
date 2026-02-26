@@ -120,7 +120,7 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
     let resolver = Arc::new(ResolverChain::from_config(&cfg.anticensorship)?);
     let outbound =
         Arc::new(DirectOutbound::new(resolver).with_first_packet_ttl(cfg.evasion.first_packet_ttl));
-    
+
     let guard = start_socks5_server(&opts.bind, outbound, opts.silent_drop, relay_opts).await?;
     println!("SOCKS5 listening on {}", guard.listen_addr());
     println!("Hint (TUN): run tun2socks and point it to this SOCKS5 endpoint.");

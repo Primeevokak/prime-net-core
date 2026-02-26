@@ -149,20 +149,27 @@ fn parse_entities_from_text(body: &str) -> (Vec<String>, Vec<String>) {
     let (mut d1, mut i1) = parse_entities_csv(body, b';');
     let (d2, i2) = parse_entities_csv(body, b',');
 
-    if d2.len() > d1.len() { d1 = d2; }
-    if i2.len() > i1.len() { i1 = i2; }
+    if d2.len() > d1.len() {
+        d1 = d2;
+    }
+    if i2.len() > i1.len() {
+        i1 = i2;
+    }
 
     // Fallback: if we got few domains from a large body, use regex
     if d1.len() < 20000 && body.len() > 1024 * 1024 {
-        let re_domain = regex::Regex::new(r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\b").expect("valid regex");
+        let re_domain =
+            regex::Regex::new(r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\b")
+                .expect("valid regex");
         for cap in re_domain.captures_iter(body) {
             let d = cap[0].to_ascii_lowercase();
             if looks_like_domain(&d) {
                 d1.push(d);
             }
         }
-        
-        let re_ip = regex::Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").expect("valid regex");
+
+        let re_ip =
+            regex::Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").expect("valid regex");
         for cap in re_ip.captures_iter(body) {
             let ip = cap[0].to_owned();
             if ip.parse::<std::net::IpAddr>().is_ok() {
@@ -203,7 +210,9 @@ fn pick_entities_from_record(record: &csv::StringRecord) -> (Vec<String>, Vec<St
         let candidate = normalize_domain_candidate(field);
         for part in candidate.split(|c: char| c == '|' || c.is_whitespace()) {
             let sub = normalize_domain_candidate(part);
-            if sub.is_empty() { continue; }
+            if sub.is_empty() {
+                continue;
+            }
             if sub.parse::<std::net::IpAddr>().is_ok() {
                 ips.push(sub);
             } else if looks_like_domain(&sub) {
@@ -229,7 +238,9 @@ fn parse_entities_legacy(body: &str) -> (Vec<String>, Vec<String>) {
     for line in body.lines() {
         for field in line.split_whitespace() {
             let sub = normalize_domain_candidate(field);
-            if sub.is_empty() { continue; }
+            if sub.is_empty() {
+                continue;
+            }
             if sub.parse::<std::net::IpAddr>().is_ok() {
                 ips.push(sub);
             } else if looks_like_domain(&sub) {

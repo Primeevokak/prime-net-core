@@ -154,7 +154,6 @@ impl ResolverChain {
         }))
     }
 
-
     /// Best-effort fetch of ECHConfigList bytes for `domain` via DNS HTTPS RR.
     ///
     /// The lookup follows the same configured resolver chain order as `resolve()`.
@@ -376,13 +375,12 @@ impl ResolverChain {
             }
 
             let mut provider_bootstrap_ips = self.cfg.bootstrap_ips.clone();
-            
+
             // Hardcoded safe fallbacks for common providers to avoid system DNS dependency
             if host == "dns.google" && provider_bootstrap_ips.is_empty() {
                 provider_bootstrap_ips.extend(fallback_ipv4s(&[[8, 8, 8, 8], [8, 8, 4, 4]]));
             } else if host == "cloudflare-dns.com" && provider_bootstrap_ips.is_empty() {
-                provider_bootstrap_ips
-                    .extend(fallback_ipv4s(&[[1, 1, 1, 1], [1, 0, 0, 1]]));
+                provider_bootstrap_ips.extend(fallback_ipv4s(&[[1, 1, 1, 1], [1, 0, 0, 1]]));
             } else if host == "dns.quad9.net" && provider_bootstrap_ips.is_empty() {
                 provider_bootstrap_ips
                     .extend(fallback_ipv4s(&[[9, 9, 9, 9], [149, 112, 112, 112]]));

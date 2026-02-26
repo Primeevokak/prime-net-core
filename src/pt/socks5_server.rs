@@ -6,9 +6,9 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{RwLock, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
+use std::sync::{OnceLock, RwLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -18,10 +18,10 @@ use tokio::task::JoinSet;
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
+use crate::anticensorship::ResolverChain;
 use crate::blocklist::expand_tilde;
 use crate::error::{EngineError, Result};
-use crate::anticensorship::ResolverChain;
-use crate::pt::{OutboundConnector, DynOutbound, BoxStream, TargetAddr, TargetEndpoint};
+use crate::pt::{BoxStream, DynOutbound, OutboundConnector, TargetAddr, TargetEndpoint};
 
 // use super::{BoxStream, DynOutbound, TargetAddr, TargetEndpoint};
 
@@ -84,28 +84,31 @@ pub struct UdpDestinationPolicy {
 }
 
 // Semantically grouped sections for SOCKS5 PT server.
-#[path = "socks5_server_parts/state_and_startup.rs"]
-mod state_and_startup;
-#[path = "socks5_server_parts/route_connection.rs"]
-mod route_connection;
+#[path = "socks5_server_parts/classifier_and_persistence.rs"]
+mod classifier_and_persistence;
+#[cfg(test)]
+#[path = "socks5_server_parts/evasion_tests.rs"]
+mod evasion_tests;
+#[path = "socks5_server_parts/ml_shadow.rs"]
+mod ml_shadow;
 #[path = "socks5_server_parts/protocol_handlers.rs"]
 mod protocol_handlers;
 #[path = "socks5_server_parts/protocol_socks4.rs"]
 mod protocol_socks4;
-#[path = "socks5_server_parts/route_scoring.rs"]
-mod route_scoring;
-#[path = "socks5_server_parts/classifier_and_persistence.rs"]
-mod classifier_and_persistence;
 #[path = "socks5_server_parts/relay_and_io_helpers.rs"]
 mod relay_and_io_helpers;
-#[cfg(test)]
-#[path = "socks5_server_parts/evasion_tests.rs"]
-mod evasion_tests;
+#[path = "socks5_server_parts/route_connection.rs"]
+mod route_connection;
+#[path = "socks5_server_parts/route_scoring.rs"]
+mod route_scoring;
+#[path = "socks5_server_parts/state_and_startup.rs"]
+mod state_and_startup;
 #[cfg(test)]
 #[path = "socks5_server_parts/tests.rs"]
 mod tests;
 
 use classifier_and_persistence::*;
+use ml_shadow::*;
 use protocol_handlers::*;
 use protocol_socks4::*;
 use relay_and_io_helpers::*;
@@ -113,4 +116,4 @@ use route_connection::*;
 use route_scoring::*;
 use state_and_startup::*;
 
-pub use state_and_startup::{RelayOptions, Socks5ServerGuard, start_socks5_server};
+pub use state_and_startup::{start_socks5_server, RelayOptions, Socks5ServerGuard};

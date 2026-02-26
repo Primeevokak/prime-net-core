@@ -350,7 +350,9 @@ pub unsafe extern "C" fn prime_request_wait(
                 }
                 Ok(Err(err)) => {
                     let mut code = error_code_from(&err);
-                    if err.to_string() == "timeout" { code = PRIME_ERR_RUNTIME; }
+                    if err.to_string() == "timeout" {
+                        code = PRIME_ERR_RUNTIME;
+                    }
                     inner
                         .status
                         .store(PrimeRequestStatus::FAILED as u8, Ordering::SeqCst);

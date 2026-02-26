@@ -14,6 +14,8 @@ use tracing::{info, warn};
 
 static RELEASE_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
 static RELEASE_ASSET_SHA256_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+const PACKET_BYPASS_REPO: &str = "hufrea/byedpi";
+const PACKET_BYPASS_STABLE_TAG: &str = "v0.17.3";
 
 #[derive(Debug)]
 pub struct PacketBypassGuard {
@@ -99,18 +101,56 @@ pub fn candidate_binary_names() -> Vec<String> {
 }
 
 pub async fn build_mirror_urls(_name: &str) -> Vec<String> {
-    let repo = "hufrea/byedpi";
-    let tag = match get_latest_release_tag(repo).await {
-        Ok(Some(t)) => t,
-        _ => "v0.17.3".to_owned(),
-    };
-    let asset_name = if cfg!(windows) {
-        format!("byedpi-{}-x86_64-w64.zip", tag.trim_start_matches('v').replace('.', ""))
+    let tag = if let Ok(v) = std::env::var("PRIME_PACKET_BYPASS_TAG") {
+        let pinned = v.trim().to_owned();
+        if pinned.is_empty() {
+            PACKET_BYPASS_STABLE_TAG.to_owned()
+        } else {
+            pinned
+        }
     } else {
-        format!("byedpi-{}-x86_64-linux.zip", tag.trim_start_matches('v').replace('.', ""))
+        match get_latest_release_tag(PACKET_BYPASS_REPO).await {
+            Ok(Some(t)) => t,
+            _ => PACKET_BYPASS_STABLE_TAG.to_owned(),
+        }
     };
-    let asset_name = asset_name.replace("173", "17.3"); 
-    vec![format!("https://github.com/{repo}/releases/download/{tag}/{asset_name}")]
+    let version = release_asset_version(&tag);
+    let compact = version.replace('.', "");
+    let mut assets = Vec::new();
+    if cfg!(windows) {
+        assets.push(format!("byedpi-{version}-x86_64-w64.zip"));
+        if compact != version {
+            assets.push(format!("byedpi-{compact}-x86_64-w64.zip"));
+        }
+    } else {
+        assets.push(format!("byedpi-{version}-x86_64-linux.zip"));
+        if compact != version {
+            assets.push(format!("byedpi-{compact}-x86_64-linux.zip"));
+        }
+    }
+    assets
+        .into_iter()
+        .map(|asset| format!("https://github.com/{}/releases/download/{tag}/{asset}", PACKET_BYPASS_REPO))
+        .collect()
+}
+
+fn release_asset_version(tag: &str) -> String {
+    let trimmed = tag.trim().trim_start_matches(['v', 'V']);
+    if trimmed.is_empty() {
+        return PACKET_BYPASS_STABLE_TAG
+            .trim_start_matches('v')
+            .trim_start_matches("0.")
+            .to_owned();
+    }
+    let mut parts: Vec<&str> = trimmed.split('.').filter(|p| !p.is_empty()).collect();
+    let numeric = parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit()));
+    if numeric && parts.first().copied() == Some("0") && parts.len() > 1 {
+        parts.remove(0);
+    }
+    if numeric && !parts.is_empty() {
+        return parts.join(".");
+    }
+    trimmed.to_owned()
 }
 
 async fn get_latest_release_tag(repo: &str) -> Result<Option<String>> {
@@ -156,13 +196,45 @@ fn packet_bypass_enabled(enabled_by_config: bool) -> bool {
 fn resolve_packet_profiles() -> Vec<PacketBypassProfile> {
     if let Ok(v) = std::env::var("PRIME_PACKET_BYPASS_ARGS") {
         if !v.trim().is_empty() {
-            return vec![PacketBypassProfile {
-                name: "env".to_owned(),
-                args: v.split_whitespace().map(|s| s.to_owned()).collect(),
-            }];
+            let parsed = parse_env_packet_profiles(&v);
+            if !parsed.is_empty() {
+                return parsed;
+            }
         }
     }
     default_bypass_profiles()
+}
+
+fn parse_env_packet_profiles(raw: &str) -> Vec<PacketBypassProfile> {
+    let chunks: Vec<&str> = raw
+        .split(|c| c == ';' || c == '\n')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if chunks.is_empty() {
+        return Vec::new();
+    }
+
+    if chunks.len() == 1 {
+        return vec![PacketBypassProfile {
+            name: "env".to_owned(),
+            args: chunks[0]
+                .split_whitespace()
+                .map(|s| s.to_owned())
+                .collect(),
+        }];
+    }
+
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(idx, chunk)| PacketBypassProfile {
+            name: format!("env-{}", idx + 1),
+            args: chunk.split_whitespace().map(|s| s.to_owned()).collect(),
+        })
+        .filter(|profile| !profile.args.is_empty())
+        .collect()
 }
 
 fn find_free_port() -> u16 {
@@ -185,9 +257,44 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
     #[cfg(target_os = "windows")]
     {
         let mut profiles = vec![
-            PacketBypassProfile { name: "clean-split-1".to_owned(), args: vec!["--split".into(), "1".into(), "--timeout".into(), "10".into()] },
-            PacketBypassProfile { name: "tlsrec-1s".to_owned(), args: vec!["--tlsrec".into(), "1+s".into(), "--timeout".into(), "10".into()] },
-            PacketBypassProfile { name: "discord-optimized".to_owned(), args: vec!["--split".into(), "1".into(), "--tlsrec".into(), "1+s".into(), "--timeout".into(), "10".into()] },
+            PacketBypassProfile {
+                name: "stable-split-disorder".to_owned(),
+                args: vec![
+                    "--split".into(),
+                    "1+s".into(),
+                    "--disorder".into(),
+                    "3+s".into(),
+                    "--auto=torst".into(),
+                    "--timeout".into(),
+                    "10".into(),
+                ],
+            },
+            PacketBypassProfile {
+                name: "stable-disorder-fake".to_owned(),
+                args: vec![
+                    "--disorder".into(),
+                    "1".into(),
+                    "--fake".into(),
+                    "-1".into(),
+                    "--auto=torst".into(),
+                    "--timeout".into(),
+                    "10".into(),
+                ],
+            },
+            PacketBypassProfile {
+                name: "stable-auto-tlsrec".to_owned(),
+                args: vec![
+                    "--split".into(),
+                    "1+s".into(),
+                    "--disorder".into(),
+                    "3+s".into(),
+                    "--auto=torst".into(),
+                    "--timeout".into(),
+                    "3".into(),
+                    "--tlsrec".into(),
+                    "3+s".into(),
+                ],
+            },
         ];
         for p in &mut profiles { set_port_arg(&mut p.args, find_free_port()); }
         profiles
@@ -231,4 +338,32 @@ async fn resolve_or_bootstrap_binary(install_dir: &Path) -> Result<PathBuf> {
     let p = install_dir.join(name);
     if p.exists() { return Ok(p); }
     download_best_binary(install_dir).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_asset_version_strips_v_and_leading_zero_major() {
+        assert_eq!(release_asset_version("v0.17.3"), "17.3");
+        assert_eq!(release_asset_version("0.13.1"), "13.1");
+        assert_eq!(release_asset_version("v1.2.3"), "1.2.3");
+    }
+
+    #[test]
+    fn release_asset_version_keeps_non_numeric_tags() {
+        assert_eq!(release_asset_version("nightly-2025-10-01"), "nightly-2025-10-01");
+    }
+
+    #[test]
+    fn parse_env_packet_profiles_supports_multiple_entries() {
+        let raw = "--disorder 1 --fake -1; --split 1+s --auto=torst";
+        let parsed = parse_env_packet_profiles(raw);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "env-1");
+        assert_eq!(parsed[1].name, "env-2");
+        assert!(parsed[0].args.iter().any(|a| a == "--fake"));
+        assert!(parsed[1].args.iter().any(|a| a == "--split"));
+    }
 }

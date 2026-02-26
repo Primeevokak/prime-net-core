@@ -141,7 +141,10 @@ pub async fn run_wizard(opts: &WizardOpts) -> Result<()> {
             }
             println!();
         } else {
-            let sz = prompt_u64("fragment_size_max (bytes)", cfg.evasion.fragment_size_max as u64)?;
+            let sz = prompt_u64(
+                "fragment_size_max (bytes)",
+                cfg.evasion.fragment_size_max as u64,
+            )?;
             cfg.evasion.fragment_size_max = sz as usize;
         }
     }

@@ -13,8 +13,8 @@ pub(super) fn destination_preferred_stage(destination: &str) -> u8 {
 pub(super) fn select_race_probe_stage(destination: &str) -> u8 {
     let _ = destination;
     let stats = STAGE_RACE_STATS.get_or_init(DashMap::new);
-    
-    let mut candidates = vec![1u8, 2u8]; 
+
+    let mut candidates = vec![1u8, 2u8];
     candidates.sort_by(|a, b| {
         let sa = stats.get(a).map(|r| r.clone()).unwrap_or_default();
         let sb = stats.get(b).map(|r| r.clone()).unwrap_or_default();
@@ -122,7 +122,11 @@ pub(super) fn record_destination_failure(
     maybe_emit_classifier_summary(classifier_emit_interval_secs.max(5));
 }
 
-pub(super) fn record_destination_success(destination: &str, stage: u8, _source: StageSelectionSource) {
+pub(super) fn record_destination_success(
+    destination: &str,
+    stage: u8,
+    _source: StageSelectionSource,
+) {
     let now = now_unix_secs();
     {
         let map = DEST_FAILURES.get_or_init(DashMap::new);
@@ -208,11 +212,14 @@ pub(super) fn maybe_emit_classifier_summary(interval_secs: u64) {
     {
         return;
     }
-    
+
     {
         let map = DEST_CLASSIFIER.get_or_init(DashMap::new);
         if !map.is_empty() {
-            let mut entries: Vec<(String, DestinationClassifier)> = map.iter().map(|r| (r.key().clone(), r.value().clone())).collect();
+            let mut entries: Vec<(String, DestinationClassifier)> = map
+                .iter()
+                .map(|r| (r.key().clone(), r.value().clone()))
+                .collect();
             entries.sort_by_key(|(_, s)| std::cmp::Reverse(s.failures));
             let top = entries.into_iter().take(3).collect::<Vec<_>>();
             for (destination, s) in top {
@@ -253,8 +260,10 @@ pub(super) fn maybe_emit_classifier_summary(interval_secs: u64) {
 
     {
         let stats_map = STAGE_RACE_STATS.get_or_init(DashMap::new);
-        let mut stages: Vec<(u8, StageRaceStats)> =
-            stats_map.iter().map(|r| (*r.key(), r.value().clone())).collect();
+        let mut stages: Vec<(u8, StageRaceStats)> = stats_map
+            .iter()
+            .map(|r| (*r.key(), r.value().clone()))
+            .collect();
         stages.sort_by_key(|(stage, _)| *stage);
         for (stage, stats) in stages.into_iter().take(4) {
             let total = stats.successes + stats.failures;
@@ -325,7 +334,10 @@ pub(super) fn maybe_emit_classifier_summary(interval_secs: u64) {
     {
         let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(DashMap::new);
         if !map.is_empty() {
-            let mut profiles: Vec<(String, BypassProfileHealth)> = map.iter().map(|r| (r.key().clone(), r.value().clone())).collect();
+            let mut profiles: Vec<(String, BypassProfileHealth)> = map
+                .iter()
+                .map(|r| (r.key().clone(), r.value().clone()))
+                .collect();
             profiles.sort_by(|a, b| {
                 let a_score = bypass_profile_score_from_health(&a.1, now);
                 let b_score = bypass_profile_score_from_health(&b.1, now);
@@ -395,10 +407,8 @@ pub(super) fn load_classifier_store_if_needed() {
     let failures = DEST_FAILURES.get_or_init(DashMap::new);
     let preferred = DEST_PREFERRED_STAGE.get_or_init(DashMap::new);
     let classifier = DEST_CLASSIFIER.get_or_init(DashMap::new);
-    let bypass_idx = DEST_BYPASS_PROFILE_IDX.get_or_init(DashMap::new);
     let bypass_failures = DEST_BYPASS_PROFILE_FAILURES.get_or_init(DashMap::new);
     let route_health = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
-    let route_winner = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
     let global_bypass = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(DashMap::new);
 
     let ClassifierSnapshot {
@@ -421,17 +431,16 @@ pub(super) fn load_classifier_store_if_needed() {
         if !destination_classifier_is_empty(&entry.stats) {
             classifier.insert(destination.clone(), entry.stats);
         }
-        if let Some(idx) = entry.bypass_profile_idx {
-            bypass_idx.insert(destination.clone(), idx);
-        }
+        // Do not restore pinned bypass profile indexes across restarts.
+        // Profile order/tuning can change between builds; stale pins hurt recovery.
+        let _ = entry.bypass_profile_idx.take();
         if entry.bypass_profile_failures > 0 {
             bypass_failures.insert(destination.clone(), entry.bypass_profile_failures);
         }
-        if let Some(winner) = entry.route_winner.take() {
-            if !winner.route_id.trim().is_empty() {
-                route_winner.insert(destination.clone(), winner);
-            }
-        }
+        // Do not restore cached route winners across process restarts.
+        // Network conditions and bypass backend profile ordering can change between
+        // runs; restoring winner IDs causes startup stickiness on stale routes.
+        let _ = entry.route_winner.take();
         if !entry.route_health.is_empty() {
             let per_route = DashMap::new();
             for (route_id, mut health) in entry.route_health {
@@ -440,6 +449,9 @@ pub(super) fn load_classifier_store_if_needed() {
                     continue;
                 }
                 health.consecutive_failures = health.consecutive_failures.min(32);
+                // Weak cooldowns are process-local. Reset them on restore to force
+                // fresh probing after startup.
+                health.weak_until_unix = 0;
                 if route_health_is_empty(&health) {
                     continue;
                 }
@@ -582,10 +594,7 @@ pub(super) fn write_classifier_snapshot(cfg: &ClassifierStoreConfig) -> std::io:
         entries.entry(r.key().clone()).or_default().failures = (*r.value()).min(8);
     }
     for r in preferred.iter() {
-        entries
-            .entry(r.key().clone())
-            .or_default()
-            .preferred_stage = (*r.value()).min(4);
+        entries.entry(r.key().clone()).or_default().preferred_stage = (*r.value()).min(4);
     }
     for r in bypass_idx.iter() {
         entries

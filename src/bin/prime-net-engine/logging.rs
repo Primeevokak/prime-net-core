@@ -171,9 +171,20 @@ impl JsonVisitor {
                 .or_else(|| Some(v.to_string()));
         } else {
             // Keep a separate key=value vector for the text formatter.
-            self.kv.push((name.to_owned(), v.to_string()));
+            self.kv.push((name.to_owned(), text_value_for_text_log(&v)));
         }
         self.fields.insert(name.to_owned(), v);
+    }
+}
+
+fn text_value_for_text_log(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_owned(),
+        Value::Bool(v) => v.to_string(),
+        Value::Number(v) => v.to_string(),
+        Value::String(v) => v.clone(),
+        // Keep compact JSON for non-scalar nested fields.
+        Value::Array(_) | Value::Object(_) => value.to_string(),
     }
 }
 
@@ -304,4 +315,21 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     let m = (mp + if mp < 10 { 3 } else { -9 }) as i32; // [1, 12]
     y += (m <= 2) as i32;
     (y, m as u32, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_log_value_keeps_plain_strings() {
+        let v = Value::String(r#"C:\Users\prime\file.txt"#.to_owned());
+        assert_eq!(text_value_for_text_log(&v), r#"C:\Users\prime\file.txt"#);
+    }
+
+    #[test]
+    fn text_log_value_keeps_numbers_without_quotes() {
+        let v = json!(1080);
+        assert_eq!(text_value_for_text_log(&v), "1080");
+    }
 }

@@ -37,7 +37,10 @@ pub fn maybe_mark_route_capability_failure(candidate: &RouteCandidate, e: &Engin
         return;
     }
     let msg = e.to_string().to_lowercase();
-    if msg.contains("socks5 invalid reply version") || msg.contains("auth rejected") || msg.contains("rejected connect: rep=0x03") {
+    if msg.contains("socks5 invalid reply version")
+        || msg.contains("auth rejected")
+        || msg.contains("rejected connect: rep=0x03")
+    {
         mark_route_capability_weak(candidate.kind, candidate.family, "rep-error", 120);
     }
 }
@@ -51,12 +54,20 @@ pub fn route_race_candidate_delay_ms(
     index: usize,
     candidate: &RouteCandidate,
     direct_present: bool,
-    _destination: &str,
+    destination: &str,
 ) -> u64 {
     if index == 0 {
         return 0;
     }
-    let mut delay = ROUTE_RACE_BASE_DELAY_MS;
+    // For YouTube/Discord buckets we want true parallel probing across bypass
+    // profiles; staggered launch makes profile #1 win almost always.
+    let bucket = host_service_bucket(destination);
+    if matches!(bucket.as_str(), "meta-group:youtube" | "meta-group:discord")
+        && candidate.kind == RouteKind::Bypass
+    {
+        return 0;
+    }
+    let mut delay = ROUTE_RACE_BASE_DELAY_MS.saturating_mul(index as u64);
     if direct_present && candidate.kind == RouteKind::Bypass {
         delay += ROUTE_RACE_DIRECT_HEADSTART_MS;
         delay += match candidate.source {
@@ -68,7 +79,23 @@ pub fn route_race_candidate_delay_ms(
     delay
 }
 
-pub fn route_race_launch_candidates(ordered: &[RouteCandidate]) -> Vec<RouteCandidate> {
+pub fn route_race_launch_candidates(
+    ordered: &[RouteCandidate],
+    destination: &str,
+) -> Vec<RouteCandidate> {
+    let bucket = host_service_bucket(destination);
+    if matches!(bucket.as_str(), "meta-group:youtube" | "meta-group:discord") {
+        let mut out = Vec::with_capacity(2);
+        if let Some(bypass) = ordered.iter().find(|c| c.kind == RouteKind::Bypass) {
+            out.push(bypass.clone());
+        }
+        if let Some(direct) = ordered.iter().find(|c| c.kind == RouteKind::Direct) {
+            out.push(direct.clone());
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
     ordered
         .iter()
         .take(ROUTE_RACE_MAX_CANDIDATES)
@@ -84,24 +111,68 @@ pub async fn connect_via_best_route(
     outbound: DynOutbound,
     relay_opts: &RelayOptions,
 ) -> Result<ConnectedRoute> {
+    let (candidates, canary) = apply_phase3_ml_override(target_label, candidates);
     let (race, reason) = route_race_decision(target.port, target_label, &candidates);
     record_route_race_decision(race, reason);
+    let decision_id =
+        begin_route_decision_event_with_canary(target_label, &candidates, race, Some(canary));
 
     if !race {
-        let candidate = candidates[0].clone();
-        record_route_selected(&candidate, false);
-        let stream = connect_route_candidate(conn_id, target, target_label, &candidate, outbound, relay_opts).await?;
-        return Ok(ConnectedRoute {
-            stream,
-            candidate,
-            route_key: target_label.to_owned(),
-            raced: false,
-        });
+        let mut last_err = None;
+        let mut last_failed_candidate: Option<RouteCandidate> = None;
+        for candidate in candidates {
+            match connect_route_candidate(
+                conn_id,
+                target,
+                target_label,
+                &candidate,
+                outbound.clone(),
+                relay_opts,
+            )
+            .await
+            {
+                Ok(stream) => {
+                    record_route_connected(target_label, &candidate);
+                    record_route_selected(&candidate, false);
+                    return Ok(ConnectedRoute {
+                        stream,
+                        candidate,
+                        route_key: target_label.to_owned(),
+                        raced: false,
+                        decision_id,
+                    });
+                }
+                Err(e) => {
+                    maybe_mark_route_capability_failure(&candidate, &e);
+                    if !should_ignore_route_failure(&candidate, &e)
+                        && !is_noise_probe_https_destination(route_destination_key(target_label))
+                    {
+                        record_route_failure(target_label, &candidate, "connect-failed");
+                    }
+                    last_failed_candidate = Some(candidate.clone());
+                    last_err = Some(e);
+                }
+            }
+        }
+        complete_route_outcome_event(
+            decision_id,
+            target_label,
+            last_failed_candidate.as_ref(),
+            false,
+            false,
+            0,
+            0,
+            "connect-failed",
+        );
+        return Err(last_err.unwrap_or_else(|| {
+            EngineError::Internal("all non-race route candidates failed".to_owned())
+        }));
     }
 
     let mut winners = JoinSet::new();
-    let launch = route_race_launch_candidates(&candidates);
+    let launch = route_race_launch_candidates(&candidates, target_label);
     let direct_present = candidates.iter().any(|c| c.kind == RouteKind::Direct);
+    let mut last_failed_candidate: Option<RouteCandidate> = None;
 
     for (idx, cand) in launch.into_iter().enumerate() {
         let delay = route_race_candidate_delay_ms(idx, &cand, direct_present, target_label);
@@ -109,12 +180,20 @@ pub async fn connect_via_best_route(
         let target_c = (*target).clone();
         let target_label_c = target_label.to_owned();
         let relay_opts_c = (*relay_opts).clone();
-        
+
         winners.spawn(async move {
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
-            let res = connect_route_candidate(conn_id, &target_c, &target_label_c, &cand, outbound_c, &relay_opts_c).await;
+            let res = connect_route_candidate(
+                conn_id,
+                &target_c,
+                &target_label_c,
+                &cand,
+                outbound_c,
+                &relay_opts_c,
+            )
+            .await;
             (cand, res)
         });
     }
@@ -139,23 +218,39 @@ pub async fn connect_via_best_route(
         match connect_res {
             Ok(stream) => {
                 winners.abort_all();
+                record_route_connected(target_label, &candidate);
                 record_route_selected(&candidate, true);
                 return Ok(ConnectedRoute {
                     stream,
                     candidate,
                     route_key: target_label.to_owned(),
                     raced: true,
+                    decision_id,
                 });
             }
             Err(e) => {
                 maybe_mark_route_capability_failure(&candidate, &e);
-                if !should_ignore_route_failure(&candidate, &e) {
-                    last_err = Some(e);
+                if !should_ignore_route_failure(&candidate, &e)
+                    && !is_noise_probe_https_destination(route_destination_key(target_label))
+                {
+                    record_route_failure(target_label, &candidate, "connect-failed");
                 }
+                last_failed_candidate = Some(candidate.clone());
+                last_err = Some(e);
             }
         }
     }
 
+    complete_route_outcome_event(
+        decision_id,
+        target_label,
+        last_failed_candidate.as_ref(),
+        false,
+        false,
+        0,
+        0,
+        "connect-failed",
+    );
     Err(last_err.unwrap_or_else(|| EngineError::Internal("all route candidates failed".to_owned())))
 }
 
@@ -182,21 +277,37 @@ pub async fn handle_client(
     }
     if hdr[0] != 0x05 {
         if hdr[0] == 0x04 {
-            return handle_socks4(conn_id, tcp, peer, client, outbound, hdr[1], silent_drop, relay_opts).await;
+            return handle_socks4(
+                conn_id,
+                tcp,
+                peer,
+                client,
+                outbound,
+                hdr[1],
+                silent_drop,
+                relay_opts,
+            )
+            .await;
         }
         if hdr[0].is_ascii_alphabetic() {
             return handle_http_proxy(conn_id, tcp, peer, client, outbound, hdr, relay_opts).await;
         }
         return silent_or_err(&mut tcp, silent_drop, "SOCKS5 invalid version").await;
     }
-    
+
     let nmethods = hdr[1] as usize;
     let mut methods = vec![0u8; nmethods];
-    tcp.read_exact(&mut methods).await.map_err(EngineError::Io)?;
-    tcp.write_all(&[0x05, 0x00]).await.map_err(EngineError::Io)?;
+    tcp.read_exact(&mut methods)
+        .await
+        .map_err(EngineError::Io)?;
+    tcp.write_all(&[0x05, 0x00])
+        .await
+        .map_err(EngineError::Io)?;
 
     let mut req_hdr = [0u8; 4];
-    tcp.read_exact(&mut req_hdr).await.map_err(EngineError::Io)?;
+    tcp.read_exact(&mut req_hdr)
+        .await
+        .map_err(EngineError::Io)?;
     if req_hdr[1] != 0x01 {
         return silent_or_err(&mut tcp, silent_drop, "SOCKS5 unsupported command").await;
     }
@@ -223,21 +334,100 @@ pub async fn handle_client(
     };
 
     let mut port_bytes = [0u8; 2];
-    tcp.read_exact(&mut port_bytes).await.map_err(EngineError::Io)?;
+    tcp.read_exact(&mut port_bytes)
+        .await
+        .map_err(EngineError::Io)?;
     let port = u16::from_be_bytes(port_bytes);
-    let target = TargetEndpoint { addr: target_addr, port };
+    let target = TargetEndpoint {
+        addr: target_addr,
+        port,
+    };
     let target_label = route_decision_key(&target.to_string(), &target.addr);
 
     let candidates = select_route_candidates(&relay_opts, &target.addr, target.port, &target_label);
     let ordered = ordered_route_candidates(&target_label, candidates);
-    
-    let is_bypass = ordered[0].kind == RouteKind::Bypass;
-    let tuned = tune_relay_for_target(relay_opts.clone(), target.port, &target_label, false, is_bypass);
 
-    match connect_via_best_route(conn_id, &target, &target_label, ordered, outbound, &relay_opts).await {
+    match connect_via_best_route(
+        conn_id,
+        &target,
+        &target_label,
+        ordered,
+        outbound,
+        &relay_opts,
+    )
+    .await
+    {
         Ok(mut connected) => {
-            tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.map_err(EngineError::Io)?;
-            let _ = relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options).await;
+            let tuned = tune_relay_for_target(
+                relay_opts.clone(),
+                target.port,
+                &target_label,
+                false,
+                connected.candidate.kind == RouteKind::Bypass,
+            );
+            if let Err(e) = tcp
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+            {
+                complete_route_outcome_event(
+                    connected.decision_id,
+                    &connected.route_key,
+                    Some(&connected.candidate),
+                    true,
+                    false,
+                    0,
+                    0,
+                    "client-reply-io",
+                );
+                return Err(e.into());
+            }
+            match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options).await {
+                Ok((_c2u, u2c)) => {
+                    complete_route_outcome_event(
+                        connected.decision_id,
+                        &connected.route_key,
+                        Some(&connected.candidate),
+                        true,
+                        u2c > 0,
+                        u2c,
+                        0,
+                        "ok",
+                    );
+                }
+                Err(e) if is_expected_disconnect(&e) => {
+                    complete_route_outcome_event(
+                        connected.decision_id,
+                        &connected.route_key,
+                        Some(&connected.candidate),
+                        true,
+                        false,
+                        0,
+                        0,
+                        "client-disconnect",
+                    );
+                }
+                Err(e) => {
+                    complete_route_outcome_event(
+                        connected.decision_id,
+                        &connected.route_key,
+                        Some(&connected.candidate),
+                        true,
+                        false,
+                        0,
+                        0,
+                        "relay-io",
+                    );
+                    debug!(
+                        target: "socks5",
+                        conn_id,
+                        client = %client,
+                        peer = %peer,
+                        destination = %target_label,
+                        error = %e,
+                        "SOCKS5 relay interrupted"
+                    );
+                }
+            }
             Ok(())
         }
         Err(e) => silent_or_err(&mut tcp, silent_drop, &e.to_string()).await,
@@ -246,7 +436,9 @@ pub async fn handle_client(
 
 pub(super) async fn silent_or_err(tcp: &mut TcpStream, silent: bool, msg: &str) -> Result<()> {
     if !silent {
-        let _ = tcp.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+        let _ = tcp
+            .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await;
     }
     Err(EngineError::Internal(msg.to_owned()))
 }

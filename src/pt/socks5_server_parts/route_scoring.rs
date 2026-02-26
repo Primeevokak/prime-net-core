@@ -3,33 +3,29 @@ use super::*;
 pub(super) fn route_health_score(route_key: &str, candidate: &RouteCandidate, now: u64) -> i64 {
     let route_id = candidate.route_id();
     let mut bonus = 0i64;
-    
+
     if candidate.kind == RouteKind::Bypass {
         match candidate.source {
             "builtin" | "learned-domain" | "learned-ip" => {
                 bonus += 5000;
             }
-            "adaptive-race" => {
-                bonus += 100;
-            }
             _ => {}
         }
 
         let bucket = host_service_bucket(route_key);
-        if bucket == "meta-group:discord" {
-            if candidate.bypass_profile_idx < 4 {
-                let is_failing = {
-                    let map = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
-                    map.get(route_key)
-                        .and_then(|m| m.get(&candidate.route_id()).map(|h| h.consecutive_failures >= 3))
-                        .unwrap_or(false)
-                };
-                if !is_failing {
-                    bonus += 50000; 
-                }
+        if bucket == "meta-group:discord" || bucket == "meta-group:youtube" {
+            let is_failing = {
+                let map = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
+                map.get(route_key)
+                    .and_then(|m| {
+                        m.get(&candidate.route_id())
+                            .map(|h| h.consecutive_failures >= 3)
+                    })
+                    .unwrap_or(false)
+            };
+            if !is_failing {
+                bonus += bypass_bucket_bonus(&bucket, candidate);
             }
-        } else if bucket == "meta-group:youtube" && candidate.bypass_profile_idx == 4 {
-            bonus += 50000;
         }
     }
 
@@ -50,7 +46,7 @@ pub(super) fn route_health_score(route_key: &str, candidate: &RouteCandidate, no
             0
         }
     };
-    
+
     local_score + global_bypass_profile_score(candidate, now) + bonus
 }
 
@@ -61,7 +57,7 @@ pub(super) fn global_bypass_profile_score(candidate: &RouteCandidate, now: u64) 
     }
     let primary_key = bypass_profile_health_key(&route_id, candidate.family);
     let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(DashMap::new);
-    
+
     if let Some(health) = map.get(&primary_key) {
         if should_reset_bypass_profile_health(&health, now) {
             drop(health);
@@ -70,7 +66,7 @@ pub(super) fn global_bypass_profile_score(candidate: &RouteCandidate, now: u64) 
         }
         return bypass_profile_score_from_health(&health, now);
     }
-    
+
     if candidate.family != RouteIpFamily::Any {
         if let Some(legacy) = map.get(&route_id) {
             if should_reset_bypass_profile_health(&legacy, now) {
@@ -113,6 +109,64 @@ pub(super) fn should_reset_bypass_profile_health(health: &BypassProfileHealth, n
     false
 }
 
+fn bypass_profile_matches_bucket_preference(bucket: &str, candidate: &RouteCandidate) -> bool {
+    if candidate.kind != RouteKind::Bypass {
+        return false;
+    }
+    match bucket {
+        // Discord profiles are ordered by conservativeness. Keep preferring the first
+        // two profiles, prioritizing profile #2 on Windows (disorder+fake style).
+        "meta-group:discord" => {
+            if candidate.bypass_profile_total <= 1 {
+                return candidate.bypass_profile_idx == 0;
+            }
+            candidate.bypass_profile_idx <= 1
+        }
+        // YouTube is usually most stable with the split+disorder profile first,
+        // but keep one fallback profile to avoid getting stuck.
+        "meta-group:youtube" => {
+            candidate.bypass_profile_total > 0 && candidate.bypass_profile_idx <= 1
+        }
+        _ => false,
+    }
+}
+
+fn bypass_bucket_bonus(bucket: &str, candidate: &RouteCandidate) -> i64 {
+    if candidate.kind != RouteKind::Bypass {
+        return 0;
+    }
+    match bucket {
+        // Prefer profile #2 for Discord if available, keep profile #1 as fallback.
+        "meta-group:discord" => {
+            if candidate.bypass_profile_total <= 1 {
+                return if candidate.bypass_profile_idx == 0 {
+                    8_000
+                } else {
+                    0
+                };
+            }
+            if candidate.bypass_profile_idx == 1 {
+                8_000
+            } else if candidate.bypass_profile_idx == 0 {
+                4_000
+            } else {
+                0
+            }
+        }
+        // Prefer profile #1 for YouTube (split+disorder), keep #2 as fallback.
+        "meta-group:youtube" => {
+            if candidate.bypass_profile_idx == 0 {
+                8_000
+            } else if candidate.bypass_profile_idx == 1 {
+                3_000
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
+}
+
 pub(super) fn route_is_temporarily_weak(route_key: &str, route_id: &str, now: u64) -> bool {
     let map = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
     map.get(route_key)
@@ -144,7 +198,7 @@ pub(super) fn ordered_route_candidates(
 ) -> Vec<RouteCandidate> {
     let now = now_unix_secs();
     let winner = route_winner_for_key(route_key);
-    
+
     let mut filtered: Vec<RouteCandidate> = candidates
         .iter()
         .filter(|c| route_capability_is_available(c.kind, c.family, now))
@@ -166,11 +220,10 @@ pub(super) fn ordered_route_candidates(
                 {
                     return true;
                 }
-                
+
                 let bucket = host_service_bucket(route_key);
-                if (bucket == "meta-group:discord" && c.bypass_profile_idx < 4) ||
-                   (bucket == "meta-group:youtube" && c.bypass_profile_idx == 4) {
-                    return true; 
+                if bypass_profile_matches_bucket_preference(&bucket, c) {
+                    return true;
                 }
                 return false;
             }
@@ -211,7 +264,7 @@ pub(super) fn ordered_route_candidates(
         }
         let a_score = route_health_score(route_key, a, now);
         let b_score = route_health_score(route_key, b, now);
-        
+
         b_score
             .cmp(&a_score)
             .then_with(|| a.kind_rank().cmp(&b.kind_rank()))
@@ -225,6 +278,7 @@ pub(super) fn route_race_decision(
     route_key: &str,
     candidates: &[RouteCandidate],
 ) -> (bool, RouteRaceReason) {
+    const META_DIRECT_WINNER_TTL_SECS: u64 = 5;
     if port != 443 || candidates.len() < 2 {
         return if port != 443 {
             (false, RouteRaceReason::NonTlsPort)
@@ -235,9 +289,9 @@ pub(super) fn route_race_decision(
     let now = now_unix_secs();
 
     if let Some(winner_cand) = candidates.first() {
-        if winner_cand.kind == RouteKind::Bypass && 
-           (winner_cand.source == "learned-domain" || winner_cand.source == "learned-ip") &&
-           route_key.contains("meta-group:") 
+        if winner_cand.kind == RouteKind::Bypass
+            && (winner_cand.source == "learned-domain" || winner_cand.source == "learned-ip")
+            && route_key.contains("meta-group:")
         {
             let score = route_health_score(route_key, winner_cand, now);
             if score > 10000 {
@@ -252,7 +306,16 @@ pub(super) fn route_race_decision(
     if winner.route_id.is_empty() {
         return (true, RouteRaceReason::EmptyWinner);
     }
-    if now.saturating_sub(winner.updated_at_unix) > ROUTE_WINNER_TTL_SECS {
+    let winner_ttl_secs = if winner.route_id == "direct"
+        && matches!(
+            host_service_bucket(route_key).as_str(),
+            "meta-group:youtube" | "meta-group:discord"
+        ) {
+        META_DIRECT_WINNER_TTL_SECS
+    } else {
+        ROUTE_WINNER_TTL_SECS
+    };
+    if now.saturating_sub(winner.updated_at_unix) > winner_ttl_secs {
         return (true, RouteRaceReason::WinnerStale);
     }
     if !candidates.iter().any(|c| c.route_id() == winner.route_id) {
@@ -269,7 +332,7 @@ pub(super) fn record_route_success(route_key: &str, candidate: &RouteCandidate) 
     let route_id = candidate.route_id();
     let service_key = route_service_key(route_key);
     let meta_key = route_meta_service_key(route_key);
-    
+
     let health_map = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
     let per_route = health_map.entry(route_key.to_owned()).or_default();
     let mut entry = per_route.entry(route_id.clone()).or_default();
@@ -292,15 +355,26 @@ pub(super) fn record_route_success(route_key: &str, candidate: &RouteCandidate) 
         }
     }
     if let Some(meta_key) = meta_key.as_ref() {
-        if meta_key != route_key
-            && service_key.as_ref().map(|s| s != meta_key).unwrap_or(true)
-        {
+        if meta_key != route_key && service_key.as_ref().map(|s| s != meta_key).unwrap_or(true) {
             winner_map.insert(meta_key.clone(), winner);
         }
     }
 
     if matches!(candidate.kind, RouteKind::Bypass) {
         record_global_bypass_profile_success(candidate, now);
+    }
+    if let Ok(mut m) = ROUTE_METRICS
+        .get_or_init(|| RwLock::new(RouteMetrics::default()))
+        .write()
+    {
+        match candidate.kind {
+            RouteKind::Direct => {
+                m.route_success_direct = m.route_success_direct.saturating_add(1);
+            }
+            RouteKind::Bypass => {
+                m.route_success_bypass = m.route_success_bypass.saturating_add(1);
+            }
+        }
     }
     mark_route_capability_healthy(candidate.kind, candidate.family);
     debug!(
@@ -312,12 +386,16 @@ pub(super) fn record_route_success(route_key: &str, candidate: &RouteCandidate) 
     maybe_flush_classifier_store(false);
 }
 
-pub(super) fn record_route_failure(route_key: &str, candidate: &RouteCandidate, reason: &'static str) {
+pub(super) fn record_route_failure(
+    route_key: &str,
+    candidate: &RouteCandidate,
+    reason: &'static str,
+) {
     let now = now_unix_secs();
     let route_id = candidate.route_id();
     let service_key = route_service_key(route_key);
     let meta_key = route_meta_service_key(route_key);
-    
+
     let health_map = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
     let per_route = health_map.entry(route_key.to_owned()).or_default();
     let mut entry = per_route.entry(route_id.clone()).or_default();
@@ -349,9 +427,7 @@ pub(super) fn record_route_failure(route_key: &str, candidate: &RouteCandidate, 
         }
     }
     if let Some(meta_key) = meta_key.as_ref() {
-        if meta_key != route_key
-            && service_key.as_ref().map(|s| s != meta_key).unwrap_or(true)
-        {
+        if meta_key != route_key && service_key.as_ref().map(|s| s != meta_key).unwrap_or(true) {
             let per_route_meta = health_map.entry(meta_key.clone()).or_default();
             let mut entry_meta = per_route_meta.entry(route_id.clone()).or_default();
             entry_meta.failures = entry_meta.failures.saturating_add(1);
@@ -363,7 +439,11 @@ pub(super) fn record_route_failure(route_key: &str, candidate: &RouteCandidate, 
     drop(per_route);
 
     let winner_map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
-    if winner_map.get(route_key).map(|w| w.route_id == route_id).unwrap_or(false) {
+    if winner_map
+        .get(route_key)
+        .map(|w| w.route_id == route_id)
+        .unwrap_or(false)
+    {
         winner_map.remove(route_key);
     }
     if let Some(service_key) = service_key.as_ref() {
@@ -396,6 +476,33 @@ pub(super) fn record_route_failure(route_key: &str, candidate: &RouteCandidate, 
             );
         }
     }
+    if let Ok(mut m) = ROUTE_METRICS
+        .get_or_init(|| RwLock::new(RouteMetrics::default()))
+        .write()
+    {
+        match candidate.kind {
+            RouteKind::Direct => {
+                m.route_failure_direct = m.route_failure_direct.saturating_add(1);
+                if reason == "connect-failed" {
+                    m.connect_failure_direct = m.connect_failure_direct.saturating_add(1);
+                }
+                if matches!(reason, "zero-reply-soft" | "suspicious-zero-reply") {
+                    m.route_soft_zero_reply_direct =
+                        m.route_soft_zero_reply_direct.saturating_add(1);
+                }
+            }
+            RouteKind::Bypass => {
+                m.route_failure_bypass = m.route_failure_bypass.saturating_add(1);
+                if reason == "connect-failed" {
+                    m.connect_failure_bypass = m.connect_failure_bypass.saturating_add(1);
+                }
+                if matches!(reason, "zero-reply-soft" | "suspicious-zero-reply") {
+                    m.route_soft_zero_reply_bypass =
+                        m.route_soft_zero_reply_bypass.saturating_add(1);
+                }
+            }
+        }
+    }
     warn!(
         target: "socks5.route",
         route_key = %route_key,
@@ -423,7 +530,11 @@ pub(super) fn record_global_bypass_profile_success(candidate: &RouteCandidate, n
     entry.io_errors = entry.io_errors.saturating_sub(1);
 }
 
-pub(super) fn record_global_bypass_profile_failure(candidate: &RouteCandidate, reason: &'static str, now: u64) {
+pub(super) fn record_global_bypass_profile_failure(
+    candidate: &RouteCandidate,
+    reason: &'static str,
+    now: u64,
+) {
     let route_id = candidate.route_id();
     if !route_id.starts_with("bypass:") {
         return;
@@ -464,30 +575,16 @@ pub(super) fn select_route_candidates(
         || host_lower.contains("adguard.org");
 
     if is_noise {
-        return vec![RouteCandidate::direct_with_family("noise-bypass", RouteIpFamily::Any)];
+        return vec![RouteCandidate::direct_with_family(
+            "noise-bypass",
+            RouteIpFamily::Any,
+        )];
     }
 
     let family = route_family_for_target(target);
     let mut out = vec![RouteCandidate::direct_with_family("adaptive", family)];
-    
-    let source = select_bypass_source(relay_opts, target, port).unwrap_or_else(|| {
-        if port == 443 {
-            let is_public = match target {
-                TargetAddr::Ip(ip) => is_bypassable_public_ip(*ip),
-                TargetAddr::Domain(host) => {
-                    if let Some(ip) = parse_ip_literal(host) {
-                        is_bypassable_public_ip(ip)
-                    } else {
-                        true 
-                    }
-                }
-            };
-            if is_public {
-                return "adaptive-race";
-            }
-        }
-        "none"
-    });
+
+    let source = select_bypass_source(relay_opts, target, port).unwrap_or("none");
 
     if source != "none" {
         for (addr, idx, total) in select_bypass_candidates(relay_opts, destination_key) {
@@ -501,16 +598,38 @@ pub(super) fn select_route_candidates(
 
 pub(super) fn host_service_bucket(host: &str) -> String {
     let host = host.to_ascii_lowercase();
-    if host.contains("discord") || host.contains("discordapp") || host.contains("discord.gg") || host.contains("discord.media") || host.contains("discord-attachments") {
+    if host.contains("discord")
+        || host.contains("discordapp")
+        || host.contains("discord.gg")
+        || host.contains("discord.media")
+        || host.contains("discord-attachments")
+    {
         return "meta-group:discord".to_owned();
     }
-    if host.contains("youtube") || host.contains("ytimg") || host.contains("googlevideo") || host.contains("ggpht") || host.contains("youtube-nocookie") {
+    if host.contains("youtube")
+        || host.contains("ytimg")
+        || host.contains("googlevideo")
+        || host.contains("ggpht")
+        || host.contains("youtube-nocookie")
+    {
         return "meta-group:youtube".to_owned();
     }
-    if host.contains("google") || host.contains("gstatic") || host.contains("googleapis") || host.contains("googleusercontent") || host.contains("google-analytics") {
+    if host.contains("google")
+        || host.contains("gstatic")
+        || host.contains("googleapis")
+        || host.contains("googleusercontent")
+        || host.contains("google-analytics")
+    {
         return "meta-group:google".to_owned();
     }
-    if host.contains("microsoft") || host.contains("windowsupdate") || host.contains("aka.ms") || host.contains("live.com") || host.contains("office") || host.contains("outlook") || host.contains("s-microsoft") {
+    if host.contains("microsoft")
+        || host.contains("windowsupdate")
+        || host.contains("aka.ms")
+        || host.contains("live.com")
+        || host.contains("office")
+        || host.contains("outlook")
+        || host.contains("s-microsoft")
+    {
         return "meta-group:microsoft".to_owned();
     }
     if host.contains("spotify") || host.contains("scdn.co") {
@@ -518,10 +637,15 @@ pub(super) fn host_service_bucket(host: &str) -> String {
     }
 
     let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
-    if labels.len() < 2 { return host.to_owned(); }
+    if labels.len() < 2 {
+        return host.to_owned();
+    }
     let tld = labels[labels.len() - 1];
     let sld = labels[labels.len() - 2];
-    if labels.len() >= 3 && tld.len() == 2 && matches!(sld, "co"|"com"|"net"|"org"|"gov"|"edu"|"ac") {
+    if labels.len() >= 3
+        && tld.len() == 2
+        && matches!(sld, "co" | "com" | "net" | "org" | "gov" | "edu" | "ac")
+    {
         return labels[labels.len() - 3].to_owned();
     }
     sld.to_owned()
@@ -556,17 +680,56 @@ pub(super) fn destination_bypass_profile_idx_known(destination: &str, total: u8)
     None
 }
 
+pub(super) fn record_route_connected(route_key: &str, candidate: &RouteCandidate) {
+    // Do not pre-pin adaptive bypass winners: TCP connect can succeed while
+    // TLS still gets blocked, which causes temporary route stickiness.
+    if candidate.kind == RouteKind::Bypass && candidate.source == "adaptive-race" {
+        return;
+    }
+    let now = now_unix_secs();
+    let route_id = candidate.route_id();
+    let service_key = route_service_key(route_key);
+    let meta_key = route_meta_service_key(route_key);
+    let winner_map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
+    let winner = RouteWinner {
+        route_id,
+        updated_at_unix: now,
+    };
+    winner_map.insert(route_key.to_owned(), winner.clone());
+    if let Some(service_key) = service_key.as_ref() {
+        if service_key != route_key {
+            winner_map.insert(service_key.clone(), winner.clone());
+        }
+    }
+    if let Some(meta_key) = meta_key.as_ref() {
+        if meta_key != route_key && service_key.as_ref().map(|s| s != meta_key).unwrap_or(true) {
+            winner_map.insert(meta_key.clone(), winner);
+        }
+    }
+}
+
 #[cfg(test)]
 pub(super) fn destination_bypass_profile_idx(destination: &str, total: u8) -> u8 {
     destination_bypass_profile_idx_known(destination, total).unwrap_or(0)
 }
 
-pub(super) fn record_bypass_profile_failure(destination: &str, current_idx: u8, total: u8, reason: &'static str) {
-    if total == 0 { return; }
+pub(super) fn record_bypass_profile_failure(
+    destination: &str,
+    current_idx: u8,
+    total: u8,
+    reason: &'static str,
+) {
+    if total == 0 {
+        return;
+    }
     let key = bypass_profile_key(destination);
     let service_key = bypass_profile_legacy_service_key(destination);
     let meta_key = bypass_profile_meta_service_key(destination);
-    let next_idx = if total > 1 { (current_idx + 1) % total } else { 0 };
+    let next_idx = if total > 1 {
+        (current_idx + 1) % total
+    } else {
+        0
+    };
     let idx_map = DEST_BYPASS_PROFILE_IDX.get_or_init(DashMap::new);
     idx_map.insert(key.clone(), next_idx);
     if service_key != key {
@@ -592,21 +755,28 @@ pub(super) fn record_bypass_profile_failure(destination: &str, current_idx: u8, 
             *m_entry = m_entry.saturating_add(1);
         }
     }
+    note_phase2_profile_rotation(destination);
     info!(target: "socks5.bypass", destination, profile_key = %key, reason, next_profile = next_idx + 1, failures, "bypass profile rotated");
     maybe_flush_classifier_store(false);
 }
 
 pub(super) fn should_bypass_by_classifier_host(host: &str, port: u16) -> bool {
-    if port != 443 { return false; }
+    if port != 443 {
+        return false;
+    }
     let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    if host == "localhost" || host.ends_with(".local") || host.contains("adguard.org") { return false; }
+    if host == "localhost" || host.ends_with(".local") || host.contains("adguard.org") {
+        return false;
+    }
     let key = bypass_profile_key(&format!("{host}:{port}"));
     let map = DEST_FAILURES.get_or_init(DashMap::new);
     map.get(&key).map(|r| *r).unwrap_or(0) >= LEARNED_BYPASS_MIN_FAILURES_DOMAIN
 }
 
 pub(super) fn should_bypass_by_classifier_ip(ip: std::net::IpAddr, port: u16) -> bool {
-    if port != 443 || !is_bypassable_public_ip(ip) { return false; }
+    if port != 443 || !is_bypassable_public_ip(ip) {
+        return false;
+    }
     let key = format!("{ip}:{port}");
     let map = DEST_FAILURES.get_or_init(DashMap::new);
     map.get(&key).map(|r| *r).unwrap_or(0) >= LEARNED_BYPASS_MIN_FAILURES_IP
@@ -651,7 +821,8 @@ pub(super) fn bypass_profile_legacy_service_key(destination: &str) -> String {
             if let Some(ip) = parse_ip_literal(&normalized_host) {
                 return format!("{ip}:{port}");
             }
-            let service_bucket = registrable_domain_bucket(&normalized_host).unwrap_or(normalized_host);
+            let service_bucket =
+                registrable_domain_bucket(&normalized_host).unwrap_or(normalized_host);
             return format!("{service_bucket}:{port}");
         }
     }
@@ -688,7 +859,9 @@ pub(super) fn bypass_profile_health_last_seen_unix(health: &BypassProfileHealth)
 
 pub(super) fn learned_bypass_threshold(destination: &str) -> Option<u8> {
     let (host, port) = split_host_port_for_connect(destination)?;
-    if port != 443 { return None; }
+    if port != 443 {
+        return None;
+    }
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         if is_bypassable_public_ip(ip) {
             return Some(LEARNED_BYPASS_MIN_FAILURES_IP);
@@ -728,6 +901,9 @@ pub(super) fn select_bypass_source(
             if should_enable_universal_bypass_domain(host) {
                 return Some("adaptive-race");
             }
+            if should_prefer_adaptive_bypass_for_host(host) {
+                return Some("adaptive-race");
+            }
             None
         }
         TargetAddr::Ip(ip) => {
@@ -739,12 +915,24 @@ pub(super) fn select_bypass_source(
             if should_bypass_by_classifier_ip(*ip, port) {
                 return Some("learned-ip");
             }
-            if is_bypassable_public_ip(*ip) {
+            if is_bypassable_public_ip(*ip) && should_prefer_adaptive_bypass_for_ip(*ip) {
                 return Some("adaptive-race");
             }
             None
         }
     }
+}
+
+fn should_prefer_adaptive_bypass_for_host(host: &str) -> bool {
+    let bucket = host_service_bucket(host);
+    matches!(
+        bucket.as_str(),
+        "meta-group:youtube" | "meta-group:discord" | "meta-group:google"
+    )
+}
+
+fn should_prefer_adaptive_bypass_for_ip(_ip: std::net::IpAddr) -> bool {
+    false
 }
 
 pub(super) fn select_bypass_candidates(
@@ -753,9 +941,10 @@ pub(super) fn select_bypass_candidates(
 ) -> Vec<(SocketAddr, u8, u8)> {
     if !relay_opts.bypass_socks5_pool.is_empty() {
         let total = relay_opts.bypass_socks5_pool.len().min(255) as u8;
-        let preferred = destination_bypass_profile_idx_known(destination, total).unwrap_or_else(
-            || (NEXT_BYPASS_POOL_IDX.fetch_add(1, Ordering::Relaxed) % u64::from(total)) as u8,
-        );
+        let preferred =
+            destination_bypass_profile_idx_known(destination, total).unwrap_or_else(|| {
+                (NEXT_BYPASS_POOL_IDX.fetch_add(1, Ordering::Relaxed) % u64::from(total)) as u8
+            });
         let mut out = Vec::with_capacity(total as usize);
         for offset in 0..total {
             let idx = (preferred + offset) % total;
@@ -812,35 +1001,67 @@ pub(super) fn mark_route_capability_healthy(kind: RouteKind, family: RouteIpFami
 }
 
 pub(super) fn record_route_race_decision(race: bool, reason: RouteRaceReason) {
-    if let Ok(mut m) = ROUTE_METRICS.get_or_init(|| RwLock::new(RouteMetrics::default())).write() {
+    if let Ok(mut m) = ROUTE_METRICS
+        .get_or_init(|| RwLock::new(RouteMetrics::default()))
+        .write()
+    {
         if race {
             m.race_started = m.race_started.saturating_add(1);
         } else {
             m.race_skipped = m.race_skipped.saturating_add(1);
         }
         match reason {
-            RouteRaceReason::NonTlsPort => m.race_reason_non_tls = m.race_reason_non_tls.saturating_add(1),
-            RouteRaceReason::SingleCandidate => m.race_reason_single_candidate = m.race_reason_single_candidate.saturating_add(1),
-            RouteRaceReason::NoWinner => { m.race_reason_no_winner = m.race_reason_no_winner.saturating_add(1); m.winner_cache_misses = m.winner_cache_misses.saturating_add(1); },
-            RouteRaceReason::EmptyWinner => { m.race_reason_empty_winner = m.race_reason_empty_winner.saturating_add(1); m.winner_cache_misses = m.winner_cache_misses.saturating_add(1); },
-            RouteRaceReason::WinnerStale => { m.race_reason_winner_stale = m.race_reason_winner_stale.saturating_add(1); m.winner_cache_misses = m.winner_cache_misses.saturating_add(1); },
-            RouteRaceReason::WinnerMissingFromCandidates => { m.race_reason_winner_missing = m.race_reason_winner_missing.saturating_add(1); m.winner_cache_misses = m.winner_cache_misses.saturating_add(1); },
-            RouteRaceReason::WinnerWeak => { m.race_reason_winner_weak = m.race_reason_winner_weak.saturating_add(1); m.winner_cache_misses = m.winner_cache_misses.saturating_add(1); },
-            RouteRaceReason::WinnerHealthy => { m.race_reason_winner_healthy = m.race_reason_winner_healthy.saturating_add(1); m.winner_cache_hits = m.winner_cache_hits.saturating_add(1); },
+            RouteRaceReason::NonTlsPort => {
+                m.race_reason_non_tls = m.race_reason_non_tls.saturating_add(1)
+            }
+            RouteRaceReason::SingleCandidate => {
+                m.race_reason_single_candidate = m.race_reason_single_candidate.saturating_add(1)
+            }
+            RouteRaceReason::NoWinner => {
+                m.race_reason_no_winner = m.race_reason_no_winner.saturating_add(1);
+                m.winner_cache_misses = m.winner_cache_misses.saturating_add(1);
+            }
+            RouteRaceReason::EmptyWinner => {
+                m.race_reason_empty_winner = m.race_reason_empty_winner.saturating_add(1);
+                m.winner_cache_misses = m.winner_cache_misses.saturating_add(1);
+            }
+            RouteRaceReason::WinnerStale => {
+                m.race_reason_winner_stale = m.race_reason_winner_stale.saturating_add(1);
+                m.winner_cache_misses = m.winner_cache_misses.saturating_add(1);
+            }
+            RouteRaceReason::WinnerMissingFromCandidates => {
+                m.race_reason_winner_missing = m.race_reason_winner_missing.saturating_add(1);
+                m.winner_cache_misses = m.winner_cache_misses.saturating_add(1);
+            }
+            RouteRaceReason::WinnerWeak => {
+                m.race_reason_winner_weak = m.race_reason_winner_weak.saturating_add(1);
+                m.winner_cache_misses = m.winner_cache_misses.saturating_add(1);
+            }
+            RouteRaceReason::WinnerHealthy => {
+                m.race_reason_winner_healthy = m.race_reason_winner_healthy.saturating_add(1);
+                m.winner_cache_hits = m.winner_cache_hits.saturating_add(1);
+            }
         }
     }
 }
 
 pub(super) fn record_route_selected(candidate: &RouteCandidate, raced: bool) {
-    if let Ok(mut m) = ROUTE_METRICS.get_or_init(|| RwLock::new(RouteMetrics::default())).write() {
+    if let Ok(mut m) = ROUTE_METRICS
+        .get_or_init(|| RwLock::new(RouteMetrics::default()))
+        .write()
+    {
         match candidate.kind {
             RouteKind::Direct => {
                 m.route_selected_direct = m.route_selected_direct.saturating_add(1);
-                if raced { m.race_winner_direct = m.race_winner_direct.saturating_add(1); }
+                if raced {
+                    m.race_winner_direct = m.race_winner_direct.saturating_add(1);
+                }
             }
             RouteKind::Bypass => {
                 m.route_selected_bypass = m.route_selected_bypass.saturating_add(1);
-                if raced { m.race_winner_bypass = m.race_winner_bypass.saturating_add(1); }
+                if raced {
+                    m.race_winner_bypass = m.race_winner_bypass.saturating_add(1);
+                }
             }
         }
     }
@@ -850,12 +1071,23 @@ pub(super) fn should_enable_universal_bypass_domain(host: &str) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let enabled = *ENABLED.get_or_init(|| {
         std::env::var("PRIME_PACKET_BYPASS_UNIVERSAL_DOMAINS")
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(false)
     });
-    if !enabled { return false; }
+    if !enabled {
+        return false;
+    }
     let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    if host.is_empty() || host == "localhost" || host.ends_with(".local") { return false; }
-    if parse_ip_literal(&host).is_some() { return false; }
+    if host.is_empty() || host == "localhost" || host.ends_with(".local") {
+        return false;
+    }
+    if parse_ip_literal(&host).is_some() {
+        return false;
+    }
     host.contains('.')
 }

@@ -19,9 +19,12 @@ fn main() {
         let mut res = winres::WindowsResource::new();
         res.set_language(0x0409); // English (US)
         res.set("ProductName", "Prime Net Engine");
-        res.set("FileDescription", "High-performance anti-censorship network engine");
+        res.set(
+            "FileDescription",
+            "High-performance anti-censorship network engine",
+        );
         res.set("LegalCopyright", "Copyright (c) 2026");
-        
+
         if let Err(e) = res.compile() {
             eprintln!("failed to compile winres: {e}");
         }

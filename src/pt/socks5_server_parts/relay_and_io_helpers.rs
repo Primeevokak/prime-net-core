@@ -23,7 +23,8 @@ pub async fn relay_bidirectional(
             if n > 0 {
                 let data = &first_buf[..n];
                 if is_tls_client_hello(data) {
-                    total += fragment_and_send_tls_hello(data, &mut upstream_w, &relay_opts).await?;
+                    total +=
+                        fragment_and_send_tls_hello(data, &mut upstream_w, &relay_opts).await?;
                 } else {
                     upstream_w.write_all(data).await?;
                     total += n as u64;
@@ -31,11 +32,13 @@ pub async fn relay_bidirectional(
                 upstream_seen_c2u.store(true, Ordering::SeqCst);
             }
         }
-        
+
         let mut buf = vec![0u8; 16384];
         loop {
             let n = client_r.read(&mut buf).await?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             upstream_w.write_all(&buf[..n]).await?;
             total += n as u64;
             upstream_seen_c2u.store(true, Ordering::SeqCst);
@@ -48,7 +51,9 @@ pub async fn relay_bidirectional(
         let mut buf = vec![0u8; 16384];
         loop {
             let n = upstream_r.read(&mut buf).await?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             client_w.write_all(&buf[..n]).await?;
             total += n as u64;
         }
@@ -69,12 +74,13 @@ pub(super) async fn fragment_and_send_tls_hello(
 ) -> std::io::Result<u64> {
     let mut sent = 0u64;
     let mut pos = 0usize;
-    
+
     let first_size = if opts.randomize_fragment_size {
         rand::thread_rng().gen_range(opts.fragment_size_min..=opts.fragment_size_max)
     } else {
         opts.fragment_size_min
-    }.min(data.len());
+    }
+    .min(data.len());
 
     upstream_w.write_all(&data[..first_size]).await?;
     sent += first_size as u64;
@@ -90,7 +96,8 @@ pub(super) async fn fragment_and_send_tls_hello(
             rand::thread_rng().gen_range(opts.fragment_size_min..=opts.fragment_size_max)
         } else {
             opts.fragment_size_max
-        }.min(remaining);
+        }
+        .min(remaining);
 
         upstream_w.write_all(&data[pos..pos + chunk_size]).await?;
         sent += chunk_size as u64;
@@ -111,7 +118,7 @@ pub(super) async fn fragment_and_send_tls_hello(
 
 pub fn find_http_header_end(buf: &[u8]) -> Option<usize> {
     for i in 0..buf.len().saturating_sub(3) {
-        if buf[i] == b'\r' && buf[i+1] == b'\n' && buf[i+2] == b'\r' && buf[i+3] == b'\n' {
+        if buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
             return Some(i + 4);
         }
     }
@@ -124,7 +131,9 @@ pub fn split_host_port_for_connect(s: &str) -> Option<(String, u16)> {
         let port_str = &s[pos + 1..];
         if let Ok(port) = port_str.parse::<u16>() {
             let host_clean = host.trim_start_matches('[').trim_end_matches(']');
-            if host_clean.is_empty() { return None; }
+            if host_clean.is_empty() {
+                return None;
+            }
             return Some((host_clean.to_owned(), port));
         }
     }
@@ -133,13 +142,17 @@ pub fn split_host_port_for_connect(s: &str) -> Option<(String, u16)> {
 
 pub fn split_host_port_with_default(s: &str, default_port: u16) -> Option<(String, u16)> {
     let s = s.trim();
-    if s.is_empty() { return None; }
-    
+    if s.is_empty() {
+        return None;
+    }
+
     if s.starts_with('[') {
         if let Some(end_idx) = s.find(']') {
             let host = &s[1..end_idx];
-            if host.is_empty() { return None; }
-            let rest = &s[end_idx+1..];
+            if host.is_empty() {
+                return None;
+            }
+            let rest = &s[end_idx + 1..];
             if rest.is_empty() {
                 return Some((host.to_owned(), default_port));
             }
@@ -156,22 +169,28 @@ pub fn split_host_port_with_default(s: &str, default_port: u16) -> Option<(Strin
     if let Some(pos) = s.rfind(':') {
         let host = &s[..pos];
         let port_str = &s[pos + 1..];
-        
+
         // Check if the part after colon is actually a port number
         if let Ok(port) = port_str.parse::<u16>() {
-            if host.is_empty() { return None; }
+            if host.is_empty() {
+                return None;
+            }
             return Some((host.to_owned(), port));
         }
-        
-        // If there's a colon but the suffix isn't a numeric port, 
+
+        // If there's a colon but the suffix isn't a numeric port,
         // it might be an unbracketed IPv6 or just garbage.
         // The tests expect None for "example.com:notaport"
         if host.contains('.') || host.is_empty() {
-            return None; 
+            return None;
         }
     }
-    
-    if s.is_empty() { None } else { Some((s.to_owned(), default_port)) }
+
+    if s.is_empty() {
+        None
+    } else {
+        Some((s.to_owned(), default_port))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -189,9 +208,13 @@ pub fn parse_http_forward_target(uri: &str, headers: &str) -> Option<HttpForward
             (rest, "/")
         };
         let (host, port) = split_host_port_with_default(host_port, 80)?;
-        return Some(HttpForwardTarget { host, port, request_uri: path.to_owned() });
+        return Some(HttpForwardTarget {
+            host,
+            port,
+            request_uri: path.to_owned(),
+        });
     }
-    
+
     let mut found_host = None;
     for line in headers.lines() {
         if line.to_ascii_lowercase().starts_with("host:") {
@@ -203,7 +226,11 @@ pub fn parse_http_forward_target(uri: &str, headers: &str) -> Option<HttpForward
 
     if let Some((host, port)) = found_host {
         // Validation: if URI is just a path, we must have found a host header
-        return Some(HttpForwardTarget { host, port, request_uri: uri.to_owned() });
+        return Some(HttpForwardTarget {
+            host,
+            port,
+            request_uri: uri.to_owned(),
+        });
     }
 
     None
@@ -221,7 +248,10 @@ pub fn rewrite_http_forward_head(headers: &str, target: &HttpForwardTarget) -> S
 
     for line in headers.lines().skip(1) {
         let lower = line.to_ascii_lowercase();
-        if lower.starts_with("host:") || lower.starts_with("proxy-connection:") || lower.starts_with("connection: close") {
+        if lower.starts_with("host:")
+            || lower.starts_with("proxy-connection:")
+            || lower.starts_with("connection: close")
+        {
             continue;
         }
         lines.push(line.to_owned());
@@ -234,7 +264,10 @@ pub fn rewrite_http_forward_head(headers: &str, target: &HttpForwardTarget) -> S
 }
 
 pub fn is_expected_disconnect(e: &std::io::Error) -> bool {
-    matches!(e.kind(), ErrorKind::ConnectionReset | ErrorKind::BrokenPipe | ErrorKind::ConnectionAborted)
+    matches!(
+        e.kind(),
+        ErrorKind::ConnectionReset | ErrorKind::BrokenPipe | ErrorKind::ConnectionAborted
+    )
 }
 
 pub(super) fn apply_tcp_window_size(stream: &TcpStream, size: u32) -> std::io::Result<()> {
@@ -266,7 +299,9 @@ pub async fn handle_socks5_udp_associate(
     _listen_addr: SocketAddr,
     _relay_opts: RelayOptions,
 ) -> Result<()> {
-    Err(EngineError::Internal("UDP Associate not fully implemented in this module".to_owned()))
+    Err(EngineError::Internal(
+        "UDP Associate not fully implemented in this module".to_owned(),
+    ))
 }
 
 pub fn route_capability_slot_mut(
@@ -319,11 +354,17 @@ pub fn should_skip_empty_session_scoring(c2u: u64, u2c: u64) -> bool {
     c2u == 0 && u2c == 0
 }
 
-pub fn should_mark_empty_bypass_session_as_soft_failure(candidate: &RouteCandidate, port: u16) -> bool {
+pub fn should_mark_empty_bypass_session_as_soft_failure(
+    candidate: &RouteCandidate,
+    port: u16,
+) -> bool {
     if port != 443 || candidate.kind != RouteKind::Bypass {
         return false;
     }
-    matches!(candidate.source, "builtin" | "learned-domain" | "learned-ip")
+    matches!(
+        candidate.source,
+        "builtin" | "learned-domain" | "learned-ip"
+    )
 }
 
 pub fn should_mark_bypass_profile_failure(port: u16, c2u: u64, u2c: u64, min_c2u: u64) -> bool {

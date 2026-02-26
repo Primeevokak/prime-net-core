@@ -188,11 +188,11 @@ impl DirectOutbound {
                             "Direct outbound attempt failed"
                         );
                     }
-                    
+
                     last_err = Some(e);
-                    
+
                     if is_unreachable {
-                        // If network is unreachable (os error 10051), 
+                        // If network is unreachable (os error 10051),
                         // we should ideally trigger the next attempt immediately if not already running.
                         // For now, just continue the loop; join_next will pick up other tasks.
                     }

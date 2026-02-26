@@ -222,7 +222,10 @@ impl UdpOverTcpTunnel {
                 UdpTargetAddr::Domain { host, port } => {
                     let host_b = host.as_bytes();
                     if host_b.len() > 255 {
-                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "domain too long"));
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "domain too long",
+                        ));
                     }
                     w.write_all(&[0x03, host_b.len() as u8]).await?;
                     w.write_all(host_b).await?;
@@ -232,16 +235,17 @@ impl UdpOverTcpTunnel {
 
             w.write_all(&(data.len() as u16).to_be_bytes()).await?;
             w.write_all(data).await?;
-            // Performance: flush is expensive, but for UDP we need it. 
+            // Performance: flush is expensive, but for UDP we need it.
             // However, we only flush if the write-half buffer is full or periodically.
             // For now, keep flush but ensure it's handled.
             w.flush().await?;
             Ok(())
-        }.await;
+        }
+        .await;
 
         if let Err(e) = res {
             // CRITICAL: Shut down the tunnel on write error to avoid zombie tasks
-            // We can't easily trigger stop_tx from here since self is &self, 
+            // We can't easily trigger stop_tx from here since self is &self,
             // but the next read loop iteration will fail or we can mark state.
             return Err(e.into());
         }

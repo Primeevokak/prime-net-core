@@ -37,7 +37,10 @@ pub fn system_proxy_manager() -> Box<dyn ProxyManager> {
     Box::new(windows::WindowsProxyManager)
 }
 
-pub fn resolve_process_id_by_connection(local: std::net::SocketAddr, remote: std::net::SocketAddr) -> Option<u32> {
+pub fn resolve_process_id_by_connection(
+    local: std::net::SocketAddr,
+    remote: std::net::SocketAddr,
+) -> Option<u32> {
     #[cfg(target_os = "windows")]
     {
         windows::get_process_id_by_connection(local, remote)

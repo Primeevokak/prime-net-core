@@ -141,12 +141,12 @@ impl<T> FragmentingIo<T> {
                 if sni_off > 0 {
                     plan.push(sni_off);
                 }
-                
+
                 // Агрессивный разрез внутри SNI (разрезаем на части по 2 байта и остаток)
                 if sni_len > 4 {
-                    plan.push(2); 
-                    plan.push(2); 
-                    plan.push(sni_len - 4); 
+                    plan.push(2);
+                    plan.push(2);
+                    plan.push(sni_len - 4);
                 } else if sni_len > 0 {
                     plan.push(1);
                     if sni_len > 1 {
@@ -158,7 +158,7 @@ impl<T> FragmentingIo<T> {
                 if consumed < buf_len {
                     plan.push(buf_len - consumed);
                 }
-                
+
                 if !plan.is_empty() {
                     self.cfg.first_write_plan = Some(plan);
                 }
@@ -189,13 +189,13 @@ impl<T> FragmentingIo<T> {
         if self.cfg.randomize_fragment_size {
             let min = self.cfg.fragment_size_min.max(1);
             let mut max = self.cfg.fragment_size_max.max(min);
-            
+
             // Limit by current buffer size to avoid out-of-bounds
             let limit = buf_len.max(1);
             if min >= limit {
                 return limit;
             }
-            
+
             max = max.min(limit);
             if min >= max {
                 return min;
@@ -269,7 +269,7 @@ pub(crate) fn find_sni_info(client_hello: &[u8]) -> Option<(usize, usize)> {
             return None;
         }
         if ext_type == 0x0000 {
-            // Found SNI extension. 
+            // Found SNI extension.
             // Structure: Type(2) | Len(2) | ListLen(2) | NameType(1) | NameLen(2) | Name(N)
             return Some((pos, 4 + ext_len));
         }

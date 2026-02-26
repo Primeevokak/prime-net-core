@@ -68,7 +68,11 @@ async fn real_main() -> Result<()> {
         version = prime_net_engine_core::version::APP_VERSION,
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
-        build = if cfg!(debug_assertions) { "debug" } else { "release" },
+        build = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
         "=== PRIME NET ENGINE STARTUP ==="
     );
 

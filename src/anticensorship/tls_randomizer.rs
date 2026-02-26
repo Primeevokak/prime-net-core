@@ -18,7 +18,9 @@ pub fn generate_fake_client_hello() -> Vec<u8> {
         "www.reddit.com",
         "www.github.com",
     ];
-    let domain = domains.choose(&mut thread_rng()).unwrap_or(&"www.google.com");
+    let domain = domains
+        .choose(&mut thread_rng())
+        .unwrap_or(&"www.google.com");
     build_client_hello_for_domain(domain)
 }
 
@@ -26,8 +28,8 @@ pub fn generate_fake_client_hello() -> Vec<u8> {
 pub fn build_client_hello_for_domain(domain: &str) -> Vec<u8> {
     const SUPPORTED_VERSIONS_EXT: [u8; 9] = [0x00, 0x2b, 0x00, 0x05, 0x04, 0x03, 0x04, 0x03, 0x03];
     const ALPN_EXT: [u8; 16] = [
-        0x00, 0x10, 0x00, 0x0e, 0x00, 0x0c, 0x02, 0x68, 0x32, 0x08, 0x68, 0x74, 0x74, 0x70,
-        0x2f, 0x31,
+        0x00, 0x10, 0x00, 0x0e, 0x00, 0x0c, 0x02, 0x68, 0x32, 0x08, 0x68, 0x74, 0x74, 0x70, 0x2f,
+        0x31,
     ];
     const ALPN_EXT_TAIL: [u8; 2] = [0x2e, 0x31];
 
@@ -38,7 +40,7 @@ pub fn build_client_hello_for_domain(domain: &str) -> Vec<u8> {
 
     let mut body = Vec::new();
     body.extend_from_slice(&[0x03, 0x03]); // Legacy Version (TLS 1.2)
-    
+
     // Random (32 bytes)
     let mut random = [0u8; 32];
     rand::thread_rng().fill(&mut random);
@@ -60,7 +62,7 @@ pub fn build_client_hello_for_domain(domain: &str) -> Vec<u8> {
 
     // Extensions
     let mut exts_data = Vec::new();
-    
+
     // SNI Extension
     exts_data.extend_from_slice(&0x0000u16.to_be_bytes());
     exts_data.extend_from_slice(&sni_ext_len.to_be_bytes());

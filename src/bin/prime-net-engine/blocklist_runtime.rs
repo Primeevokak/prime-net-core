@@ -43,7 +43,10 @@ impl DomainMatcher {
         for ip in ips {
             i_set.insert(ip.trim().to_owned());
         }
-        Self { domains: d_set, ips: i_set }
+        Self {
+            domains: d_set,
+            ips: i_set,
+        }
     }
 
     fn contains_host_or_suffix(&self, host: &str) -> bool {
@@ -51,7 +54,7 @@ impl DomainMatcher {
         if host.is_empty() {
             return false;
         }
-        
+
         // If it's an IP literal, check the IP set
         if host.parse::<std::net::IpAddr>().is_ok() {
             return self.ips.contains(&host);
@@ -87,10 +90,11 @@ pub async fn initialize_runtime_blocklist(cfg: &BlocklistConfig) -> Result<Runti
 
     let cache_path = expand_tilde(&cfg.cache_path);
     let mut cache = BlocklistCache::status(&cache_path)?;
-    
+
     // Invalidate suspiciously small cache for large known sources
     if let Some(ref c) = cache {
-        if c.domains.len() < 5000 && (c.source.contains("zapret-info") || c.source.contains("z-i")) {
+        if c.domains.len() < 5000 && (c.source.contains("zapret-info") || c.source.contains("z-i"))
+        {
             warn!(target: "socks_cmd", domains = c.domains.len(), "cached blocklist is suspiciously small; invalidating to force full re-parse");
             cache = None;
         }
@@ -120,7 +124,7 @@ pub async fn initialize_runtime_blocklist(cfg: &BlocklistConfig) -> Result<Runti
         .as_ref()
         .map(|c| (c.domains.clone(), c.ips.clone()))
         .unwrap_or_default();
-    
+
     if domains.is_empty() && ips.is_empty() {
         domains = load_domains_from_pt_tools().unwrap_or_default();
     }

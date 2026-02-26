@@ -304,23 +304,44 @@ impl WindowsProxyManager {
     }
 }
 
-pub fn get_process_id_by_connection(local: std::net::SocketAddr, remote: std::net::SocketAddr) -> Option<u32> {
+pub fn get_process_id_by_connection(
+    local: std::net::SocketAddr,
+    remote: std::net::SocketAddr,
+) -> Option<u32> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GetExtendedTcpTable, TCP_TABLE_OWNER_PID_ALL,
     };
     use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
     let mut dw_size = 0;
-    let family = if local.is_ipv4() { AF_INET as u32 } else { AF_INET6 as u32 };
+    let family = if local.is_ipv4() {
+        AF_INET as u32
+    } else {
+        AF_INET6 as u32
+    };
 
     // Initial call to get required size
     unsafe {
-        GetExtendedTcpTable(std::ptr::null_mut(), &mut dw_size, 0, family, TCP_TABLE_OWNER_PID_ALL, 0);
+        GetExtendedTcpTable(
+            std::ptr::null_mut(),
+            &mut dw_size,
+            0,
+            family,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        );
     }
 
     let mut buffer = vec![0u8; dw_size as usize];
     let ret = unsafe {
-        GetExtendedTcpTable(buffer.as_mut_ptr() as *mut _, &mut dw_size, 0, family, TCP_TABLE_OWNER_PID_ALL, 0)
+        GetExtendedTcpTable(
+            buffer.as_mut_ptr() as *mut _,
+            &mut dw_size,
+            0,
+            family,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        )
     };
 
     if ret != 0 {
@@ -330,7 +351,8 @@ pub fn get_process_id_by_connection(local: std::net::SocketAddr, remote: std::ne
     if local.is_ipv4() {
         let table = buffer.as_ptr() as *const MIB_TCPTABLE_OWNER_PID;
         let num_entries = unsafe { (*table).dwNumEntries };
-        let entries = unsafe { std::slice::from_raw_parts((*table).table.as_ptr(), num_entries as usize) };
+        let entries =
+            unsafe { std::slice::from_raw_parts((*table).table.as_ptr(), num_entries as usize) };
 
         for entry in entries {
             let entry_local_addr = std::net::Ipv4Addr::from(u32::from_be(entry.dwLocalAddr));
@@ -339,8 +361,11 @@ pub fn get_process_id_by_connection(local: std::net::SocketAddr, remote: std::ne
             let entry_remote_port = u16::from_be(entry.dwRemotePort as u16);
 
             if let (std::net::SocketAddr::V4(l), std::net::SocketAddr::V4(r)) = (local, remote) {
-                if entry_local_addr == *l.ip() && entry_local_port == l.port() &&
-                   entry_remote_addr == *r.ip() && entry_remote_port == r.port() {
+                if entry_local_addr == *l.ip()
+                    && entry_local_port == l.port()
+                    && entry_remote_addr == *r.ip()
+                    && entry_remote_port == r.port()
+                {
                     return Some(entry.dwOwningPid);
                 }
             }
@@ -348,7 +373,8 @@ pub fn get_process_id_by_connection(local: std::net::SocketAddr, remote: std::ne
     } else {
         let table = buffer.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID;
         let num_entries = unsafe { (*table).dwNumEntries };
-        let entries = unsafe { std::slice::from_raw_parts((*table).table.as_ptr(), num_entries as usize) };
+        let entries =
+            unsafe { std::slice::from_raw_parts((*table).table.as_ptr(), num_entries as usize) };
 
         for entry in entries {
             let entry_local_addr = std::net::Ipv6Addr::from(entry.ucLocalAddr);
@@ -357,8 +383,11 @@ pub fn get_process_id_by_connection(local: std::net::SocketAddr, remote: std::ne
             let entry_remote_port = u16::from_be(entry.dwRemotePort as u16);
 
             if let (std::net::SocketAddr::V6(l), std::net::SocketAddr::V6(r)) = (local, remote) {
-                if entry_local_addr == *l.ip() && entry_local_port == l.port() &&
-                   entry_remote_addr == *r.ip() && entry_remote_port == r.port() {
+                if entry_local_addr == *l.ip()
+                    && entry_local_port == l.port()
+                    && entry_remote_addr == *r.ip()
+                    && entry_remote_port == r.port()
+                {
                     return Some(entry.dwOwningPid);
                 }
             }
@@ -371,7 +400,8 @@ pub fn get_process_id_by_connection(local: std::net::SocketAddr, remote: std::ne
 pub fn get_process_name_by_pid(pid: u32) -> Option<String> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     let handle: HANDLE = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };

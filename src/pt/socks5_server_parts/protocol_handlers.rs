@@ -68,7 +68,12 @@ pub(super) async fn handle_http_proxy(
             port,
         };
         let target_label = route_decision_key(&destination, &target_endpoint.addr);
-        let candidates = select_route_candidates(&relay_opts, &target_endpoint.addr, target_endpoint.port, &target_label);
+        let candidates = select_route_candidates(
+            &relay_opts,
+            &target_endpoint.addr,
+            target_endpoint.port,
+            &target_label,
+        );
         let ordered = ordered_route_candidates(&target_label, candidates);
 
         debug!(target: "socks5", conn_id, peer = %peer, client = %client, destination = %destination, "HTTP CONNECT requested");
@@ -94,7 +99,7 @@ pub(super) async fn handle_http_proxy(
             }
         };
         if connected.candidate.kind == RouteKind::Bypass {
-            debug!(
+            info!(
                 target: "socks5",
                 conn_id,
                 peer = %peer,
@@ -127,6 +132,16 @@ pub(super) async fn handle_http_proxy(
             .await
         {
             if is_expected_disconnect(&e) {
+                complete_route_outcome_event(
+                    connected.decision_id,
+                    &connected.route_key,
+                    Some(&connected.candidate),
+                    true,
+                    false,
+                    0,
+                    0,
+                    "client-disconnect-before-confirm",
+                );
                 debug!(
                     target: "socks5",
                     conn_id,
@@ -138,6 +153,16 @@ pub(super) async fn handle_http_proxy(
                 );
                 return Ok(());
             }
+            complete_route_outcome_event(
+                connected.decision_id,
+                &connected.route_key,
+                Some(&connected.candidate),
+                true,
+                false,
+                0,
+                0,
+                "client-confirm-io",
+            );
             return Err(e.into());
         }
 
@@ -152,8 +177,10 @@ pub(super) async fn handle_http_proxy(
                 "bypass tunnel established"
             );
             let bypass_tunnel_started = Instant::now();
+            let noisy_tls_destination = is_noise_probe_https_destination(&destination);
             let tuned = tune_relay_for_target(relay_opts.clone(), port, &destination, false, true);
-            match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options.clone()).await {
+            match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options.clone()).await
+            {
                 Ok((c2u, u2c)) => {
                     let lifetime_ms = bypass_tunnel_started.elapsed().as_millis() as u64;
                     let evasion_tag = if tuned.options.fragment_client_hello {
@@ -161,9 +188,11 @@ pub(super) async fn handle_http_proxy(
                     } else {
                         ""
                     };
+                    let outcome_error_class: &str;
+                    let tls_ok_proxy = u2c > 0;
 
-                    debug!(
-                        target: "socks5",
+                    info!(
+                        target: "socks5.bypass",
                         conn_id,
                         destination = %destination,
                         bytes_client_to_bypass = c2u,
@@ -175,16 +204,22 @@ pub(super) async fn handle_http_proxy(
                         evasion_tag
                     );
                     if should_skip_empty_session_scoring(c2u, u2c) {
-                        if should_mark_empty_bypass_session_as_soft_failure(&connected.candidate, port)
+                        if should_mark_empty_bypass_session_as_soft_failure(
+                            &connected.candidate,
+                            port,
+                        ) && !noisy_tls_destination
                         {
                             record_route_failure(
                                 &connected.route_key,
                                 &connected.candidate,
                                 "zero-reply-soft",
                             );
+                            outcome_error_class = "zero-reply-soft";
+                        } else {
+                            outcome_error_class = "empty-session";
                         }
-                    } else if u2c < 20 && lifetime_ms < 1000 {
-                        // Very short session with almost no data is likely a TLS handshake failure 
+                    } else if u2c < 20 && lifetime_ms < 1000 && !noisy_tls_destination {
+                        // Very short session with almost no data is likely a TLS handshake failure
                         // disguised as a successful TCP connect.
                         record_route_failure(
                             &connected.route_key,
@@ -198,34 +233,190 @@ pub(super) async fn handle_http_proxy(
                             bytes_u2c = u2c,
                             "bypass session too short/empty, marked as weak"
                         );
+                        outcome_error_class = "zero-reply-soft";
                     } else if should_mark_bypass_profile_failure(
                         port,
                         c2u,
                         u2c,
                         relay_opts.suspicious_zero_reply_min_c2u as u64,
                     ) {
+                        if !noisy_tls_destination {
+                            record_bypass_profile_failure(
+                                &destination,
+                                connected.candidate.bypass_profile_idx,
+                                connected.candidate.bypass_profile_total,
+                                "suspicious-zero-reply",
+                            );
+                            record_route_failure(
+                                &connected.route_key,
+                                &connected.candidate,
+                                "suspicious-zero-reply",
+                            );
+                            warn!(
+                                target: "socks5",
+                                conn_id,
+                                destination = %destination,
+                                bytes_client_to_bypass = c2u,
+                                bytes_bypass_to_client = u2c,
+                                bypass_profile = connected.candidate.bypass_profile_idx + 1,
+                                bypass_profiles = connected.candidate.bypass_profile_total,
+                                "bypass profile marked as weak for destination"
+                            );
+                        }
+                        outcome_error_class = "suspicious-zero-reply";
+                    } else if should_mark_bypass_zero_reply_soft(port, c2u, u2c, lifetime_ms) {
+                        if !noisy_tls_destination {
+                            record_route_failure(
+                                &connected.route_key,
+                                &connected.candidate,
+                                "zero-reply-soft",
+                            );
+                            warn!(
+                                target: "socks5.route",
+                                conn_id,
+                                route_key = %connected.route_key,
+                                route = connected.candidate.route_label(),
+                                destination = %destination,
+                                bytes_client_to_bypass = c2u,
+                                bytes_bypass_to_client = u2c,
+                                session_lifetime_ms = lifetime_ms,
+                                "adaptive route observed soft zero-reply; winner confidence reduced"
+                            );
+                        }
+                        outcome_error_class = "zero-reply-soft";
+                    } else {
+                        record_bypass_profile_success(
+                            &destination,
+                            connected.candidate.bypass_profile_idx,
+                        );
+                        record_route_success(&connected.route_key, &connected.candidate);
+                        outcome_error_class = "ok";
+                    }
+                    complete_route_outcome_event(
+                        connected.decision_id,
+                        &connected.route_key,
+                        Some(&connected.candidate),
+                        true,
+                        tls_ok_proxy,
+                        u2c,
+                        lifetime_ms,
+                        outcome_error_class,
+                    );
+                }
+                Err(e) if is_expected_disconnect(&e) => {
+                    complete_route_outcome_event(
+                        connected.decision_id,
+                        &connected.route_key,
+                        Some(&connected.candidate),
+                        true,
+                        false,
+                        0,
+                        bypass_tunnel_started.elapsed().as_millis() as u64,
+                        "client-disconnect",
+                    );
+                    let _ = e;
+                }
+                Err(e) => {
+                    warn!(
+                        target: "socks5",
+                        conn_id,
+                        destination = %destination,
+                        error = %e,
+                        "bypass tunnel error"
+                    );
+                    if !noisy_tls_destination {
                         record_bypass_profile_failure(
                             &destination,
                             connected.candidate.bypass_profile_idx,
                             connected.candidate.bypass_profile_total,
-                            "suspicious-zero-reply",
+                            "io-error",
+                        );
+                        record_route_failure(
+                            &connected.route_key,
+                            &connected.candidate,
+                            "io-error",
+                        );
+                    }
+                    complete_route_outcome_event(
+                        connected.decision_id,
+                        &connected.route_key,
+                        Some(&connected.candidate),
+                        true,
+                        false,
+                        0,
+                        bypass_tunnel_started.elapsed().as_millis() as u64,
+                        "io-error",
+                    );
+                }
+            }
+            return Ok(());
+        }
+
+        let is_bypass = connected.candidate.kind == RouteKind::Bypass;
+        let mut tuned = tune_relay_for_target(relay_opts, port, &destination, false, false);
+
+        // CRITICAL: If we are using a Bypass route, disable internal evasion to avoid "double fragmentation"
+        // which triggers antivirus resets and breaks Discord/Cloudflare.
+        if is_bypass {
+            tuned.options.fragment_client_hello = false;
+            tuned.options.tcp_window_trick = false;
+            tuned.options.sni_spoofing = false;
+            tuned.options.sni_case_toggle = false;
+        }
+
+        let direct_tunnel_started = Instant::now();
+        match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options.clone()).await {
+            Ok((bytes_client_to_upstream, bytes_upstream_to_client)) => {
+                let mut outcome_error_class = "ok";
+                if should_skip_empty_session_scoring(
+                    bytes_client_to_upstream,
+                    bytes_upstream_to_client,
+                ) {
+                    debug!(
+                        target: "socks5.route",
+                        conn_id,
+                        route_key = %connected.route_key,
+                        route = connected.candidate.route_label(),
+                        destination = %destination,
+                        "adaptive route skipped scoring for empty direct session"
+                    );
+                    outcome_error_class = "empty-session";
+                } else if should_mark_suspicious_zero_reply(
+                    port,
+                    bytes_client_to_upstream,
+                    bytes_upstream_to_client,
+                    tuned.options.suspicious_zero_reply_min_c2u,
+                ) {
+                    if !is_noise_probe_https_destination(&destination) {
+                        record_destination_failure(
+                            &destination,
+                            BlockingSignal::SuspiciousZeroReply,
+                            tuned.options.classifier_emit_interval_secs,
+                            tuned.stage,
+                        );
+                        warn!(
+                            target: "socks5",
+                            conn_id,
+                            peer = %peer,
+                            client = %client,
+                            destination = %destination,
+                            bytes_client_to_upstream,
+                            bytes_upstream_to_client,
+                            "HTTP CONNECT suspicious early close (no upstream bytes) classified as potential blocking"
                         );
                         record_route_failure(
                             &connected.route_key,
                             &connected.candidate,
                             "suspicious-zero-reply",
                         );
-                        warn!(
-                            target: "socks5",
-                            conn_id,
-                            destination = %destination,
-                            bytes_client_to_bypass = c2u,
-                            bytes_bypass_to_client = u2c,
-                            bypass_profile = connected.candidate.bypass_profile_idx + 1,
-                            bypass_profiles = connected.candidate.bypass_profile_total,
-                            "bypass profile marked as weak for destination"
-                        );
-                    } else if should_mark_bypass_zero_reply_soft(port, c2u, u2c, lifetime_ms) {
+                        outcome_error_class = "suspicious-zero-reply";
+                    }
+                } else if should_mark_route_soft_zero_reply(
+                    port,
+                    bytes_client_to_upstream,
+                    bytes_upstream_to_client,
+                ) {
+                    if !is_noise_probe_https_destination(&destination) {
                         record_route_failure(
                             &connected.route_key,
                             &connected.candidate,
@@ -237,117 +428,27 @@ pub(super) async fn handle_http_proxy(
                             route_key = %connected.route_key,
                             route = connected.candidate.route_label(),
                             destination = %destination,
-                            bytes_client_to_bypass = c2u,
-                            bytes_bypass_to_client = u2c,
-                            session_lifetime_ms = lifetime_ms,
+                            bytes_client_to_upstream,
+                            bytes_upstream_to_client,
                             "adaptive route observed soft zero-reply; winner confidence reduced"
                         );
-                    } else {
-                        record_bypass_profile_success(
-                            &destination,
-                            connected.candidate.bypass_profile_idx,
-                        );
-                        record_route_success(&connected.route_key, &connected.candidate);
                     }
-                }
-                Err(e) if is_expected_disconnect(&e) => {
-                    let _ = e;
-                }
-                Err(e) => {
-                    warn!(
-                        target: "socks5",
-                        conn_id,
-                        destination = %destination,
-                        error = %e,
-                        "bypass tunnel error"
-                    );
-                    record_bypass_profile_failure(
-                        &destination,
-                        connected.candidate.bypass_profile_idx,
-                        connected.candidate.bypass_profile_total,
-                        "io-error",
-                    );
-                    record_route_failure(&connected.route_key, &connected.candidate, "io-error");
-                }
-            }
-            return Ok(());
-        }
-
-        let is_bypass = connected.candidate.kind == RouteKind::Bypass;
-        let mut tuned = tune_relay_for_target(relay_opts, port, &destination, false, false);
-        
-        // CRITICAL: If we are using a Bypass route, disable internal evasion to avoid "double fragmentation"
-        // which triggers antivirus resets and breaks Discord/Cloudflare.
-        if is_bypass {
-            tuned.options.fragment_client_hello = false;
-            tuned.options.tcp_window_trick = false;
-            tuned.options.sni_spoofing = false;
-            tuned.options.sni_case_toggle = false;
-        }
-
-        match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options.clone()).await {
-            Ok((bytes_client_to_upstream, bytes_upstream_to_client)) => {
-                if should_skip_empty_session_scoring(bytes_client_to_upstream, bytes_upstream_to_client)
-                {
-                    debug!(
-                        target: "socks5.route",
-                        conn_id,
-                        route_key = %connected.route_key,
-                        route = connected.candidate.route_label(),
-                        destination = %destination,
-                        "adaptive route skipped scoring for empty direct session"
-                    );
-                } else if should_mark_suspicious_zero_reply(
-                    port,
-                    bytes_client_to_upstream,
-                    bytes_upstream_to_client,
-                    tuned.options.suspicious_zero_reply_min_c2u,
-                ) {
-                    record_destination_failure(
-                        &destination,
-                        BlockingSignal::SuspiciousZeroReply,
-                        tuned.options.classifier_emit_interval_secs,
-                        tuned.stage,
-                    );
-                    warn!(
-                        target: "socks5",
-                        conn_id,
-                        peer = %peer,
-                        client = %client,
-                        destination = %destination,
-                        bytes_client_to_upstream,
-                        bytes_upstream_to_client,
-                        "HTTP CONNECT suspicious early close (no upstream bytes) classified as potential blocking"
-                    );
-                    record_route_failure(
-                        &connected.route_key,
-                        &connected.candidate,
-                        "suspicious-zero-reply",
-                    );
-                } else if should_mark_route_soft_zero_reply(
-                    port,
-                    bytes_client_to_upstream,
-                    bytes_upstream_to_client,
-                ) {
-                    record_route_failure(
-                        &connected.route_key,
-                        &connected.candidate,
-                        "zero-reply-soft",
-                    );
-                    warn!(
-                        target: "socks5.route",
-                        conn_id,
-                        route_key = %connected.route_key,
-                        route = connected.candidate.route_label(),
-                        destination = %destination,
-                        bytes_client_to_upstream,
-                        bytes_upstream_to_client,
-                        "adaptive route observed soft zero-reply; winner confidence reduced"
-                    );
+                    outcome_error_class = "zero-reply-soft";
                 } else {
                     record_destination_success(&destination, tuned.stage, tuned.source);
                     record_route_success(&connected.route_key, &connected.candidate);
+                    outcome_error_class = "ok";
                 }
+                complete_route_outcome_event(
+                    connected.decision_id,
+                    &connected.route_key,
+                    Some(&connected.candidate),
+                    true,
+                    bytes_upstream_to_client > 0,
+                    bytes_upstream_to_client,
+                    direct_tunnel_started.elapsed().as_millis() as u64,
+                    outcome_error_class,
+                );
                 debug!(
                     target: "socks5",
                     conn_id,
@@ -360,6 +461,16 @@ pub(super) async fn handle_http_proxy(
                 );
             }
             Err(e) if is_expected_disconnect(&e) => {
+                complete_route_outcome_event(
+                    connected.decision_id,
+                    &connected.route_key,
+                    Some(&connected.candidate),
+                    true,
+                    false,
+                    0,
+                    direct_tunnel_started.elapsed().as_millis() as u64,
+                    "client-disconnect",
+                );
                 debug!(
                     target: "socks5",
                     conn_id,
@@ -381,6 +492,16 @@ pub(super) async fn handle_http_proxy(
                 record_route_failure(
                     &connected.route_key,
                     &connected.candidate,
+                    blocking_signal_label(signal),
+                );
+                complete_route_outcome_event(
+                    connected.decision_id,
+                    &connected.route_key,
+                    Some(&connected.candidate),
+                    true,
+                    false,
+                    0,
+                    direct_tunnel_started.elapsed().as_millis() as u64,
                     blocking_signal_label(signal),
                 );
                 warn!(
@@ -563,6 +684,25 @@ fn is_noise_probe_http_destination(destination: &str) -> bool {
         || host.contains("captive")
 }
 
+pub(super) fn is_noise_probe_https_destination(destination: &str) -> bool {
+    let host = destination
+        .split_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(destination)
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if is_noise_probe_http_destination(destination) {
+        return true;
+    }
+    host.contains("doubleclick.net")
+        || host.contains("googlesyndication.com")
+        || host.contains("googleadservices.com")
+        || host.contains("ogads-pa.")
+        || host.starts_with("adservice.")
+}
+
 pub(super) fn tune_relay_for_target(
     mut base: RelayOptions,
     port: u16,
@@ -576,7 +716,7 @@ pub(super) fn tune_relay_for_target(
         // We use base options but explicitly disable our own fragmentation to avoid "double-evasion".
         let mut opts = base.clone();
         opts.fragment_client_hello = false;
-        
+
         return TunedRelay {
             options: opts,
             stage: 0,
@@ -605,30 +745,40 @@ pub(super) fn tune_relay_for_target(
         stage = stage.max(preferred);
         source = StageSelectionSource::Cache;
     }
-    
+
     let failures = destination_failures(destination);
     if preferred == 0 && failures == 0 && base.strategy_race_enabled && !socks4_flow {
         stage = select_race_probe_stage(destination);
         source = StageSelectionSource::Probe;
     }
-    
-    let is_very_sensitive = destination.contains("discord") || destination.contains("instagram") || 
-                           destination.contains("facebook") || destination.contains("fbcdn") ||
-                           destination.contains("youtube") || destination.contains("ytimg") ||
-                           destination.contains("googlevideo") || destination.contains("ggpht") ||
-                           destination.contains("google.com") || destination.contains("discordapp") ||
-                           destination.contains("discord.gg") || destination.contains("cloudflare") ||
-                           destination.contains("aka.ms") || destination.contains("windowsupdate") ||
-                           destination.contains("spotify");
-                           
+
+    let is_very_sensitive = destination.contains("discord")
+        || destination.contains("instagram")
+        || destination.contains("facebook")
+        || destination.contains("fbcdn")
+        || destination.contains("youtube")
+        || destination.contains("ytimg")
+        || destination.contains("googlevideo")
+        || destination.contains("ggpht")
+        || destination.contains("google.com")
+        || destination.contains("discordapp")
+        || destination.contains("discord.gg")
+        || destination.contains("cloudflare")
+        || destination.contains("aka.ms")
+        || destination.contains("windowsupdate")
+        || destination.contains("spotify");
+
     if is_very_sensitive {
         base.tcp_window_trick = true;
         if failures == 0 {
             // Discord doesn't like Stage 4 fragmentation on some ISPs/AVs.
             // Keep it at Stage 2 for Discord initially to be safe but effective.
             // CRITICAL: For Discord, STICK to Stage 2. Do not escalate to 3 or 4.
-            if destination.contains("discord") || destination.contains("discordapp") || destination.contains("discord.gg") {
-                stage = 2; 
+            if destination.contains("discord")
+                || destination.contains("discordapp")
+                || destination.contains("discord.gg")
+            {
+                stage = 2;
             } else {
                 stage = stage.max(4);
             }
@@ -644,7 +794,7 @@ pub(super) fn tune_relay_for_target(
     if failures >= base.stage3_failures {
         stage = 4;
     }
-    
+
     stage = stage.min(4);
 
     if socks4_flow && !WARNED_SOCKS4_AGGRESSIVE.swap(true, Ordering::Relaxed) {
@@ -697,7 +847,7 @@ pub(super) fn tune_relay_for_target(
             fragment_size_min: 1,
             #[cfg(not(windows))]
             fragment_size_max: 1,
-            fragment_sleep_ms: base.fragment_sleep_ms.min(1), 
+            fragment_sleep_ms: base.fragment_sleep_ms.min(1),
             fragment_budget_bytes: base.fragment_budget_bytes.clamp(4096, 8192),
             client_hello_split_offsets: vec![16, 32, 64],
             sni_spoofing: true,
@@ -821,8 +971,13 @@ pub(super) fn route_state_key(destination: &str) -> String {
     destination.trim().to_ascii_lowercase()
 }
 
-pub(super) fn route_capability_is_available(kind: RouteKind, family: RouteIpFamily, now: u64) -> bool {
-    let map = ROUTE_CAPABILITIES.get_or_init(|| std::sync::RwLock::new(RouteCapabilities::default()));
+pub(super) fn route_capability_is_available(
+    kind: RouteKind,
+    family: RouteIpFamily,
+    now: u64,
+) -> bool {
+    let map =
+        ROUTE_CAPABILITIES.get_or_init(|| std::sync::RwLock::new(RouteCapabilities::default()));
     let Ok(guard) = map.read() else {
         return true;
     };
@@ -835,4 +990,3 @@ pub(super) fn route_capability_is_available(kind: RouteKind, family: RouteIpFami
     };
     until <= now
 }
-

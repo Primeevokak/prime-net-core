@@ -21,7 +21,7 @@ pub struct ShadowsocksOutbound {
 impl ShadowsocksOutbound {
     pub async fn new(resolver: Arc<ResolverChain>, cfg: ShadowsocksPtConfig) -> Result<Self> {
         let (host, port) = split_host_port(&cfg.server)?;
-        
+
         // Validate method early
         let method = cfg
             .method
@@ -55,7 +55,10 @@ impl ShadowsocksOutbound {
         } else {
             let ips = self.resolver.resolve(&self.server_host).await?;
             let ip = *ips.first().ok_or_else(|| {
-                EngineError::Internal(format!("dns resolver returned no IPs for '{}'", self.server_host))
+                EngineError::Internal(format!(
+                    "dns resolver returned no IPs for '{}'",
+                    self.server_host
+                ))
             })?;
             info!(target: "outbound.shadowsocks", server_host = %self.server_host, resolved_ip = %ip, server_port = self.server_port, "Shadowsocks server resolved");
             std::net::SocketAddr::new(ip, self.server_port)
@@ -68,7 +71,7 @@ impl ShadowsocksOutbound {
         )
         .map_err(|e| EngineError::Config(format!("pt.shadowsocks config error: {e}")))?;
         server_cfg.set_mode(shadowsocks::config::Mode::TcpOnly);
-        
+
         let server_endpoint = server_addr.to_string();
 
         let addr = match target.addr {

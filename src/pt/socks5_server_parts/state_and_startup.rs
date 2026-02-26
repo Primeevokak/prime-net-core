@@ -6,7 +6,8 @@ pub(super) static WARNED_SOCKS4_AGGRESSIVE: AtomicBool = AtomicBool::new(false);
 
 pub(super) static DEST_FAILURES: OnceLock<DashMap<String, u8>> = OnceLock::new();
 pub(super) static DEST_PREFERRED_STAGE: OnceLock<DashMap<String, u8>> = OnceLock::new();
-pub(super) static DEST_CLASSIFIER: OnceLock<DashMap<String, DestinationClassifier>> = OnceLock::new();
+pub(super) static DEST_CLASSIFIER: OnceLock<DashMap<String, DestinationClassifier>> =
+    OnceLock::new();
 pub(super) static DEST_BYPASS_PROFILE_IDX: OnceLock<DashMap<String, u8>> = OnceLock::new();
 pub(super) static DEST_BYPASS_PROFILE_FAILURES: OnceLock<DashMap<String, u8>> = OnceLock::new();
 pub(super) static GLOBAL_BYPASS_PROFILE_HEALTH: OnceLock<DashMap<String, BypassProfileHealth>> =
@@ -19,7 +20,11 @@ pub(super) static RACE_SOURCE_COUNTERS: OnceLock<RaceSourceCounters> = OnceLock:
 pub(super) static ROUTE_METRICS: OnceLock<RwLock<RouteMetrics>> = OnceLock::new();
 pub(super) static ROUTE_CAPABILITIES: OnceLock<RwLock<RouteCapabilities>> = OnceLock::new();
 pub(super) static BYPASS_POOL: OnceLock<DashMap<SocketAddr, Vec<TcpStream>>> = OnceLock::new();
+pub(super) static BYPASS_POOL_WARMUP_NEXT_AT_MS: OnceLock<DashMap<SocketAddr, u64>> =
+    OnceLock::new();
 pub(super) static NEXT_BYPASS_POOL_IDX: AtomicU64 = AtomicU64::new(0);
+
+const BYPASS_POOL_WARMUP_COOLDOWN_MS: u64 = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayOptions {
@@ -294,6 +299,7 @@ pub struct ConnectedRoute {
     pub candidate: RouteCandidate,
     pub route_key: String,
     pub raced: bool,
+    pub decision_id: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,7 +345,7 @@ pub async fn start_socks5_server(
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
 
     let relay_opts = Arc::new(relay_opts);
-    
+
     init_classifier_store(&relay_opts);
     load_classifier_store_if_needed();
 
@@ -390,13 +396,17 @@ pub(super) async fn connect_bypass_upstream(
     bypass_profile_total: u8,
     resolver: Option<Arc<ResolverChain>>,
 ) -> Result<TcpStream> {
+    let noisy_tls_destination =
+        is_noise_probe_https_destination(route_destination_key(target_label));
     // 1. Try to get a connection from the pool
     let mut pooled_bypass = None;
     let pool_map = BYPASS_POOL.get_or_init(DashMap::new);
-    
+
     loop {
-        let s_opt = pool_map.get_mut(&bypass_addr).and_then(|mut list| list.pop());
-        
+        let s_opt = pool_map
+            .get_mut(&bypass_addr)
+            .and_then(|mut list| list.pop());
+
         let s = match s_opt {
             Some(s) => s,
             None => break,
@@ -427,34 +437,50 @@ pub(super) async fn connect_bypass_upstream(
         s
     } else {
         let pool_addr = bypass_addr;
-        tokio::spawn(async move {
-            let pool_map = BYPASS_POOL.get_or_init(DashMap::new);
-            let needs_warmup = pool_map.get(&pool_addr).map(|l| l.len() < 4).unwrap_or(true);
-            
-            if needs_warmup {
-                // Pre-warm a connection: connect and do the initial SOCKS5 handshake
-                if let Ok(Ok(mut s)) = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(pool_addr)).await {
-                    let _ = s.set_nodelay(true);
-                    // Perform initial handshake (HELLO + NO AUTH)
-                    if s.write_all(&[0x05, 0x01, 0x00]).await.is_ok() {
-                        let mut method = [0u8; 2];
-                        if tokio::time::timeout(Duration::from_millis(500), s.read_exact(&mut method))
+        if should_schedule_bypass_pool_warmup(pool_addr) {
+            tokio::spawn(async move {
+                let pool_map = BYPASS_POOL.get_or_init(DashMap::new);
+                let needs_warmup = pool_map
+                    .get(&pool_addr)
+                    .map(|l| l.len() < 4)
+                    .unwrap_or(true);
+
+                if needs_warmup {
+                    // Pre-warm a connection: connect and do the initial SOCKS5 handshake
+                    if let Ok(Ok(mut s)) =
+                        tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(pool_addr))
+                            .await
+                    {
+                        let _ = s.set_nodelay(true);
+                        // Perform initial handshake (HELLO + NO AUTH)
+                        if s.write_all(&[0x05, 0x01, 0x00]).await.is_ok() {
+                            let mut method = [0u8; 2];
+                            if tokio::time::timeout(
+                                Duration::from_millis(500),
+                                s.read_exact(&mut method),
+                            )
                             .await
                             .is_ok()
-                            && method[0] == 0x05
-                            && method[1] == 0x00
-                        {
-                            pool_map.entry(pool_addr).or_default().push(s);
+                                && method[0] == 0x05
+                                && method[1] == 0x00
+                            {
+                                pool_map.entry(pool_addr).or_default().push(s);
+                            }
                         }
                     }
                 }
-            }
-        });
+            });
+        }
 
         let mut last_e = None;
         let mut connected = None;
-        for _ in 0..2 {
-            match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(bypass_addr)).await {
+        for attempt in 0..2 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+            }
+            match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(bypass_addr))
+                .await
+            {
                 Ok(Ok(s)) => {
                     connected = Some(s);
                     break;
@@ -469,26 +495,57 @@ pub(super) async fn connect_bypass_upstream(
                 let _ = s.set_nodelay(true);
                 // Since this is a fresh connection, we must do the HELLO handshake here
                 if let Err(e) = s.write_all(&[0x05, 0x01, 0x00]).await {
-                    record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "handshake-io");
+                    if !noisy_tls_destination {
+                        record_bypass_profile_failure(
+                            target_label,
+                            bypass_profile_idx,
+                            bypass_profile_total,
+                            "handshake-io",
+                        );
+                    }
                     return Err(e.into());
                 }
                 let mut method = [0u8; 2];
                 if let Err(e) = s.read_exact(&mut method).await {
-                    record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "handshake-io");
+                    if !noisy_tls_destination {
+                        record_bypass_profile_failure(
+                            target_label,
+                            bypass_profile_idx,
+                            bypass_profile_total,
+                            "handshake-io",
+                        );
+                    }
                     return Err(e.into());
                 }
                 if method[0] != 0x05 || method[1] != 0x00 {
-                    record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "auth-rejected");
-                    return Err(EngineError::Internal(format!("bypass socks5 auth rejected: {:02x} {:02x}", method[0], method[1])));
+                    if !noisy_tls_destination {
+                        record_bypass_profile_failure(
+                            target_label,
+                            bypass_profile_idx,
+                            bypass_profile_total,
+                            "auth-rejected",
+                        );
+                    }
+                    return Err(EngineError::Internal(format!(
+                        "bypass socks5 auth rejected: {:02x} {:02x}",
+                        method[0], method[1]
+                    )));
                 }
                 s
-            },
+            }
             None => {
                 let e = last_e.unwrap_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::TimedOut, "bypass connect timeout")
                 });
                 warn!(target: "socks5", conn_id, destination = %target_label, bypass = %bypass_addr, error = %e, "bypass connect failed after retries");
-                record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "connect-failed");
+                if !noisy_tls_destination {
+                    record_bypass_profile_failure(
+                        target_label,
+                        bypass_profile_idx,
+                        bypass_profile_total,
+                        "connect-failed",
+                    );
+                }
                 return Err(e.into());
             }
         }
@@ -498,13 +555,12 @@ pub(super) async fn connect_bypass_upstream(
         if let Some(r) = &resolver {
             match r.resolve(host).await {
                 Ok(ips) if !ips.is_empty() => {
-                    let picked_ip = if host.contains("discord") {
-                        ips.iter().find(|ip| ip.is_ipv4()).copied().unwrap_or(ips[0])
+                    if let Some(picked_ip) = pick_bypass_resolved_ip(host, &ips) {
+                        debug!(target: "socks5", conn_id, host, ip = %picked_ip, "resolved domain for bypass via internal resolver");
+                        Some(TargetAddr::Ip(picked_ip))
                     } else {
-                        ips[0]
-                    };
-                    debug!(target: "socks5", conn_id, host, ip = %picked_ip, "resolved domain for bypass via internal resolver");
-                    Some(TargetAddr::Ip(picked_ip))
+                        None
+                    }
                 }
                 _ => None,
             }
@@ -521,7 +577,9 @@ pub(super) async fn connect_bypass_upstream(
     match addr_to_send {
         TargetAddr::Domain(host) => {
             let b = host.as_bytes();
-            if b.len() > 255 { return Err(EngineError::Internal("bypass domain too long".to_owned())); }
+            if b.len() > 255 {
+                return Err(EngineError::Internal("bypass domain too long".to_owned()));
+            }
             req.push(0x03);
             req.push(b.len() as u8);
             req.extend_from_slice(b);
@@ -537,55 +595,171 @@ pub(super) async fn connect_bypass_upstream(
     }
     req.extend_from_slice(&target.port.to_be_bytes());
     if let Err(e) = bypass.write_all(&req).await {
-        record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "handshake-io");
+        if !noisy_tls_destination {
+            record_bypass_profile_failure(
+                target_label,
+                bypass_profile_idx,
+                bypass_profile_total,
+                "handshake-io",
+            );
+        }
         return Err(e.into());
     }
 
     let mut reply_hdr = [0u8; 4];
     if let Err(e) = bypass.read_exact(&mut reply_hdr).await {
-        record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "handshake-io");
+        if !noisy_tls_destination {
+            record_bypass_profile_failure(
+                target_label,
+                bypass_profile_idx,
+                bypass_profile_total,
+                "handshake-io",
+            );
+        }
         return Err(e.into());
     }
     if reply_hdr[0] != 0x05 {
-        record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "invalid-reply-version");
-        return Err(EngineError::Internal(format!("bypass socks5 invalid reply version: 0x{:02x}", reply_hdr[0])));
+        if !noisy_tls_destination {
+            record_bypass_profile_failure(
+                target_label,
+                bypass_profile_idx,
+                bypass_profile_total,
+                "invalid-reply-version",
+            );
+        }
+        return Err(EngineError::Internal(format!(
+            "bypass socks5 invalid reply version: 0x{:02x}",
+            reply_hdr[0]
+        )));
     }
     if reply_hdr[1] != 0x00 {
-        record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "rep-nonzero");
-        return Err(EngineError::Internal(format!("ciadpi rejected connect: REP=0x{:02x}", reply_hdr[1])));
+        if !noisy_tls_destination {
+            record_bypass_profile_failure(
+                target_label,
+                bypass_profile_idx,
+                bypass_profile_total,
+                "rep-nonzero",
+            );
+        }
+        return Err(EngineError::Internal(format!(
+            "ciadpi rejected connect: REP=0x{:02x}",
+            reply_hdr[1]
+        )));
     }
     match reply_hdr[3] {
         0x01 => {
             let mut b = [0u8; 4 + 2];
             if let Err(e) = bypass.read_exact(&mut b).await {
-                record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "handshake-io");
+                if !noisy_tls_destination {
+                    record_bypass_profile_failure(
+                        target_label,
+                        bypass_profile_idx,
+                        bypass_profile_total,
+                        "handshake-io",
+                    );
+                }
                 return Err(e.into());
             }
         }
         0x03 => {
             let mut l = [0u8; 1];
             if let Err(e) = bypass.read_exact(&mut l).await {
-                record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "handshake-io");
+                if !noisy_tls_destination {
+                    record_bypass_profile_failure(
+                        target_label,
+                        bypass_profile_idx,
+                        bypass_profile_total,
+                        "handshake-io",
+                    );
+                }
                 return Err(e.into());
             }
             let mut b = vec![0u8; l[0] as usize + 2];
             if let Err(e) = bypass.read_exact(&mut b).await {
-                record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "handshake-io");
+                if !noisy_tls_destination {
+                    record_bypass_profile_failure(
+                        target_label,
+                        bypass_profile_idx,
+                        bypass_profile_total,
+                        "handshake-io",
+                    );
+                }
                 return Err(e.into());
             }
         }
         0x04 => {
             let mut b = [0u8; 16 + 2];
             if let Err(e) = bypass.read_exact(&mut b).await {
-                record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "handshake-io");
+                if !noisy_tls_destination {
+                    record_bypass_profile_failure(
+                        target_label,
+                        bypass_profile_idx,
+                        bypass_profile_total,
+                        "handshake-io",
+                    );
+                }
                 return Err(e.into());
             }
         }
         other => {
-            record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "invalid-addr-type");
-            return Err(EngineError::Internal(format!("bypass invalid addr type: 0x{other:02x}")));
+            if !noisy_tls_destination {
+                record_bypass_profile_failure(
+                    target_label,
+                    bypass_profile_idx,
+                    bypass_profile_total,
+                    "invalid-addr-type",
+                );
+            }
+            return Err(EngineError::Internal(format!(
+                "bypass invalid addr type: 0x{other:02x}"
+            )));
         }
     }
 
     Ok(bypass)
+}
+
+pub(super) fn pick_bypass_resolved_ip(
+    host: &str,
+    ips: &[std::net::IpAddr],
+) -> Option<std::net::IpAddr> {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let bucket = host_service_bucket(&host);
+    // Keep domain-based SOCKS CONNECT for fragile groups; pinning a single DNS answer
+    // can lock us to a bad edge and trigger repeated resets.
+    if matches!(bucket.as_str(), "meta-group:youtube" | "meta-group:google") {
+        return None;
+    }
+    let mut public_ips: Vec<std::net::IpAddr> = ips
+        .iter()
+        .copied()
+        .filter(|ip| is_bypassable_public_ip(*ip))
+        .collect();
+    if public_ips.is_empty() {
+        return None;
+    }
+    if bucket == "meta-group:discord" {
+        if let Some(v4) = public_ips.iter().find(|ip| ip.is_ipv4()).copied() {
+            return Some(v4);
+        }
+    }
+    Some(public_ips.remove(0))
+}
+
+pub(super) fn should_schedule_bypass_pool_warmup(pool_addr: SocketAddr) -> bool {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    should_schedule_bypass_pool_warmup_at(pool_addr, now_ms)
+}
+
+pub(super) fn should_schedule_bypass_pool_warmup_at(pool_addr: SocketAddr, now_ms: u64) -> bool {
+    let map = BYPASS_POOL_WARMUP_NEXT_AT_MS.get_or_init(DashMap::new);
+    let mut entry = map.entry(pool_addr).or_insert(0);
+    if *entry > now_ms {
+        return false;
+    }
+    *entry = now_ms.saturating_add(BYPASS_POOL_WARMUP_COOLDOWN_MS);
+    true
 }
