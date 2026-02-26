@@ -282,7 +282,7 @@ pub struct RouteCapabilities {
 #[derive(Debug)]
 pub struct Socks5ServerGuard {
     listen_addr: SocketAddr,
-    shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    _shutdown_tx: tokio::sync::oneshot::Sender<()>,
 }
 
 impl Socks5ServerGuard {
@@ -301,7 +301,6 @@ pub async fn start_socks5_server(
     let listen_addr = listener.local_addr().map_err(EngineError::Io)?;
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
 
-    let outbound = Arc::new(outbound);
     let relay_opts = Arc::new(relay_opts);
     
     init_classifier_store(&relay_opts);
@@ -318,9 +317,9 @@ pub async fn start_socks5_server(
                         Ok((tcp, peer)) => {
                             let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::SeqCst);
                             let relay_opts_val = (*relay_opts).clone();
-                            let outbound = outbound.clone();
+                            let outbound_handle = outbound.clone();
                             join_set.spawn(async move {
-                                if let Err(e) = handle_client(conn_id, tcp, peer, listen_addr, outbound, silent_drop, relay_opts_val).await {
+                                if let Err(e) = handle_client(conn_id, tcp, peer, listen_addr, outbound_handle, silent_drop, relay_opts_val).await {
                                     debug!(target: "socks5", conn_id, error = %e, "client session failed");
                                 }
                             });
@@ -341,7 +340,7 @@ pub async fn start_socks5_server(
 
     Ok(Socks5ServerGuard {
         listen_addr,
-        shutdown_tx,
+        _shutdown_tx: shutdown_tx,
     })
 }
 

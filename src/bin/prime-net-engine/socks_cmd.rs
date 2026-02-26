@@ -179,9 +179,9 @@ fn build_direct_relay_options(cfg: &EngineConfig) -> RelayOptions {
         randomize_fragment_size: cfg.evasion.randomize_fragment_size,
         fragment_sleep_ms: sleep_ms,
         fragment_budget_bytes: cfg.evasion.fragment_budget_bytes.clamp(1024, 128 * 1024),
-        tcp_window_size: cfg.evasion.tcp_window_size,
+        tcp_window_size: cfg.evasion.tcp_window_size as u16,
         classifier_persist_enabled: cfg.evasion.classifier_persist_enabled,
-        classifier_cache_path: Some(cfg.evasion.classifier_cache_path.clone()),
+        classifier_cache_path: cfg.evasion.classifier_cache_path.clone(),
         classifier_entry_ttl_secs: cfg.evasion.classifier_entry_ttl_secs,
         strategy_race_enabled: cfg.evasion.strategy_race_enabled,
         ..RelayOptions::default()
