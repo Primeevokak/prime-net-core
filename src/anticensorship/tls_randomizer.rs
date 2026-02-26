@@ -23,26 +23,18 @@ pub fn generate_fake_client_hello() -> Vec<u8> {
 }
 
 /// Constructs a minimal TLS 1.2+ ClientHello record with the specified SNI.
-#[allow(clippy::expect_used)]
 pub fn build_client_hello_for_domain(domain: &str) -> Vec<u8> {
+    const SUPPORTED_VERSIONS_EXT: [u8; 9] = [0x00, 0x2b, 0x00, 0x05, 0x04, 0x03, 0x04, 0x03, 0x03];
+    const ALPN_EXT: [u8; 16] = [
+        0x00, 0x10, 0x00, 0x0e, 0x00, 0x0c, 0x02, 0x68, 0x32, 0x08, 0x68, 0x74, 0x74, 0x70,
+        0x2f, 0x31,
+    ];
+    const ALPN_EXT_TAIL: [u8; 2] = [0x2e, 0x31];
+
     let host = domain.as_bytes();
     let sni_name_len = host.len() as u16;
     let sni_list_len = 1 + 2 + sni_name_len;
     let sni_ext_len = 2 + sni_list_len;
-
-    // Supported Versions (TLS 1.2, 1.3)
-    let supported_versions_ext = hex::decode("002b00050403040303").expect("valid hex");
-
-    let mut exts = Vec::new();
-    // SNI Extension
-    exts.extend_from_slice(&0x0000u16.to_be_bytes());
-    exts.extend_from_slice(&sni_ext_len.to_be_bytes());
-    exts.extend_from_slice(&sni_list_len.to_be_bytes());
-    exts.push(0x00);
-    exts.extend_from_slice(&sni_name_len.to_be_bytes());
-    exts.extend_from_slice(host);
-    // Supported Versions Extension
-    exts.extend_from_slice(&supported_versions_ext);
 
     let mut body = Vec::new();
     body.extend_from_slice(&[0x03, 0x03]); // Legacy Version (TLS 1.2)
@@ -78,10 +70,11 @@ pub fn build_client_hello_for_domain(domain: &str) -> Vec<u8> {
     exts_data.extend_from_slice(host);
 
     // Supported Versions
-    exts_data.extend_from_slice(&supported_versions_ext);
+    exts_data.extend_from_slice(&SUPPORTED_VERSIONS_EXT);
 
     // ALPN (h2, http/1.1)
-    exts_data.extend_from_slice(&hex::decode("0010000e000c02683208687474702f312e31").unwrap());
+    exts_data.extend_from_slice(&ALPN_EXT);
+    exts_data.extend_from_slice(&ALPN_EXT_TAIL);
 
     // GREASE Extension (random type, empty body)
     let grease_type = 0x0a0au16 + (rand::thread_rng().gen_range(0..10) * 0x1010);

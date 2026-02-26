@@ -119,7 +119,21 @@ pub async fn connect_via_best_route(
 
     let mut last_err = None;
     while let Some(res) = winners.join_next().await {
-        let (candidate, connect_res) = res.unwrap();
+        let (candidate, connect_res) = match res {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    target: "socks5",
+                    conn_id,
+                    error = %e,
+                    "route race worker task failed"
+                );
+                last_err = Some(EngineError::Internal(format!(
+                    "route race worker task failed: {e}"
+                )));
+                continue;
+            }
+        };
         match connect_res {
             Ok(stream) => {
                 winners.abort_all();

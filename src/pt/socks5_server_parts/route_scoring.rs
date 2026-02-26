@@ -15,18 +15,19 @@ fn route_health_score(route_key: &str, candidate: &RouteCandidate, now: u64) -> 
 
         let bucket = host_service_bucket(route_key);
         if bucket == "meta-group:discord" {
-            // Prefer Bypass for Discord if not already failing
-            let is_failing = {
-                let map = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
-                map.get(route_key)
-                    .and_then(|m| m.get(&candidate.route_id()).map(|h| h.consecutive_failures >= 2))
-                    .unwrap_or(false)
-            };
-            if !is_failing {
-                bonus += 50000; 
+            if candidate.bypass_profile_idx < 4 {
+                let is_failing = {
+                    let map = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
+                    map.get(route_key)
+                        .and_then(|m| m.get(&candidate.route_id()).map(|h| h.consecutive_failures >= 3))
+                        .unwrap_or(false)
+                };
+                if !is_failing {
+                    bonus += 50000; 
+                }
             }
-        } else if bucket == "meta-group:youtube" {
-            bonus += 10000;
+        } else if bucket == "meta-group:youtube" && candidate.bypass_profile_idx == 4 {
+            bonus += 50000;
         }
     }
 
@@ -96,15 +97,16 @@ fn bypass_profile_score_from_health(health: &BypassProfileHealth, now: u64) -> i
 }
 
 fn should_reset_bypass_profile_health(health: &BypassProfileHealth, now: u64) -> bool {
-    if health.successes == 0 && (health.failures > 20 || health.connect_failures > 10) {
-        if now.saturating_sub(health.last_failure_unix) > 600 {
-            return true;
-        }
+    if health.successes == 0
+        && (health.failures > 20 || health.connect_failures > 10)
+        && now.saturating_sub(health.last_failure_unix) > 600
+    {
+        return true;
     }
-    if bypass_profile_score_from_health(health, now) < GLOBAL_BYPASS_HARD_WEAK_SCORE {
-        if now.saturating_sub(health.last_failure_unix) > 1800 {
-            return true;
-        }
+    if bypass_profile_score_from_health(health, now) < GLOBAL_BYPASS_HARD_WEAK_SCORE
+        && now.saturating_sub(health.last_failure_unix) > 1800
+    {
+        return true;
     }
     false
 }
@@ -147,10 +149,9 @@ fn ordered_route_candidates(
                     return true;
                 }
                 
-                // For sensitive groups, be slightly more lenient but still respect deep failures
                 let bucket = host_service_bucket(route_key);
-                if (bucket == "meta-group:discord" || bucket == "meta-group:youtube") && 
-                   score > (GLOBAL_BYPASS_HARD_WEAK_SCORE * 2) {
+                if (bucket == "meta-group:discord" && c.bypass_profile_idx < 4) ||
+                   (bucket == "meta-group:youtube" && c.bypass_profile_idx == 4) {
                     return true; 
                 }
                 return false;
@@ -260,14 +261,29 @@ fn record_route_success(route_key: &str, candidate: &RouteCandidate) {
     drop(per_route);
 
     let winner_map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
-    let winner = RouteWinner {
-        route_id: route_id.clone(),
-        updated_at_unix: now,
-    };
-    winner_map.insert(route_key.to_owned(), winner.clone());
-    if let Some(service_key) = route_service_key(route_key) {
-        if service_key != route_key {
-            winner_map.insert(service_key, winner);
+    // Do not pin adaptive bypass winners when multiple bypass backends exist.
+    // Keeping winner sticky in this case overloads bypass:1 and defeats pool balancing.
+    let pin_winner = !(candidate.kind == RouteKind::Bypass
+        && candidate.source == "adaptive-race"
+        && candidate.bypass_profile_total > 1);
+
+    if pin_winner {
+        let winner = RouteWinner {
+            route_id: route_id.clone(),
+            updated_at_unix: now,
+        };
+        winner_map.insert(route_key.to_owned(), winner.clone());
+        if let Some(service_key) = route_service_key(route_key) {
+            if service_key != route_key {
+                winner_map.insert(service_key, winner);
+            }
+        }
+    } else {
+        winner_map.remove(route_key);
+        if let Some(service_key) = route_service_key(route_key) {
+            if service_key != route_key {
+                winner_map.remove(&service_key);
+            }
         }
     }
 
@@ -313,7 +329,8 @@ fn record_route_failure(route_key: &str, candidate: &RouteCandidate, reason: &'s
             let per_route_service = health_map.entry(service_key).or_default();
             let mut entry_service = per_route_service.entry(route_id.clone()).or_default();
             entry_service.failures = entry_service.failures.saturating_add(1);
-            entry_service.consecutive_failures = entry_service.consecutive_failures.saturating_add(1).min(32);
+            entry_service.consecutive_failures =
+                entry_service.consecutive_failures.saturating_add(1).min(32);
             entry_service.last_failure_unix = now;
         }
     }
@@ -356,8 +373,10 @@ fn record_global_bypass_profile_success(candidate: &RouteCandidate, now: u64) {
     let mut entry = map.entry(key).or_default();
     entry.successes = entry.successes.saturating_add(1);
     entry.last_success_unix = now;
-    // We don't sub total failures, but we effectively reset the "badness" of the profile on success
-    // by making it eligible for higher scores in bypass_profile_score_from_health.
+    entry.failures = entry.failures.saturating_sub(1);
+    entry.connect_failures = entry.connect_failures.saturating_sub(1);
+    entry.soft_zero_replies = entry.soft_zero_replies.saturating_sub(1);
+    entry.io_errors = entry.io_errors.saturating_sub(1);
 }
 
 fn record_global_bypass_profile_failure(candidate: &RouteCandidate, reason: &'static str, now: u64) {
@@ -461,22 +480,29 @@ fn host_service_bucket(host: &str) -> String {
     sld.to_owned()
 }
 
-fn destination_bypass_profile_idx(destination: &str, total: u8) -> u8 {
-    if total <= 1 { return 0; }
+fn destination_bypass_profile_idx_known(destination: &str, total: u8) -> Option<u8> {
+    if total <= 1 {
+        return Some(0);
+    }
     let key = bypass_profile_key(destination);
     let map = DEST_BYPASS_PROFILE_IDX.get_or_init(DashMap::new);
     if let Some(v) = map.get(&key) {
-        return (*v).min(total.saturating_sub(1));
+        return Some((*v).min(total.saturating_sub(1)));
     }
     let legacy_key = bypass_profile_legacy_service_key(destination);
     if legacy_key != key {
         if let Some(v) = map.get(&legacy_key) {
             let normalized = (*v).min(total.saturating_sub(1));
             map.insert(key, normalized);
-            return normalized;
+            return Some(normalized);
         }
     }
-    0
+    None
+}
+
+#[cfg(test)]
+fn destination_bypass_profile_idx(destination: &str, total: u8) -> u8 {
+    destination_bypass_profile_idx_known(destination, total).unwrap_or(0)
 }
 
 fn record_bypass_profile_failure(destination: &str, current_idx: u8, total: u8, reason: &'static str) {
@@ -644,7 +670,9 @@ fn select_bypass_candidates(
 ) -> Vec<(SocketAddr, u8, u8)> {
     if !relay_opts.bypass_socks5_pool.is_empty() {
         let total = relay_opts.bypass_socks5_pool.len().min(255) as u8;
-        let preferred = destination_bypass_profile_idx(destination, total);
+        let preferred = destination_bypass_profile_idx_known(destination, total).unwrap_or_else(
+            || (NEXT_BYPASS_POOL_IDX.fetch_add(1, Ordering::Relaxed) % u64::from(total)) as u8,
+        );
         let mut out = Vec::with_capacity(total as usize);
         for offset in 0..total {
             let idx = (preferred + offset) % total;

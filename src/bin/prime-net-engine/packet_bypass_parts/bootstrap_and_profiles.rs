@@ -186,8 +186,8 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
     {
         let mut profiles = vec![
             PacketBypassProfile { name: "clean-split-1".to_owned(), args: vec!["--split".into(), "1".into(), "--timeout".into(), "10".into()] },
-            PacketBypassProfile { name: "discord-optimized".to_owned(), args: vec!["--split".into(), "2".into(), "--tlsrec".into(), "1+s".into(), "--timeout".into(), "10".into()] },
             PacketBypassProfile { name: "tlsrec-1s".to_owned(), args: vec!["--tlsrec".into(), "1+s".into(), "--timeout".into(), "10".into()] },
+            PacketBypassProfile { name: "discord-optimized".to_owned(), args: vec!["--split".into(), "1".into(), "--tlsrec".into(), "1+s".into(), "--timeout".into(), "10".into()] },
         ];
         for p in &mut profiles { set_port_arg(&mut p.args, find_free_port()); }
         profiles

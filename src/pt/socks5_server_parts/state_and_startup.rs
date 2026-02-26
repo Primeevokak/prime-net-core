@@ -17,6 +17,7 @@ static RACE_SOURCE_COUNTERS: OnceLock<RaceSourceCounters> = OnceLock::new();
 static ROUTE_METRICS: OnceLock<RwLock<RouteMetrics>> = OnceLock::new();
 static ROUTE_CAPABILITIES: OnceLock<RwLock<RouteCapabilities>> = OnceLock::new();
 static BYPASS_POOL: OnceLock<DashMap<SocketAddr, Vec<TcpStream>>> = OnceLock::new();
+static NEXT_BYPASS_POOL_IDX: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RelayOptions {
@@ -401,10 +402,13 @@ async fn connect_bypass_upstream(
                     // Perform initial handshake (HELLO + NO AUTH)
                     if s.write_all(&[0x05, 0x01, 0x00]).await.is_ok() {
                         let mut method = [0u8; 2];
-                        if tokio::time::timeout(Duration::from_millis(500), s.read_exact(&mut method)).await.is_ok() {
-                            if method[0] == 0x05 && method[1] == 0x00 {
-                                pool_map.entry(pool_addr).or_default().push(s);
-                            }
+                        if tokio::time::timeout(Duration::from_millis(500), s.read_exact(&mut method))
+                            .await
+                            .is_ok()
+                            && method[0] == 0x05
+                            && method[1] == 0x00
+                        {
+                            pool_map.entry(pool_addr).or_default().push(s);
                         }
                     }
                 }

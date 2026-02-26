@@ -1,37 +1,45 @@
 use std::fs;
-use std::io::{BufRead};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc};
-use std::time::{Duration, Instant, UNIX_EPOCH, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    MouseEvent,
+    MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use prime_net_engine_core::blocklist::{expand_tilde, BlocklistCache};
-use prime_net_engine_core::config::{EngineConfig};
+use prime_net_engine_core::config::DnsResolverKind;
+use prime_net_engine_core::config::EchMode;
+use prime_net_engine_core::config::EngineConfig;
+use prime_net_engine_core::config::EvasionStrategy;
+use prime_net_engine_core::config::PluggableTransportKind;
+use prime_net_engine_core::config::SystemProxyMode;
 use prime_net_engine_core::error::{EngineError, Result};
+use prime_net_engine_core::health::{HealthChecker, HealthLevel};
 use prime_net_engine_core::platform::diagnostics::{
     DiagnosticLevel, DiagnosticResult, ProxyDiagnostics,
 };
-use prime_net_engine_core::platform::{system_proxy_manager, ProxyMode, ProxyStatus};
+use prime_net_engine_core::platform::system_proxy_manager;
+use prime_net_engine_core::platform::ProxyMode;
 use prime_net_engine_core::telemetry::tui_layer::TuiLayer;
 use prime_net_engine_core::tui::config_editor::{Action as ConfigAction, ConfigEditor, UxMode};
 use prime_net_engine_core::tui::connection_monitor::ConnectionMonitor;
+use prime_net_engine_core::tui::first_run_wizard::default_config_path;
 use prime_net_engine_core::tui::help::show_help_overlay;
-use prime_net_engine_core::tui::log_viewer::{format_timestamp, LogViewer, LogEntry};
-use prime_net_engine_core::tui::privacy_dashboard::{PrivacyDashboard};
+use prime_net_engine_core::tui::log_viewer::{format_timestamp, LogEntry, LogViewer};
+use prime_net_engine_core::tui::privacy_dashboard::{cycle_referer_mode, PrivacyDashboard};
 use prime_net_engine_core::tui::privacy_headers::PrivacyHeadersTab;
 use prime_net_engine_core::version::PRIME_TUI_VERSION_LABEL;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Clear};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::{Frame, Terminal};
 use tracing::Level;
 use tracing_subscriber::layer::SubscriberExt;
@@ -89,9 +97,6 @@ pub(crate) struct App {
     allow_unverified_packet_bypass_next_start: bool,
     proxy_managed_by_tui: bool,
     core_start_pending: Option<(String, Instant)>,
-    
-    proxy_status_rx: mpsc::Receiver<ProxyStatus>,
-    current_proxy_status: Option<ProxyStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,7 +114,8 @@ struct PacketBypassBootstrapPrompt {
 
 #[derive(Debug, Clone)]
 struct PacketBypassUnsafeConfirmPrompt {
-    _started_at: Instant,
+    source_url: Option<String>,
+    started_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -118,7 +124,7 @@ enum CoreUiEvent {
 }
 
 impl App {
-    pub fn new(config_path: PathBuf, config: EngineConfig, log_viewer: Arc<LogViewer>, proxy_status_rx: mpsc::Receiver<ProxyStatus>) -> Self {
+    fn new(config_path: PathBuf, config: EngineConfig, log_viewer: Arc<LogViewer>) -> Self {
         log_viewer.set_filter_level(None);
         log_viewer.set_category_filter(None);
         log_viewer.set_search_query(String::new());
@@ -154,34 +160,55 @@ impl App {
             allow_unverified_packet_bypass_next_start: false,
             proxy_managed_by_tui: false,
             core_start_pending: None,
-            proxy_status_rx,
-            current_proxy_status: None,
-        }
-    }
-
-    fn update_from_channels(&mut self) {
-        while let Ok(status) = self.proxy_status_rx.try_recv() {
-            self.current_proxy_status = Some(status);
         }
     }
 
     async fn refresh_proxy_diagnostics(&mut self) {
         let mut out = Vec::new();
-        let endpoint = self.config_editor.config.system_proxy.socks_endpoint.clone();
+        let endpoint = self
+            .config_editor
+            .config
+            .system_proxy
+            .socks_endpoint
+            .clone();
+        
+        let packet_bypass_enabled = self.config_editor.config.evasion.packet_bypass_enabled;
         
         if self.config_editor.config.pt.is_none() {
-            if self.config_editor.config.evasion.packet_bypass_enabled {
-                out.push(DiagnosticResult::info("Активен Packet Bypass", "Используется ciadpi"));
+            if packet_bypass_enabled {
+                out.push(DiagnosticResult::info(
+                    "Активен обход через Packet Bypass (ciadpi)",
+                    "Движок использует внешний бэкенд для десинхронизации пакетов",
+                ));
+            } else {
+                out.push(DiagnosticResult::warn(
+                    "Транспорт обхода отключен (шаблон PT = direct)",
+                    "Установите шаблон trojan/shadowsocks в Конфиг -> Системный прокси",
+                ));
             }
         }
-        
-        if let Some(status) = &self.current_proxy_status {
-            if status.enabled {
+        let status = system_proxy_manager().status();
+        if let Ok(status) = status {
+            let core_running = self
+                .core_process
+                .as_mut()
+                .map(|c| c.try_wait().ok().flatten().is_none())
+                .unwrap_or(false);
+            if status.enabled || core_running {
                 out.push(ProxyDiagnostics::check_socks5_listening(&endpoint));
+            } else {
+                out.push(DiagnosticResult::info(
+                    "SOCKS5-сервер остановлен",
+                    "Нажмите [a], чтобы запустить ядро и включить прокси",
+                ));
             }
             out.push(ProxyDiagnostics::check_system_proxy_config());
+            if let Some(url) = status.pac_url {
+                out.push(ProxyDiagnostics::check_pac_server(&url).await);
+            }
+        } else if let Ok(mut fallback) = ProxyDiagnostics::run_sync_basic(&endpoint) {
+            out.append(&mut fallback);
         }
-        
         self.diagnostics = out;
         self.last_diag_refresh = Instant::now();
     }
@@ -207,6 +234,14 @@ impl App {
             UserMode::Simple => UxMode::Simple,
             UserMode::Advanced => UxMode::Advanced,
         });
+        if self.user_mode == UserMode::Simple
+            && !matches!(
+                self.tab,
+                Tab::Config | Tab::Privacy | Tab::PrivacyHeaders | Tab::Proxy
+            )
+        {
+            self.tab = Tab::Config;
+        }
     }
 }
 
@@ -216,7 +251,10 @@ impl Drop for App {
             let _ = child.kill();
             let _ = child.wait();
         }
-        if self.proxy_managed_by_tui { let _ = system_proxy_manager().disable(); }
+        self.core_start_pending = None;
+        if self.proxy_managed_by_tui {
+            let _ = system_proxy_manager().disable();
+        }
     }
 }
 
@@ -224,7 +262,12 @@ impl Drop for App {
 async fn main() {
     install_panic_report_hook();
     if let Err(e) = run_main().await {
-        eprintln!("критическая ошибка: {e}");
+        let body = format!("критическая ошибка: {e}");
+        if let Some(path) = write_crash_report("fatal-error", &body) {
+            eprintln!("критическая ошибка: {e}\nотчёт: {}", path.display());
+        } else {
+            eprintln!("критическая ошибка: {e}");
+        }
         std::process::exit(1);
     }
 }
@@ -236,175 +279,754 @@ async fn run_main() -> Result<()> {
     let log_viewer = Arc::new(LogViewer::new());
     init_tui_tracing(log_viewer.clone())?;
 
-    let (proxy_tx, proxy_rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let manager = system_proxy_manager();
-        loop {
-            if let Ok(status) = manager.status() { let _ = proxy_tx.send(status); }
-            std::thread::sleep(Duration::from_secs(2));
-        }
-    });
-
     enable_raw_mode().map_err(EngineError::Io)?;
-    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture).map_err(EngineError::Io)?;
+    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)
+        .map_err(EngineError::Io)?;
     let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend).map_err(EngineError::Io)?;
 
-    let mut app = App::new(config_path, config, log_viewer, proxy_rx);
-    if let Some(note) = startup_note { app.status_line = note; }
-    else { app.status_line = startup_health_summary(&app.config_editor.config); }
+    let mut app = App::new(config_path, config, log_viewer);
+    app.config_editor.set_ux_mode(UxMode::Simple);
+    if let Some(note) = startup_note {
+        app.status_line = note.clone();
+        app.help_overlay = Some(format!(
+            "{note}\n\nПроверьте параметры и сохраните конфиг клавишей [s]."
+        ));
+    } else {
+        app.status_line = startup_health_summary(&app.config_editor.config).await;
+    }
     app.refresh_proxy_diagnostics().await;
-    
-    let mut last_tick = Instant::now();
-    let tick_rate = Duration::from_millis(100);
+    let mut tick = Instant::now();
 
+    let run_res = run_app(&mut terminal, &mut app, &mut tick).await;
+
+    disable_raw_mode().map_err(EngineError::Io)?;
+    execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen)
+        .map_err(EngineError::Io)?;
+    run_res
+}
+
+async fn run_app(
+    terminal: &mut Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
+    tick: &mut Instant,
+) -> Result<()> {
     loop {
-        app.update_from_channels();
-        poll_core_startup(&mut app)?;
-        drain_core_events(&mut app);
+        poll_core_startup(app)?;
+        drain_core_events(app);
         app.conn_monitor.tick();
-        if app.log_auto_scroll { app.log_viewer.jump_to_bottom(); app.log_selected_line = app.log_viewer.selected_line(); }
-        if app.last_diag_refresh.elapsed() >= Duration::from_secs(10) { app.refresh_proxy_diagnostics().await; }
+        if app.log_auto_scroll {
+            app.log_viewer.jump_to_bottom();
+            app.log_selected_line = app.log_viewer.selected_line();
+        }
+        if app.last_diag_refresh.elapsed() >= Duration::from_secs(10) {
+            app.refresh_proxy_diagnostics().await;
+        }
 
-        terminal.draw(|f| render(f, &mut app)).map_err(EngineError::Io)?;
+        terminal.draw(|f| render(f, app)).map_err(EngineError::Io)?;
 
-        let timeout = tick_rate.checked_sub(last_tick.elapsed()).unwrap_or(Duration::from_secs(0));
-        if event::poll(timeout).map_err(EngineError::Io)? {
+        if event::poll(Duration::from_millis(50)).map_err(EngineError::Io)? {
             match event::read().map_err(EngineError::Io)? {
                 Event::Key(key) => {
-                    if key.kind == KeyEventKind::Release { continue; }
-                    match handle_key(&mut app, key).await {
-                        Ok(true) => break,
-                        Err(e) => app.status_line = format!("Ошибка: {e}"),
-                        _ => {}
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    match handle_key(app, key).await {
+                        Ok(should_quit) => {
+                            if should_quit {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            app.status_line = format!("Ошибка действия: {e}");
+                            let _ = write_crash_report("runtime-error", &format!("{e}"));
+                        }
                     }
                 }
-                Event::Mouse(mouse) => handle_mouse(&mut app, mouse),
+                Event::Mouse(mouse) => handle_mouse(app, mouse),
                 _ => {}
             }
         }
-        if last_tick.elapsed() >= tick_rate { last_tick = Instant::now(); }
-    }
 
-    disable_raw_mode().map_err(EngineError::Io)?;
-    execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen).map_err(EngineError::Io)?;
+        if tick.elapsed() >= Duration::from_secs(1) {
+            *tick = Instant::now();
+        }
+    }
     Ok(())
 }
 
 fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.size();
-    let chunks = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(2)]).split(area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(2),
+        ])
+        .split(area);
 
     frame.render_widget(tab_bar(app.tab, app.user_mode), chunks[0]);
     match app.tab {
         Tab::Config => app.config_editor.render(frame, chunks[1]),
         Tab::Monitor => app.conn_monitor.render(frame, chunks[1]),
-        Tab::Privacy => app.privacy_dashboard.render(frame, chunks[1], &app.config_editor.config),
-        Tab::PrivacyHeaders => app.privacy_headers_tab.render(frame, chunks[1], &app.config_editor.config),
+        Tab::Privacy => app
+            .privacy_dashboard
+            .render(frame, chunks[1], &app.config_editor.config),
+        Tab::PrivacyHeaders => {
+            app.privacy_headers_tab
+                .render(frame, chunks[1], &app.config_editor.config)
+        }
         Tab::Logs => render_logs(frame, chunks[1], app),
         Tab::Proxy => render_proxy(frame, chunks[1], app),
     }
 
-    let footer = Paragraph::new(compose_status_line(app)).block(Block::default().title("Статус").borders(Borders::ALL));
+    let footer = Paragraph::new(compose_status_line(app))
+        .block(Block::default().title("Статус").borders(Borders::ALL));
     frame.render_widget(footer, chunks[2]);
 
     if let Some(help) = &app.help_overlay {
         let popup = centered_rect(75, 70, area);
         frame.render_widget(Clear, popup);
-        frame.render_widget(Paragraph::new(help.clone()).block(Block::default().title("Справка").borders(Borders::ALL)), popup);
+        frame.render_widget(
+            Paragraph::new(help.clone())
+                .block(Block::default().title("Справка").borders(Borders::ALL)),
+            popup,
+        );
+    } else if let Some(confirm) = &app.packet_bypass_unsafe_confirm_prompt {
+        let popup = centered_rect(90, 70, area);
+        let source = confirm.source_url.as_deref().unwrap_or("н/д");
+        let remaining = 10u64.saturating_sub(confirm.started_at.elapsed().as_secs());
+        let confirm_hint = if remaining == 0 {
+            "[y]/[Enter] Да, я понимаю риск"
+        } else {
+            "Ожидайте завершения таймера перед подтверждением"
+        };
+        let text = format!(
+            "Режим запуска без проверки SHA256\n\n\
+Источник: {source}\n\
+До разблокировки подтверждения: {remaining} с\n\n\
+Риски:\n\
+  - может быть запущен подменённый бинарный файл\n\
+  - возможны кража данных и перехват трафика\n\
+  - вы обходите защиту целостности загрузки\n\n\
+Действия:\n\
+  {confirm_hint}\n\
+  [n]/[Esc] Нет, я передумал"
+        );
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(text).block(
+                Block::default()
+                    .title("Подтверждение риск-режима")
+                    .borders(Borders::ALL),
+            ),
+            popup,
+        );
+    } else if let Some(prompt) = &app.packet_bypass_bootstrap_prompt {
+        let popup = centered_rect(90, 70, area);
+        let source = prompt.source_url.as_deref().unwrap_or("н/д");
+        let text = format!(
+            "Packet bypass не удалось запустить в безопасном режиме.\n\n\
+Причина: не найден SHA256 sidecar для скачанного пакета.\n\
+Источник: {source}\n\n\
+Что можно сделать:\n\
+  [r]/[Enter] Повторить безопасный запуск (рекомендуется)\n\
+  [u] Запустить без проверки SHA256 (небезопасно)\n\
+  [n]/[Esc] Оставить direct-режим\n\n\
+Режим без проверки включается только вручную и только на один запуск."
+        );
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(text)
+                .block(Block::default().title("Проблема запуска bypass").borders(Borders::ALL)),
+            popup,
+        );
+    } else if let Some(prompt) = &app.classifier_cache_clear_prompt {
+        let popup = centered_rect(85, 70, area);
+        let modified_label = prompt
+            .modified_unix
+            .map(|ts| ts.to_string())
+            .unwrap_or_else(|| "н/д".to_owned());
+        let exists_label = if prompt.exists { "да" } else { "нет" };
+        let text = format!(
+            "Очистить кэш relay-классификатора?\n\n\
+Путь: {}\n\
+Файл существует: {exists_label}\n\
+Размер: {} байт\n\
+Изменён (unix): {modified_label}\n\n\
+Плюсы:\n\
+  + удаляются устаревшие обученные решения маршрутизации\n\
+  + проще исправлять некорректные состояния adaptive-маршрутов\n\
+  + следующие сессии обучаются на актуальных условиях сети\n\n\
+Минусы:\n\
+  - первые запросы могут быть медленнее (холодный старт обучения)\n\
+  - временно могут участиться route race/fallback\n\
+  - будет потеряна история удачных обученных профилей\n\n\
+Нажмите [y]/[Enter] для подтверждения, [n]/[Esc] для отмены.",
+            prompt.path.display(),
+            prompt.size_bytes
+        );
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(text)
+                .block(Block::default().title("Подтверждение очистки кэша").borders(Borders::ALL)),
+            popup,
+        );
+    } else if let Some((endpoint, started)) = &app.core_start_pending {
+        let popup = centered_rect(75, 45, area);
+        let text = format!(
+            "Запуск ядра...\n\nSOCKS endpoint: {endpoint}\nВремя: {} с\n\nЕсли PT недоступен, ядро автоматически переключится в direct-режим.\nДетали: вкладка «Логи» (targets: socks_cmd, socks5).",
+            started.elapsed().as_secs()
+        );
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(text).block(Block::default().title("Запуск ядра").borders(Borders::ALL)),
+            popup,
+        );
     }
 }
 
 fn tab_bar(tab: Tab, mode: UserMode) -> Paragraph<'static> {
     let tabs = match mode {
-        UserMode::Simple => vec![(Tab::Config, "1 Конфиг"), (Tab::Privacy, "2 Приват"), (Tab::Proxy, "3 Прокси")],
-        UserMode::Advanced => vec![(Tab::Config, "1 Конфиг"), (Tab::Monitor, "2 Мон"), (Tab::Privacy, "3 Приват"), (Tab::PrivacyHeaders, "4 Заг"), (Tab::Logs, "5 Логи"), (Tab::Proxy, "6 Прокси")],
+        UserMode::Simple => vec![
+            (Tab::Config, "1 Конфиг"),
+            (Tab::Privacy, "2 Приватность"),
+            (Tab::Proxy, "3 Прокси"),
+        ],
+        UserMode::Advanced => vec![
+            (Tab::Config, "1 Конфиг"),
+            (Tab::Monitor, "2 Монитор"),
+            (Tab::Privacy, "3 Приватность"),
+            (Tab::PrivacyHeaders, "4 Заголовки приватности"),
+            (Tab::Logs, "5 Логи"),
+            (Tab::Proxy, "6 Прокси"),
+        ],
     };
-    let spans = tabs.into_iter().flat_map(|(t, name)| {
-        let style = if t == tab { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default() };
-        vec![Span::styled(name, style), Span::raw("  ")]
-    }).collect::<Vec<_>>();
-    Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::ALL).title(PRIME_TUI_VERSION_LABEL))
+    let spans = tabs
+        .iter()
+        .flat_map(|(t, name)| {
+            let active = *t == tab;
+            let style = if active {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            vec![Span::styled(*name, style), Span::raw("  ")]
+        })
+        .collect::<Vec<_>>();
+    let mode_label = match mode {
+        UserMode::Simple => "простой",
+        UserMode::Advanced => "расширенный",
+    };
+    Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::ALL).title(format!(
+        "{PRIME_TUI_VERSION_LABEL}  [q] выход  [Tab] далее  [m] режим: {mode_label}  [?] справка"
+    )))
 }
 
 fn render_logs(frame: &mut Frame, area: Rect, app: &mut App) {
-    let logs = app.log_viewer.visible_logs(area.height as usize);
-    let items = logs.iter().map(|entry| {
-        let ts = format_timestamp(entry.timestamp);
-        let count_label = if entry.count > 1 { format!(" (x{})", entry.count) } else { String::new() };
-        let style = match entry.level { Level::ERROR => Style::default().fg(Color::Red), Level::WARN => Style::default().fg(Color::Yellow), _ => Style::default().fg(Color::Green) };
-        ListItem::new(Line::from(vec![Span::styled(format!("{ts} {:5} {} {}{}", entry.level, entry.target, entry.message, count_label), style)]))
-    }).collect::<Vec<_>>();
-    frame.render_widget(List::new(items).block(Block::default().borders(Borders::ALL).title("Логи")), area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(6),
+            Constraint::Length(3),
+        ])
+        .split(area);
+    let level = match app.log_filter_level {
+        None => "ВСЕ",
+        Some(Level::ERROR) => "ERROR",
+        Some(Level::WARN) => "WARN",
+        Some(Level::INFO) => "INFO",
+        Some(Level::DEBUG) => "DEBUG",
+        Some(Level::TRACE) => "TRACE",
+    };
+    let mode = if app.log_use_regex {
+        "regex"
+    } else {
+        "текст"
+    };
+    let search = if app.log_input_mode == LogInputMode::Search {
+        format!("{}_", app.log_search_buf)
+    } else {
+        app.log_search_buf.clone()
+    };
+    let category = app
+        .log_viewer
+        .category_filter()
+        .unwrap_or_else(|| "ВСЕ".to_owned());
+    let header = format!("Фильтр: {level}  Категория: {category}  Поиск({mode}): {search}");
+    let total_logs = app.log_viewer.filtered_logs().len();
+    let live_marker = if app.log_auto_scroll {
+        " [LIVE]".to_owned()
+    } else {
+        let current = if total_logs == 0 {
+            0
+        } else {
+            (app.log_selected_line + 1).min(total_logs)
+        };
+        format!(" [{current}/{total_logs}]")
+    };
+    frame.render_widget(
+        Paragraph::new(header).block(
+            Block::default()
+                .title(format!("Просмотр логов{live_marker}"))
+                .borders(Borders::ALL),
+        ),
+        chunks[0],
+    );
+    let viewport_height = chunks[1].height as usize;
+    let start_index = if app.log_auto_scroll || app.log_selected_line == 0 {
+        total_logs.saturating_sub(viewport_height)
+    } else {
+        app.log_selected_line.min(total_logs.saturating_sub(1))
+    };
+    let highlighted_index = if app.log_auto_scroll || app.log_selected_line == 0 {
+        total_logs.saturating_sub(1)
+    } else {
+        app.log_selected_line
+    };
+    let logs = app.log_viewer.visible_logs(viewport_height);
+    let items = logs
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            let ts = format_timestamp(entry.timestamp);
+            let mut style = match entry.level {
+                Level::ERROR => Style::default().fg(Color::Red),
+                Level::WARN => Style::default().fg(Color::Yellow),
+                Level::INFO => Style::default().fg(Color::Green),
+                Level::DEBUG => Style::default().fg(Color::Cyan),
+                Level::TRACE => Style::default().fg(Color::Gray),
+            };
+            if start_index + idx == highlighted_index {
+                style = style.add_modifier(Modifier::BOLD).bg(Color::DarkGray);
+            }
+            ListItem::new(Line::from(vec![Span::styled(
+                format!("{ts} {:5} {} {}", entry.level, entry.target, entry.message),
+                style,
+            )]))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(items).block(Block::default().borders(Borders::ALL)),
+        chunks[1],
+    );
+    frame.render_widget(
+        Paragraph::new(
+            "[/] поиск  [f] уровень  [k] категория  [r] regex  [s] автопрокрутка  [e] экспорт  [y] копировать  [c] очистить",
+        )
+        .block(Block::default().borders(Borders::ALL)),
+        chunks[2],
+    );
 }
-
 fn render_proxy(frame: &mut Frame, area: Rect, app: &App) {
+    let status = system_proxy_manager().status();
     let mut lines = Vec::new();
-    if let Some(status) = &app.current_proxy_status {
-        lines.push(Line::from(format!("Статус: {}", if status.enabled { "Включен" } else { "Выключен" })));
-        lines.push(Line::from(format!("Режим: {:?}", status.mode)));
-        if let Some(ep) = &status.socks_endpoint { lines.push(Line::from(format!("SOCKS5: {}", ep))); }
-    } else { lines.push(Line::from("Статус: получение данных...")); }
+    match status {
+        Ok(status) => {
+            let indicator = if status.enabled {
+                "ВКЛЮЧЕН"
+            } else {
+                "ВЫКЛЮЧЕН"
+            };
+            lines.push(Line::from(format!("Статус: {indicator}")));
+            lines.push(Line::from(format!(
+                "Режим: {}",
+                proxy_mode_label(&status.mode)
+            )));
+            lines.push(Line::from(format!(
+                "SOCKS5: {}",
+                status.socks_endpoint.unwrap_or_else(|| "н/д".to_owned())
+            )));
+            lines.push(Line::from(format!(
+                "URL PAC: {}",
+                status.pac_url.unwrap_or_else(|| "н/д".to_owned())
+            )));
+        }
+        Err(e) => lines.push(Line::from(format!("Статус недоступен: {e}"))),
+    }
 
     let blocklist_path = expand_tilde(&app.config_editor.config.blocklist.cache_path);
     if let Ok(Some(cache)) = BlocklistCache::status(Path::new(&blocklist_path)) {
-        lines.push(Line::from(format!("Блоклист: {} доменов", cache.domains.len())));
+        lines.push(Line::from(format!(
+            "Блоклист: {} доменов (обновлено: {})",
+            cache.domains.len(),
+            cache.updated_at_unix
+        )));
     }
     lines.push(Line::from(""));
     lines.push(Line::from("Диагностика:"));
-    if app.diagnostics.is_empty() { lines.push(Line::from("  (нажмите [u] для запуска)")); }
-    for d in &app.diagnostics { lines.push(Line::from(format!("[{:?}] {}", d.level, d.message))); }
+    for d in &app.diagnostics {
+        let level = match d.level {
+            DiagnosticLevel::Ok => "[OK]",
+            DiagnosticLevel::Info => "[INFO]",
+            DiagnosticLevel::Warn => "[WARN]",
+            DiagnosticLevel::Error => "[ERROR]",
+        };
+        lines.push(Line::from(format!("{level} {}", d.message)));
+        if !d.suggestion.is_empty() {
+            lines.push(Line::from(format!("  исправить: {}", d.suggestion)));
+        }
+    }
     lines.push(Line::from(""));
-    lines.push(Line::from("[a] Запуск ядра  [x] Остановка  [u] Обновить диагностику  [d] Очистить кэш"));
-    lines.push(Line::from(format!("Telegram: {}", AUTHOR_TELEGRAM_URL)));
-    frame.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Прокси ")), area);
+    lines.push(Line::from(
+        "[a] включить ядро  [x] выключить ядро  [u] обновить диагностику",
+    ));
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(
+        "[d] очистить кэш relay-классификатора (с подтверждением)",
+    ));
+    lines.push(Line::from(""));
+    lines.push(Line::from("Ссылки автора:"));
+    lines.push(Line::from(format!(
+        "  [Enter] Открыть Telegram-канал: {}",
+        AUTHOR_TELEGRAM_URL
+    )));
+
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title("Системный прокси")
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
-    if app.help_overlay.is_some() { app.help_overlay = None; return Ok(false); }
-    if matches!(key.code, KeyCode::Char('?')) { app.help_overlay = Some(show_help_overlay("main")); return Ok(false); }
-    if matches!(key.code, KeyCode::Char('q')) { return Ok(true); }
-    if matches!(key.code, KeyCode::Char('m')) { app.cycle_user_mode(); return Ok(false); }
-    if matches!(key.code, KeyCode::Tab) { 
-        let tabs = tabs_for_mode(app.user_mode);
-        let current_pos = tabs.iter().position(|&t| t == app.tab).unwrap_or(0);
-        app.tab = tabs[(current_pos + 1) % tabs.len()];
+    if let Some(confirm) = app.packet_bypass_unsafe_confirm_prompt.clone() {
+        match key.code {
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.packet_bypass_unsafe_confirm_prompt = None;
+                app.packet_bypass_bootstrap_prompt = None;
+                app.status_line = "Запуск в риск-режиме отменён".to_owned();
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                let remaining = 10u64.saturating_sub(confirm.started_at.elapsed().as_secs());
+                if remaining > 0 {
+                    app.status_line = format!(
+                        "Подтверждение риск-режима станет доступно через {remaining} с"
+                    );
+                } else {
+                    app.packet_bypass_unsafe_confirm_prompt = None;
+                    app.packet_bypass_bootstrap_prompt = None;
+                    restart_core_for_packet_bypass_prompt(app, true)?;
+                    app.status_line = "Запуск риск-режима активирован: проверка SHA256 временно отключена на один запуск".to_owned();
+                }
+            }
+            _ => {}
+        }
         return Ok(false);
     }
+    if app.packet_bypass_bootstrap_prompt.is_some() {
+        match key.code {
+            KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Enter => {
+                app.packet_bypass_bootstrap_prompt = None;
+                restart_core_for_packet_bypass_prompt(app, false)?;
+                app.status_line = "Повтор безопасного запуска packet bypass".to_owned();
+            }
+            KeyCode::Char('u') | KeyCode::Char('U') => {
+                let source_url = app
+                    .packet_bypass_bootstrap_prompt
+                    .as_ref()
+                    .and_then(|p| p.source_url.clone());
+                app.packet_bypass_unsafe_confirm_prompt = Some(PacketBypassUnsafeConfirmPrompt {
+                    source_url,
+                    started_at: Instant::now(),
+                });
+                app.status_line =
+                    "Риск-режим требует отдельного подтверждения через 10 секунд".to_owned();
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.packet_bypass_bootstrap_prompt = None;
+                app.status_line =
+                    "Оставлен direct-режим: запуск packet bypass без проверки отменён".to_owned();
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+    if let Some(prompt) = app.classifier_cache_clear_prompt.clone() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                app.classifier_cache_clear_prompt = None;
+                match clear_classifier_cache_file(&prompt.path)? {
+                    ClassifierCacheClearResult::Removed => {
+                        app.status_line = format!(
+                            "Кэш relay-классификатора очищен: {} (перезапустите ядро, чтобы применить изменения в памяти)",
+                            prompt.path.display()
+                        );
+                    }
+                    ClassifierCacheClearResult::Missing => {
+                        app.status_line = format!(
+                            "Файл кэша relay-классификатора уже отсутствует: {}",
+                            prompt.path.display()
+                        );
+                    }
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.classifier_cache_clear_prompt = None;
+                app.status_line = "Очистка кэша relay-классификатора отменена".to_owned();
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+    if app.help_overlay.is_some() {
+        app.help_overlay = None;
+        return Ok(false);
+    }
+    if matches!(key.code, KeyCode::Char('?')) {
+        let context = match app.tab {
+            Tab::Config => "config_editor",
+            Tab::Monitor => "connection_monitor",
+            Tab::Privacy => "privacy_dashboard",
+            Tab::PrivacyHeaders => "privacy_headers",
+            Tab::Logs => "log_viewer",
+            Tab::Proxy => "proxy",
+        };
+        app.help_overlay = Some(show_help_overlay(context));
+        return Ok(false);
+    }
+    if matches!(key.code, KeyCode::Char('q')) {
+        return Ok(true);
+    }
+    if matches!(key.code, KeyCode::Char('c'))
+        && key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+    {
+        return Ok(true);
+    }
+    if matches!(key.code, KeyCode::Char('m')) {
+        app.cycle_user_mode();
+        app.status_line = match app.user_mode {
+            UserMode::Simple => "Режим интерфейса: простой".to_owned(),
+            UserMode::Advanced => "Режим интерфейса: расширенный".to_owned(),
+        };
+        return Ok(false);
+    }
+    if matches!(key.code, KeyCode::Tab) {
+        app.tab = match app.user_mode {
+            UserMode::Simple => match app.tab {
+                Tab::Config => Tab::Privacy,
+                Tab::Privacy => Tab::Proxy,
+                Tab::Proxy => Tab::Config,
+                _ => Tab::Config,
+            },
+            UserMode::Advanced => match app.tab {
+                Tab::Config => Tab::Monitor,
+                Tab::Monitor => Tab::Privacy,
+                Tab::Privacy => Tab::PrivacyHeaders,
+                Tab::PrivacyHeaders => Tab::Logs,
+                Tab::Logs => Tab::Proxy,
+                Tab::Proxy => Tab::Config,
+            },
+        };
+        return Ok(false);
+    }
+
     match key.code {
         KeyCode::Char('1') => app.tab = Tab::Config,
-        KeyCode::Char('2') => app.tab = if app.user_mode == UserMode::Simple { Tab::Privacy } else { Tab::Monitor },
-        KeyCode::Char('3') => app.tab = if app.user_mode == UserMode::Simple { Tab::Proxy } else { Tab::Privacy },
-        KeyCode::Char('4') if app.user_mode == UserMode::Advanced => app.tab = Tab::PrivacyHeaders,
-        KeyCode::Char('5') if app.user_mode == UserMode::Advanced => app.tab = Tab::Logs,
-        KeyCode::Char('6') if app.user_mode == UserMode::Advanced => app.tab = Tab::Proxy,
+        KeyCode::Char('2') => {
+            app.tab = match app.user_mode {
+                UserMode::Simple => Tab::Privacy,
+                UserMode::Advanced => Tab::Monitor,
+            }
+        }
+        KeyCode::Char('3') => {
+            app.tab = match app.user_mode {
+                UserMode::Simple => Tab::Proxy,
+                UserMode::Advanced => Tab::Privacy,
+            }
+        }
+        KeyCode::Char('4') => {
+            if app.user_mode == UserMode::Advanced {
+                app.tab = Tab::PrivacyHeaders;
+            }
+        }
+        KeyCode::Char('5') => {
+            if app.user_mode == UserMode::Advanced {
+                app.tab = Tab::Logs;
+            }
+        }
+        KeyCode::Char('6') => {
+            if app.user_mode == UserMode::Advanced {
+                app.tab = Tab::Proxy;
+            }
+        }
         _ => {}
     }
+
     match app.tab {
         Tab::Config => match app.config_editor.handle_input(key)? {
-            ConfigAction::Saved => { app.config_editor.save_to_file(&app.config_path)?; app.status_line = "Сохранено".to_owned(); }
+            ConfigAction::Saved => {
+                app.config_editor.save_to_file(&app.config_path)?;
+                app.status_line = format!("Сохранено {}", app.config_path.display());
+            }
+            ConfigAction::Reloaded => {
+                app.config_editor.reload_from_file(&app.config_path)?;
+                app.status_line = "Конфигурация перезагружена".to_owned();
+            }
+            ConfigAction::SaveRequested => {}
+            ConfigAction::Back | ConfigAction::None => {}
+        },
+        Tab::Monitor => match key.code {
+            KeyCode::Up => app.conn_monitor.select_prev(),
+            KeyCode::Down => app.conn_monitor.select_next(),
+            KeyCode::Char('r') => app.conn_monitor.refresh(),
             _ => {}
         },
-        Tab::Monitor => match key.code { KeyCode::Up => app.conn_monitor.select_prev(), KeyCode::Down => app.conn_monitor.select_next(), _ => {} },
+        Tab::Privacy => match key.code {
+            KeyCode::Char('v') => {
+                cycle_referer_mode(&mut app.config_editor.config);
+                app.status_line = format!(
+                    "Режим Referer: {:?}",
+                    app.config_editor.config.privacy.referer.mode
+                );
+            }
+            KeyCode::Char('b') => {
+                let v = &mut app.config_editor.config.privacy.tracker_blocker.enabled;
+                *v = !*v;
+                app.status_line =
+                    format!("Блокировщик трекеров: {}", if *v { "вкл" } else { "выкл" });
+            }
+            KeyCode::Char('n') => {
+                let v = &mut app.config_editor.config.privacy.signals.send_dnt;
+                *v = !*v;
+                app.status_line = format!("DNT: {}", if *v { "вкл" } else { "выкл" });
+            }
+            KeyCode::Char('g') => {
+                let v = &mut app.config_editor.config.privacy.signals.send_gpc;
+                *v = !*v;
+                app.status_line = format!("GPC: {}", if *v { "вкл" } else { "выкл" });
+            }
+            _ => {}
+        },
+        Tab::PrivacyHeaders => {
+            let _ = app
+                .privacy_headers_tab
+                .handle_key(key, &mut app.config_editor.config);
+        }
         Tab::Logs => handle_logs_key(app, key)?,
         Tab::Proxy => match key.code {
-            KeyCode::Char('a') => activate_core(app)?,
-            KeyCode::Char('x') => deactivate_core(app)?,
-            KeyCode::Char('u') => app.refresh_proxy_diagnostics().await,
-            KeyCode::Char('d') => { app.classifier_cache_clear_prompt = Some(build_classifier_cache_clear_prompt(&app.config_editor.config)); }
-            KeyCode::Enter => { let _ = Command::new("cmd").args(["/C", "start", "", AUTHOR_TELEGRAM_URL]).spawn(); }
+            KeyCode::Char('u') => {
+                app.refresh_proxy_diagnostics().await;
+                app.status_line = "Диагностика обновлена".to_owned();
+            }
+            KeyCode::Char('d') => {
+                app.classifier_cache_clear_prompt =
+                    Some(build_classifier_cache_clear_prompt(&app.config_editor.config));
+                app.status_line = "Подтвердите очистку кэша relay-классификатора".to_owned();
+            }
+            KeyCode::Char('a') => {
+                activate_core(app)?;
+            }
+            KeyCode::Char('x') => {
+                deactivate_core(app)?;
+                app.refresh_proxy_diagnostics().await;
+            }
+            KeyCode::Enter => {
+                open_author_telegram_channel()?;
+                app.status_line = format!("Открываю Telegram-канал: {AUTHOR_TELEGRAM_URL}");
+            }
             _ => {}
         },
-        _ => {}
     }
+
     Ok(false)
 }
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
-    if mouse.row < 3 { 
-        let tabs = tabs_for_mode(app.user_mode);
-        let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(120);
-        let idx = (mouse.column as usize * tabs.len()) / width as usize;
-        if let Some(&t) = tabs.get(idx) { app.tab = t; }
+    if !matches!(
+        mouse.kind,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left)
+            | MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+    ) {
+        return;
+    }
+    if mouse.row > 2 {
+        return;
+    }
+
+    let tabs = tabs_for_mode(app.user_mode);
+    if tabs.is_empty() {
+        return;
+    }
+    let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(120);
+    let idx = ((mouse.column as usize) * tabs.len()) / (width as usize);
+    let idx = idx.min(tabs.len().saturating_sub(1));
+    app.tab = tabs[idx];
+}
+
+fn tabs_for_mode(mode: UserMode) -> Vec<Tab> {
+    match mode {
+        UserMode::Simple => vec![Tab::Config, Tab::Privacy, Tab::Proxy],
+        UserMode::Advanced => vec![
+            Tab::Config,
+            Tab::Monitor,
+            Tab::Privacy,
+            Tab::PrivacyHeaders,
+            Tab::Logs,
+            Tab::Proxy,
+        ],
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClassifierCacheClearResult {
+    Removed,
+    Missing,
+}
+
+fn classifier_cache_path_for(cfg: &EngineConfig) -> PathBuf {
+    let configured = cfg.evasion.classifier_cache_path.trim();
+    if !configured.is_empty() {
+        return expand_tilde(configured);
+    }
+    if let Some(dir) = dirs::cache_dir() {
+        return dir.join("prime-net-engine").join("relay-classifier.json");
+    }
+    expand_tilde("~/.cache/prime-net-engine/relay-classifier.json")
+}
+
+fn build_classifier_cache_clear_prompt(cfg: &EngineConfig) -> ClassifierCacheClearPrompt {
+    let path = classifier_cache_path_for(cfg);
+    let mut exists = false;
+    let mut size_bytes = 0u64;
+    let mut modified_unix = None;
+    if let Ok(meta) = fs::metadata(&path) {
+        exists = true;
+        size_bytes = meta.len();
+        modified_unix = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+    }
+    ClassifierCacheClearPrompt {
+        path,
+        exists,
+        size_bytes,
+        modified_unix,
+    }
+}
+
+fn clear_classifier_cache_file(path: &Path) -> Result<ClassifierCacheClearResult> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(ClassifierCacheClearResult::Removed),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ClassifierCacheClearResult::Missing)
+        }
+        Err(e) => Err(EngineError::Internal(format!(
+            "не удалось очистить кэш relay-классификатора {}: {e}",
+            path.display()
+        ))),
+    }
+}
+

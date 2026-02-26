@@ -141,8 +141,7 @@ pub fn split_host_port_with_default(s: &str, default_port: u16) -> Option<(Strin
             if rest.is_empty() {
                 return Some((host.to_owned(), default_port));
             }
-            if rest.starts_with(':') {
-                let port_str = &rest[1..];
+            if let Some(port_str) = rest.strip_prefix(':') {
                 if let Ok(port) = port_str.parse::<u16>() {
                     return Some((host.to_owned(), port));
                 }
@@ -181,8 +180,7 @@ pub struct HttpForwardTarget {
 }
 
 pub fn parse_http_forward_target(uri: &str, headers: &str) -> Option<HttpForwardTarget> {
-    if uri.starts_with("http://") {
-        let rest = &uri[7..];
+    if let Some(rest) = uri.strip_prefix("http://") {
         let (host_port, path) = if let Some(slash_pos) = rest.find('/') {
             (&rest[..slash_pos], &rest[slash_pos..])
         } else {
@@ -336,8 +334,26 @@ pub fn should_mark_bypass_zero_reply_soft(port: u16, c2u: u64, u2c: u64, lifetim
 
 pub fn record_bypass_profile_success(destination: &str, idx: u8) {
     let key = bypass_profile_key(destination);
+    let service_key = bypass_profile_legacy_service_key(destination);
     if let Some(map) = DEST_BYPASS_PROFILE_IDX.get() {
-        map.insert(key, idx);
+        if let Some(mut entry) = map.get_mut(&key) {
+            *entry = idx;
+        }
+        if service_key != key {
+            if let Some(mut entry) = map.get_mut(&service_key) {
+                *entry = idx;
+            }
+        }
+    }
+    if let Some(map) = DEST_BYPASS_PROFILE_FAILURES.get() {
+        if let Some(mut entry) = map.get_mut(&key) {
+            *entry = entry.saturating_sub(1);
+        }
+        if service_key != key {
+            if let Some(mut entry) = map.get_mut(&service_key) {
+                *entry = entry.saturating_sub(1);
+            }
+        }
     }
 }
 

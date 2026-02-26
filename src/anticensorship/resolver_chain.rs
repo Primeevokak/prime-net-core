@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use crate::config::{AntiCensorshipConfig, DnsResolverKind};
 use crate::error::{EngineError, Result};
@@ -379,17 +379,21 @@ impl ResolverChain {
             
             // Hardcoded safe fallbacks for common providers to avoid system DNS dependency
             if host == "dns.google" && provider_bootstrap_ips.is_empty() {
-                provider_bootstrap_ips.extend(["8.8.8.8".parse::<IpAddr>().unwrap(), "8.8.4.4".parse::<IpAddr>().unwrap()]);
+                provider_bootstrap_ips.extend(fallback_ipv4s(&[[8, 8, 8, 8], [8, 8, 4, 4]]));
             } else if host == "cloudflare-dns.com" && provider_bootstrap_ips.is_empty() {
-                provider_bootstrap_ips.extend(["1.1.1.1".parse::<IpAddr>().unwrap(), "1.0.0.1".parse::<IpAddr>().unwrap()]);
+                provider_bootstrap_ips
+                    .extend(fallback_ipv4s(&[[1, 1, 1, 1], [1, 0, 0, 1]]));
             } else if host == "dns.quad9.net" && provider_bootstrap_ips.is_empty() {
-                provider_bootstrap_ips.extend(["9.9.9.9".parse::<IpAddr>().unwrap(), "149.112.112.112".parse::<IpAddr>().unwrap()]);
+                provider_bootstrap_ips
+                    .extend(fallback_ipv4s(&[[9, 9, 9, 9], [149, 112, 112, 112]]));
             } else if host == "dns.adguard.com" && provider_bootstrap_ips.is_empty() {
-                provider_bootstrap_ips.extend(["94.140.14.14".parse::<IpAddr>().unwrap(), "94.140.15.15".parse::<IpAddr>().unwrap()]);
+                provider_bootstrap_ips
+                    .extend(fallback_ipv4s(&[[94, 140, 14, 14], [94, 140, 15, 15]]));
             } else if host == "doh.mullvad.net" && provider_bootstrap_ips.is_empty() {
-                provider_bootstrap_ips.extend(["194.242.2.2".parse::<IpAddr>().unwrap()]);
+                provider_bootstrap_ips.extend(fallback_ipv4s(&[[194, 242, 2, 2]]));
             } else if host == "doh.opendns.com" && provider_bootstrap_ips.is_empty() {
-                provider_bootstrap_ips.extend(["208.67.222.222".parse::<IpAddr>().unwrap(), "208.67.220.220".parse::<IpAddr>().unwrap()]);
+                provider_bootstrap_ips
+                    .extend(fallback_ipv4s(&[[208, 67, 222, 222], [208, 67, 220, 220]]));
             }
 
             if !provider_bootstrap_ips.is_empty() {
@@ -601,6 +605,15 @@ fn should_filter_poisoned_ips(domain: &str) -> bool {
         return false;
     }
     true
+}
+
+#[cfg(feature = "hickory-dns")]
+fn fallback_ipv4s(addrs: &[[u8; 4]]) -> Vec<IpAddr> {
+    addrs
+        .iter()
+        .copied()
+        .map(|octets| IpAddr::V4(Ipv4Addr::from(octets)))
+        .collect()
 }
 
 #[cfg(feature = "hickory-dns")]

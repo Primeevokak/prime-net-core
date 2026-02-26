@@ -58,7 +58,7 @@ pub struct ClassifierStoreConfig {
     pub entry_ttl_secs: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClassifierSnapshotEntry {
     pub failures: u8,
     pub preferred_stage: u8,
@@ -67,20 +67,6 @@ pub struct ClassifierSnapshotEntry {
     pub bypass_profile_failures: u8,
     pub route_winner: Option<RouteWinner>,
     pub route_health: HashMap<String, RouteHealth>,
-}
-
-impl Default for ClassifierSnapshotEntry {
-    fn default() -> Self {
-        Self {
-            failures: 0,
-            preferred_stage: 0,
-            stats: DestinationClassifier::default(),
-            bypass_profile_idx: None,
-            bypass_profile_failures: 0,
-            route_winner: None,
-            route_health: HashMap::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

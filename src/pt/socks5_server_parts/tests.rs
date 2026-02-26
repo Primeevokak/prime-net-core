@@ -301,6 +301,38 @@ mod tests {
     }
 
     #[test]
+    fn bypass_candidates_round_robin_when_profile_not_pinned() {
+        clear_bypass_profile_state_for_test();
+        let relay_opts = RelayOptions {
+            bypass_socks5_pool: vec![
+                "127.0.0.1:19080".parse().expect("addr"),
+                "127.0.0.1:19081".parse().expect("addr"),
+                "127.0.0.1:19082".parse().expect("addr"),
+            ],
+            ..RelayOptions::default()
+        };
+        let first = select_bypass_candidates(&relay_opts, "round-robin.example:443");
+        let second = select_bypass_candidates(&relay_opts, "round-robin.example:443");
+        assert_ne!(first[0].1, second[0].1);
+        clear_bypass_profile_state_for_test();
+    }
+
+    #[test]
+    fn adaptive_bypass_multi_profile_success_does_not_pin_winner() {
+        let route_key = "adaptive-no-pin.example:443|any";
+        clear_route_state_for_test(route_key);
+        let candidate = RouteCandidate::bypass(
+            "adaptive-race",
+            "127.0.0.1:19080".parse().expect("addr"),
+            0,
+            3,
+        );
+        record_route_success(route_key, &candidate);
+        assert!(route_winner_for_key(route_key).is_none());
+        clear_route_state_for_test(route_key);
+    }
+
+    #[test]
     fn adaptive_route_candidates_include_bypass_for_public_tls_domain() {
         let relay_opts = RelayOptions {
             bypass_socks5_pool: vec![
