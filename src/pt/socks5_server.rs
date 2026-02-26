@@ -84,12 +84,33 @@ pub struct UdpDestinationPolicy {
 }
 
 // Semantically grouped sections for SOCKS5 PT server.
-include!("socks5_server_parts/state_and_startup.rs");
-include!("socks5_server_parts/route_connection.rs");
-include!("socks5_server_parts/protocol_handlers.rs");
-include!("socks5_server_parts/protocol_socks4.rs");
-include!("socks5_server_parts/route_scoring.rs");
-include!("socks5_server_parts/classifier_and_persistence.rs");
-include!("socks5_server_parts/relay_and_io_helpers.rs");
-include!("socks5_server_parts/evasion_tests.rs");
-include!("socks5_server_parts/tests.rs");
+#[path = "socks5_server_parts/state_and_startup.rs"]
+mod state_and_startup;
+#[path = "socks5_server_parts/route_connection.rs"]
+mod route_connection;
+#[path = "socks5_server_parts/protocol_handlers.rs"]
+mod protocol_handlers;
+#[path = "socks5_server_parts/protocol_socks4.rs"]
+mod protocol_socks4;
+#[path = "socks5_server_parts/route_scoring.rs"]
+mod route_scoring;
+#[path = "socks5_server_parts/classifier_and_persistence.rs"]
+mod classifier_and_persistence;
+#[path = "socks5_server_parts/relay_and_io_helpers.rs"]
+mod relay_and_io_helpers;
+#[cfg(test)]
+#[path = "socks5_server_parts/evasion_tests.rs"]
+mod evasion_tests;
+#[cfg(test)]
+#[path = "socks5_server_parts/tests.rs"]
+mod tests;
+
+use classifier_and_persistence::*;
+use protocol_handlers::*;
+use protocol_socks4::*;
+use relay_and_io_helpers::*;
+use route_connection::*;
+use route_scoring::*;
+use state_and_startup::*;
+
+pub use state_and_startup::{RelayOptions, Socks5ServerGuard, start_socks5_server};

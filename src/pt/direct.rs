@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::anticensorship::ResolverChain;
 use crate::error::{EngineError, Result};
@@ -94,7 +94,7 @@ impl DirectOutbound {
                 let attempts = ordered.len().min(Self::MAX_DOMAIN_IP_ATTEMPTS);
                 let has_v4 = ordered.iter().any(IpAddr::is_ipv4);
                 let has_v6 = ordered.iter().any(IpAddr::is_ipv6);
-                info!(
+                debug!(
                     target: "outbound.direct",
                     host = %host,
                     port = target.port,
@@ -140,7 +140,7 @@ impl DirectOutbound {
                 Ok((idx, addr, Ok(stream))) => {
                     set.abort_all();
                     if idx > 0 {
-                        info!(
+                        debug!(
                             target: "outbound.direct",
                             destination = %target_label,
                             upstream = %addr,
@@ -156,16 +156,38 @@ impl DirectOutbound {
                     } else {
                         false
                     };
-
-                    warn!(
-                        target: "outbound.direct",
-                        destination = %target_label,
-                        upstream = %addr,
-                        attempt = idx + 1,
-                        unreachable = is_unreachable,
-                        error = %e,
-                        "Direct outbound attempt failed"
-                    );
+                    let is_noise_probe = is_noise_probe_destination(target_label);
+                    if is_noise_probe && is_unreachable {
+                        debug!(
+                            target: "outbound.direct",
+                            destination = %target_label,
+                            upstream = %addr,
+                            attempt = idx + 1,
+                            unreachable = is_unreachable,
+                            error = %e,
+                            "Direct outbound probe attempt failed (expected in IPv6-offline environments)"
+                        );
+                    } else if is_noise_probe {
+                        debug!(
+                            target: "outbound.direct",
+                            destination = %target_label,
+                            upstream = %addr,
+                            attempt = idx + 1,
+                            unreachable = is_unreachable,
+                            error = %e,
+                            "Direct outbound probe attempt failed"
+                        );
+                    } else {
+                        warn!(
+                            target: "outbound.direct",
+                            destination = %target_label,
+                            upstream = %addr,
+                            attempt = idx + 1,
+                            unreachable = is_unreachable,
+                            error = %e,
+                            "Direct outbound attempt failed"
+                        );
+                    }
                     
                     last_err = Some(e);
                     
@@ -201,7 +223,7 @@ impl DirectOutbound {
                 "direct connect target is unspecified/sinkhole IP: {addr}"
             )));
         }
-        info!(target: "outbound.direct", destination = %target_label, upstream = %addr, "Direct outbound connect");
+        debug!(target: "outbound.direct", destination = %target_label, upstream = %addr, "Direct outbound connect");
         let connect = tokio::time::timeout(Self::CONNECT_TIMEOUT, TcpStream::connect(addr)).await;
         let tcp = match connect {
             Ok(Ok(v)) => v,
@@ -215,7 +237,7 @@ impl DirectOutbound {
         };
         let _ = tcp.set_nodelay(true);
         let _ = set_socket_ttl_low(&tcp, self.first_packet_ttl);
-        info!(target: "outbound.direct", destination = %target_label, upstream = %addr, "Direct outbound connected");
+        debug!(target: "outbound.direct", destination = %target_label, upstream = %addr, "Direct outbound connected");
         Ok(Box::new(tcp))
     }
 
@@ -225,7 +247,7 @@ impl DirectOutbound {
         target: &TargetEndpoint,
         proxy_addr: SocketAddr,
     ) -> Result<BoxStream> {
-        info!(
+        debug!(
             target: "outbound.direct",
             destination = %target_label,
             upstream_socks5 = %proxy_addr,
@@ -325,7 +347,7 @@ impl DirectOutbound {
             }
         }
 
-        info!(
+        debug!(
             target: "outbound.direct",
             destination = %target_label,
             upstream_socks5 = %proxy_addr,
@@ -333,6 +355,21 @@ impl DirectOutbound {
         );
         Ok(Box::new(tcp))
     }
+}
+
+fn is_noise_probe_destination(target_label: &str) -> bool {
+    let host = target_label
+        .split_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(target_label)
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    host.contains("msftconnecttest")
+        || host.contains("msftncsi")
+        || host.contains("connectivitycheck")
+        || host.contains("captive")
 }
 
 fn normalize_host_literal(host: &str) -> String {

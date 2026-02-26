@@ -1,3 +1,5 @@
+use super::*;
+
 pub async fn relay_bidirectional(
     client: &mut TcpStream,
     upstream: &mut BoxStream,
@@ -56,11 +58,11 @@ pub async fn relay_bidirectional(
     tokio::try_join!(c2u, u2c)
 }
 
-fn is_tls_client_hello(data: &[u8]) -> bool {
+pub(super) fn is_tls_client_hello(data: &[u8]) -> bool {
     data.len() >= 5 && data[0] == 0x16 && data[1] == 0x03 && (data[2] == 0x01 || data[2] == 0x03)
 }
 
-async fn fragment_and_send_tls_hello(
+pub(super) async fn fragment_and_send_tls_hello(
     data: &[u8],
     upstream_w: &mut (impl AsyncWriteExt + Unpin),
     opts: &RelayOptions,
@@ -235,7 +237,7 @@ pub fn is_expected_disconnect(e: &std::io::Error) -> bool {
     matches!(e.kind(), ErrorKind::ConnectionReset | ErrorKind::BrokenPipe | ErrorKind::ConnectionAborted)
 }
 
-fn apply_tcp_window_size(stream: &TcpStream, size: u32) -> std::io::Result<()> {
+pub(super) fn apply_tcp_window_size(stream: &TcpStream, size: u32) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawSocket;
@@ -335,6 +337,7 @@ pub fn should_mark_bypass_zero_reply_soft(port: u16, c2u: u64, u2c: u64, lifetim
 pub fn record_bypass_profile_success(destination: &str, idx: u8) {
     let key = bypass_profile_key(destination);
     let service_key = bypass_profile_legacy_service_key(destination);
+    let meta_key = bypass_profile_meta_service_key(destination);
     if let Some(map) = DEST_BYPASS_PROFILE_IDX.get() {
         if let Some(mut entry) = map.get_mut(&key) {
             *entry = idx;
@@ -342,6 +345,13 @@ pub fn record_bypass_profile_success(destination: &str, idx: u8) {
         if service_key != key {
             if let Some(mut entry) = map.get_mut(&service_key) {
                 *entry = idx;
+            }
+        }
+        if let Some(meta_key) = meta_key.as_ref() {
+            if meta_key != &key && meta_key != &service_key {
+                if let Some(mut entry) = map.get_mut(meta_key) {
+                    *entry = idx;
+                }
             }
         }
     }
@@ -352,6 +362,13 @@ pub fn record_bypass_profile_success(destination: &str, idx: u8) {
         if service_key != key {
             if let Some(mut entry) = map.get_mut(&service_key) {
                 *entry = entry.saturating_sub(1);
+            }
+        }
+        if let Some(meta_key) = meta_key.as_ref() {
+            if meta_key != &key && meta_key != &service_key {
+                if let Some(mut entry) = map.get_mut(meta_key) {
+                    *entry = entry.saturating_sub(1);
+                }
             }
         }
     }

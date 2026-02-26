@@ -1,14 +1,16 @@
-fn destination_failures(destination: &str) -> u8 {
+use super::*;
+
+pub(super) fn destination_failures(destination: &str) -> u8 {
     let map = DEST_FAILURES.get_or_init(DashMap::new);
     map.get(destination).map(|r| *r).unwrap_or(0)
 }
 
-fn destination_preferred_stage(destination: &str) -> u8 {
+pub(super) fn destination_preferred_stage(destination: &str) -> u8 {
     let map = DEST_PREFERRED_STAGE.get_or_init(DashMap::new);
     map.get(destination).map(|r| *r).unwrap_or(0).min(4)
 }
 
-fn select_race_probe_stage(destination: &str) -> u8 {
+pub(super) fn select_race_probe_stage(destination: &str) -> u8 {
     let _ = destination;
     let stats = STAGE_RACE_STATS.get_or_init(DashMap::new);
     
@@ -28,7 +30,7 @@ fn select_race_probe_stage(destination: &str) -> u8 {
     candidates.into_iter().next().unwrap_or(1)
 }
 
-fn stage_penalty(successes: u64, failures: u64) -> f64 {
+pub(super) fn stage_penalty(successes: u64, failures: u64) -> f64 {
     let total = successes + failures;
     if total == 0 {
         return 0.5;
@@ -36,7 +38,7 @@ fn stage_penalty(successes: u64, failures: u64) -> f64 {
     failures as f64 / total as f64
 }
 
-fn stable_hash(input: &str) -> u64 {
+pub(super) fn stable_hash(input: &str) -> u64 {
     let mut h = 1469598103934665603u64;
     for b in input.as_bytes() {
         h ^= *b as u64;
@@ -45,7 +47,7 @@ fn stable_hash(input: &str) -> u64 {
     h
 }
 
-fn record_stage_source_selected(source: StageSelectionSource) {
+pub(super) fn record_stage_source_selected(source: StageSelectionSource) {
     let counters = RACE_SOURCE_COUNTERS.get_or_init(RaceSourceCounters::default);
     match source {
         StageSelectionSource::Cache => counters.cache.fetch_add(1, Ordering::Relaxed),
@@ -54,7 +56,7 @@ fn record_stage_source_selected(source: StageSelectionSource) {
     };
 }
 
-fn record_destination_failure(
+pub(super) fn record_destination_failure(
     destination: &str,
     signal: BlockingSignal,
     classifier_emit_interval_secs: u64,
@@ -120,7 +122,7 @@ fn record_destination_failure(
     maybe_emit_classifier_summary(classifier_emit_interval_secs.max(5));
 }
 
-fn record_destination_success(destination: &str, stage: u8, _source: StageSelectionSource) {
+pub(super) fn record_destination_success(destination: &str, stage: u8, _source: StageSelectionSource) {
     let now = now_unix_secs();
     {
         let map = DEST_FAILURES.get_or_init(DashMap::new);
@@ -146,7 +148,7 @@ fn record_destination_success(destination: &str, stage: u8, _source: StageSelect
     maybe_flush_classifier_store(false);
 }
 
-fn record_stage_outcome(stage: u8, success: bool) {
+pub(super) fn record_stage_outcome(stage: u8, success: bool) {
     if stage == 0 {
         return;
     }
@@ -159,7 +161,7 @@ fn record_stage_outcome(stage: u8, success: bool) {
     }
 }
 
-fn classify_io_error(e: &std::io::Error) -> BlockingSignal {
+pub(super) fn classify_io_error(e: &std::io::Error) -> BlockingSignal {
     if e.to_string().contains("silent drop") {
         return BlockingSignal::SilentDrop;
     }
@@ -172,7 +174,7 @@ fn classify_io_error(e: &std::io::Error) -> BlockingSignal {
     }
 }
 
-fn blocking_signal_label(signal: BlockingSignal) -> &'static str {
+pub(super) fn blocking_signal_label(signal: BlockingSignal) -> &'static str {
     match signal {
         BlockingSignal::Reset => "reset",
         BlockingSignal::Timeout => "timeout",
@@ -183,7 +185,7 @@ fn blocking_signal_label(signal: BlockingSignal) -> &'static str {
     }
 }
 
-fn should_mark_suspicious_zero_reply(
+pub(super) fn should_mark_suspicious_zero_reply(
     port: u16,
     bytes_client_to_upstream: u64,
     bytes_upstream_to_client: u64,
@@ -192,9 +194,9 @@ fn should_mark_suspicious_zero_reply(
     port == 443 && bytes_upstream_to_client == 0 && bytes_client_to_upstream >= min_c2u as u64
 }
 
-static LAST_CLASSIFIER_EMIT_UNIX: AtomicU64 = AtomicU64::new(0);
+pub(super) static LAST_CLASSIFIER_EMIT_UNIX: AtomicU64 = AtomicU64::new(0);
 
-fn maybe_emit_classifier_summary(interval_secs: u64) {
+pub(super) fn maybe_emit_classifier_summary(interval_secs: u64) {
     let now = now_unix_secs();
     let last = LAST_CLASSIFIER_EMIT_UNIX.load(Ordering::Relaxed);
     if now.saturating_sub(last) < interval_secs {
@@ -347,13 +349,13 @@ fn maybe_emit_classifier_summary(interval_secs: u64) {
     maybe_flush_classifier_store(false);
 }
 
-static CLASSIFIER_STORE_CFG: OnceLock<Option<ClassifierStoreConfig>> = OnceLock::new();
-static CLASSIFIER_STORE_LOADED: AtomicBool = AtomicBool::new(false);
-static CLASSIFIER_STORE_DIRTY: AtomicBool = AtomicBool::new(false);
-static CLASSIFIER_STORE_LAST_FLUSH_UNIX: AtomicU64 = AtomicU64::new(0);
-const CLASSIFIER_PERSIST_DEBOUNCE_SECS: u64 = 30;
+pub(super) static CLASSIFIER_STORE_CFG: OnceLock<Option<ClassifierStoreConfig>> = OnceLock::new();
+pub(super) static CLASSIFIER_STORE_LOADED: AtomicBool = AtomicBool::new(false);
+pub(super) static CLASSIFIER_STORE_DIRTY: AtomicBool = AtomicBool::new(false);
+pub(super) static CLASSIFIER_STORE_LAST_FLUSH_UNIX: AtomicU64 = AtomicU64::new(0);
+pub(super) const CLASSIFIER_PERSIST_DEBOUNCE_SECS: u64 = 30;
 
-fn init_classifier_store(relay_opts: &RelayOptions) {
+pub(super) fn init_classifier_store(relay_opts: &RelayOptions) {
     let _ = CLASSIFIER_STORE_CFG.get_or_init(|| {
         if !relay_opts.classifier_persist_enabled {
             return None;
@@ -371,14 +373,14 @@ fn init_classifier_store(relay_opts: &RelayOptions) {
     });
 }
 
-fn default_classifier_store_path() -> PathBuf {
+pub(super) fn default_classifier_store_path() -> PathBuf {
     if let Some(dir) = dirs::cache_dir() {
         return dir.join("prime-net-engine").join("relay-classifier.json");
     }
     expand_tilde("~/.cache/prime-net-engine/relay-classifier.json")
 }
 
-fn load_classifier_store_if_needed() {
+pub(super) fn load_classifier_store_if_needed() {
     if CLASSIFIER_STORE_LOADED.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -473,7 +475,7 @@ fn load_classifier_store_if_needed() {
     }
 }
 
-fn destination_classifier_is_empty(stats: &DestinationClassifier) -> bool {
+pub(super) fn destination_classifier_is_empty(stats: &DestinationClassifier) -> bool {
     stats.failures == 0
         && stats.resets == 0
         && stats.timeouts == 0
@@ -483,7 +485,7 @@ fn destination_classifier_is_empty(stats: &DestinationClassifier) -> bool {
         && stats.successes == 0
 }
 
-fn route_health_is_empty(health: &RouteHealth) -> bool {
+pub(super) fn route_health_is_empty(health: &RouteHealth) -> bool {
     health.successes == 0
         && health.failures == 0
         && health.consecutive_failures == 0
@@ -492,14 +494,14 @@ fn route_health_is_empty(health: &RouteHealth) -> bool {
         && health.last_failure_unix == 0
 }
 
-fn route_health_last_seen_unix(health: &RouteHealth) -> u64 {
+pub(super) fn route_health_last_seen_unix(health: &RouteHealth) -> u64 {
     health
         .last_success_unix
         .max(health.last_failure_unix)
         .max(health.weak_until_unix)
 }
 
-fn snapshot_entry_last_seen_unix(entry: &ClassifierSnapshotEntry) -> u64 {
+pub(super) fn snapshot_entry_last_seen_unix(entry: &ClassifierSnapshotEntry) -> u64 {
     let mut last_seen = entry.stats.last_seen_unix;
     if let Some(winner) = entry.route_winner.as_ref() {
         last_seen = last_seen.max(winner.updated_at_unix);
@@ -510,7 +512,7 @@ fn snapshot_entry_last_seen_unix(entry: &ClassifierSnapshotEntry) -> u64 {
     last_seen
 }
 
-fn read_classifier_snapshot(path: &Path) -> std::io::Result<Option<ClassifierSnapshot>> {
+pub(super) fn read_classifier_snapshot(path: &Path) -> std::io::Result<Option<ClassifierSnapshot>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -520,7 +522,7 @@ fn read_classifier_snapshot(path: &Path) -> std::io::Result<Option<ClassifierSna
     Ok(Some(parsed))
 }
 
-fn maybe_flush_classifier_store(force: bool) {
+pub(super) fn maybe_flush_classifier_store(force: bool) {
     let Some(cfg) = CLASSIFIER_STORE_CFG.get().and_then(Clone::clone) else {
         return;
     };
@@ -550,7 +552,7 @@ fn maybe_flush_classifier_store(force: bool) {
     }
 }
 
-fn write_classifier_snapshot(cfg: &ClassifierStoreConfig) -> std::io::Result<()> {
+pub(super) fn write_classifier_snapshot(cfg: &ClassifierStoreConfig) -> std::io::Result<()> {
     let failures = DEST_FAILURES.get_or_init(DashMap::new);
     let preferred = DEST_PREFERRED_STAGE.get_or_init(DashMap::new);
     let classifier = DEST_CLASSIFIER.get_or_init(DashMap::new);
@@ -669,7 +671,7 @@ fn write_classifier_snapshot(cfg: &ClassifierStoreConfig) -> std::io::Result<()>
     Ok(())
 }
 
-fn write_snapshot_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub(super) fn write_snapshot_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())

@@ -1,3 +1,5 @@
+use super::*;
+
 #[cfg(test)]
 mod evasion_integration_tests {
     use super::*;

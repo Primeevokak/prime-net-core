@@ -1,25 +1,27 @@
-static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
-static WARNED_SOCKS4_LIMITATIONS: AtomicBool = AtomicBool::new(false);
-static WARNED_SOCKS4_AGGRESSIVE: AtomicBool = AtomicBool::new(false);
+use super::*;
 
-static DEST_FAILURES: OnceLock<DashMap<String, u8>> = OnceLock::new();
-static DEST_PREFERRED_STAGE: OnceLock<DashMap<String, u8>> = OnceLock::new();
-static DEST_CLASSIFIER: OnceLock<DashMap<String, DestinationClassifier>> = OnceLock::new();
-static DEST_BYPASS_PROFILE_IDX: OnceLock<DashMap<String, u8>> = OnceLock::new();
-static DEST_BYPASS_PROFILE_FAILURES: OnceLock<DashMap<String, u8>> = OnceLock::new();
-static GLOBAL_BYPASS_PROFILE_HEALTH: OnceLock<DashMap<String, BypassProfileHealth>> =
-    OnceLock::new();
-static DEST_ROUTE_WINNER: OnceLock<DashMap<String, RouteWinner>> = OnceLock::new();
-static DEST_ROUTE_HEALTH: OnceLock<DashMap<String, DashMap<String, RouteHealth>>> =
-    OnceLock::new();
-static STAGE_RACE_STATS: OnceLock<DashMap<u8, StageRaceStats>> = OnceLock::new();
-static RACE_SOURCE_COUNTERS: OnceLock<RaceSourceCounters> = OnceLock::new();
-static ROUTE_METRICS: OnceLock<RwLock<RouteMetrics>> = OnceLock::new();
-static ROUTE_CAPABILITIES: OnceLock<RwLock<RouteCapabilities>> = OnceLock::new();
-static BYPASS_POOL: OnceLock<DashMap<SocketAddr, Vec<TcpStream>>> = OnceLock::new();
-static NEXT_BYPASS_POOL_IDX: AtomicU64 = AtomicU64::new(0);
+pub(super) static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+pub(super) static WARNED_SOCKS4_LIMITATIONS: AtomicBool = AtomicBool::new(false);
+pub(super) static WARNED_SOCKS4_AGGRESSIVE: AtomicBool = AtomicBool::new(false);
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(super) static DEST_FAILURES: OnceLock<DashMap<String, u8>> = OnceLock::new();
+pub(super) static DEST_PREFERRED_STAGE: OnceLock<DashMap<String, u8>> = OnceLock::new();
+pub(super) static DEST_CLASSIFIER: OnceLock<DashMap<String, DestinationClassifier>> = OnceLock::new();
+pub(super) static DEST_BYPASS_PROFILE_IDX: OnceLock<DashMap<String, u8>> = OnceLock::new();
+pub(super) static DEST_BYPASS_PROFILE_FAILURES: OnceLock<DashMap<String, u8>> = OnceLock::new();
+pub(super) static GLOBAL_BYPASS_PROFILE_HEALTH: OnceLock<DashMap<String, BypassProfileHealth>> =
+    OnceLock::new();
+pub(super) static DEST_ROUTE_WINNER: OnceLock<DashMap<String, RouteWinner>> = OnceLock::new();
+pub(super) static DEST_ROUTE_HEALTH: OnceLock<DashMap<String, DashMap<String, RouteHealth>>> =
+    OnceLock::new();
+pub(super) static STAGE_RACE_STATS: OnceLock<DashMap<u8, StageRaceStats>> = OnceLock::new();
+pub(super) static RACE_SOURCE_COUNTERS: OnceLock<RaceSourceCounters> = OnceLock::new();
+pub(super) static ROUTE_METRICS: OnceLock<RwLock<RouteMetrics>> = OnceLock::new();
+pub(super) static ROUTE_CAPABILITIES: OnceLock<RwLock<RouteCapabilities>> = OnceLock::new();
+pub(super) static BYPASS_POOL: OnceLock<DashMap<SocketAddr, Vec<TcpStream>>> = OnceLock::new();
+pub(super) static NEXT_BYPASS_POOL_IDX: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayOptions {
     pub fragment_client_hello: bool,
     pub split_at_sni: bool,
@@ -49,6 +51,40 @@ pub struct RelayOptions {
     pub bypass_socks5_pool: Vec<SocketAddr>,
     #[serde(skip)]
     pub bypass_domain_check: Option<fn(&str) -> bool>,
+}
+
+impl Default for RelayOptions {
+    fn default() -> Self {
+        Self {
+            fragment_client_hello: false,
+            split_at_sni: false,
+            client_hello_split_offsets: Vec::new(),
+            fragment_size_min: 1,
+            fragment_size_max: 128,
+            randomize_fragment_size: false,
+            fragment_sleep_ms: 0,
+            fragment_budget_bytes: 16 * 1024,
+            tcp_window_trick: false,
+            tcp_window_size: 0,
+            sni_spoofing: false,
+            sni_case_toggle: false,
+            classifier_persist_enabled: false,
+            classifier_cache_path: String::new(),
+            classifier_entry_ttl_secs: 24 * 60 * 60,
+            classifier_emit_interval_secs: 30,
+            strategy_race_enabled: true,
+            suspicious_zero_reply_min_c2u: 256,
+            stage1_failures: 1,
+            stage2_failures: 2,
+            stage3_failures: 3,
+            udp_padding_range: None,
+            block_quic: false,
+            upstream_socks5: None,
+            bypass_socks5: None,
+            bypass_socks5_pool: Vec::new(),
+            bypass_domain_check: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -345,7 +381,7 @@ pub async fn start_socks5_server(
     })
 }
 
-async fn connect_bypass_upstream(
+pub(super) async fn connect_bypass_upstream(
     conn_id: u64,
     target: &TargetEndpoint,
     target_label: &str,

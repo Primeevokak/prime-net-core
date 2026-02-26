@@ -1,19 +1,28 @@
+use super::*;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn clear_route_state_for_test(route_key: &str) {
         let service_key = route_service_key(route_key);
+        let meta_key = route_meta_service_key(route_key);
         let health_map = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
         health_map.remove(route_key);
         if let Some(service_key) = service_key.as_ref() {
             health_map.remove(service_key);
+        }
+        if let Some(meta_key) = meta_key.as_ref() {
+            health_map.remove(meta_key);
         }
         
         let winner_map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
         winner_map.remove(route_key);
         if let Some(service_key) = service_key.as_ref() {
             winner_map.remove(service_key);
+        }
+        if let Some(meta_key) = meta_key.as_ref() {
+            winner_map.remove(meta_key);
         }
     }
 
@@ -169,6 +178,39 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_route_skips_race_when_meta_service_winner_is_healthy() {
+        let winner_route_key = route_decision_key(
+            "www.youtube.com:443",
+            &TargetAddr::Domain("www.youtube.com".to_owned()),
+        );
+        let probe_route_key = route_decision_key(
+            "i.ytimg.com:443",
+            &TargetAddr::Domain("i.ytimg.com".to_owned()),
+        );
+        clear_route_state_for_test(&winner_route_key);
+        clear_route_state_for_test(&probe_route_key);
+        let meta_key = route_meta_service_key(&winner_route_key).expect("meta key");
+        let winner_map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
+        winner_map.insert(
+            meta_key,
+            RouteWinner {
+                route_id: "bypass:2".to_owned(),
+                updated_at_unix: now_unix_secs(),
+            },
+        );
+
+        let candidates = vec![
+            RouteCandidate::direct("test"),
+            RouteCandidate::bypass("test", "127.0.0.1:19080".parse().expect("addr"), 0, 2),
+            RouteCandidate::bypass("test", "127.0.0.1:19081".parse().expect("addr"), 1, 2),
+        ];
+        let decision = route_race_decision(443, &probe_route_key, &candidates);
+        assert_eq!(decision, (false, RouteRaceReason::WinnerHealthy));
+        clear_route_state_for_test(&winner_route_key);
+        clear_route_state_for_test(&probe_route_key);
+    }
+
+    #[test]
     fn bypass_zero_reply_soft_requires_meaningful_payload_and_lifetime() {
         assert!(!should_mark_bypass_zero_reply_soft(443, 1, 0, 5_000));
         assert!(!should_mark_bypass_zero_reply_soft(
@@ -301,6 +343,23 @@ mod tests {
     }
 
     #[test]
+    fn bypass_profile_rotation_normalizes_family_aware_route_keys() {
+        clear_bypass_profile_state_for_test();
+        record_bypass_profile_failure("www.youtube.com:443|any", 0, 3, "handshake-io");
+        assert_eq!(destination_bypass_profile_idx("www.youtube.com:443", 3), 1);
+        clear_bypass_profile_state_for_test();
+    }
+
+    #[test]
+    fn bypass_profile_rotation_propagates_to_meta_service_group() {
+        clear_bypass_profile_state_for_test();
+        record_bypass_profile_failure("www.youtube.com:443", 0, 3, "unit-test");
+        assert_eq!(destination_bypass_profile_idx("i.ytimg.com:443", 3), 1);
+        assert_eq!(destination_bypass_profile_idx("yt3.ggpht.com:443", 3), 1);
+        clear_bypass_profile_state_for_test();
+    }
+
+    #[test]
     fn bypass_candidates_round_robin_when_profile_not_pinned() {
         clear_bypass_profile_state_for_test();
         let relay_opts = RelayOptions {
@@ -318,8 +377,8 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_bypass_multi_profile_success_does_not_pin_winner() {
-        let route_key = "adaptive-no-pin.example:443|any";
+    fn adaptive_bypass_multi_profile_success_pins_winner() {
+        let route_key = "adaptive-pin.example:443|any";
         clear_route_state_for_test(route_key);
         let candidate = RouteCandidate::bypass(
             "adaptive-race",
@@ -328,7 +387,8 @@ mod tests {
             3,
         );
         record_route_success(route_key, &candidate);
-        assert!(route_winner_for_key(route_key).is_none());
+        let winner = route_winner_for_key(route_key).expect("winner");
+        assert_eq!(winner.route_id, "bypass:1");
         clear_route_state_for_test(route_key);
     }
 
@@ -357,6 +417,46 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn noise_bypass_does_not_match_local_substring_domains() {
+        let relay_opts = RelayOptions {
+            bypass_socks5_pool: vec![
+                "127.0.0.1:19080".parse().expect("addr"),
+            ],
+            ..RelayOptions::default()
+        };
+        let target = TargetAddr::Domain("cdn.localizeapi.com".to_owned());
+        let route_key = route_decision_key("cdn.localizeapi.com:443", &target);
+        let candidates = select_route_candidates(&relay_opts, &target, 443, &route_key);
+        assert!(candidates.iter().any(|c| c.kind == RouteKind::Bypass));
+        assert_ne!(candidates[0].source, "noise-bypass");
+    }
+
+    #[test]
+    fn noise_bypass_matches_local_hosts_only() {
+        let relay_opts = RelayOptions {
+            bypass_socks5_pool: vec![
+                "127.0.0.1:19080".parse().expect("addr"),
+            ],
+            ..RelayOptions::default()
+        };
+
+        let localhost = TargetAddr::Domain("localhost".to_owned());
+        let localhost_key = route_decision_key("localhost:443", &localhost);
+        let localhost_candidates =
+            select_route_candidates(&relay_opts, &localhost, 443, &localhost_key);
+        assert_eq!(localhost_candidates.len(), 1);
+        assert_eq!(localhost_candidates[0].kind, RouteKind::Direct);
+        assert_eq!(localhost_candidates[0].source, "noise-bypass");
+
+        let local = TargetAddr::Domain("printer.local".to_owned());
+        let local_key = route_decision_key("printer.local:443", &local);
+        let local_candidates = select_route_candidates(&relay_opts, &local, 443, &local_key);
+        assert_eq!(local_candidates.len(), 1);
+        assert_eq!(local_candidates[0].kind, RouteKind::Direct);
+        assert_eq!(local_candidates[0].source, "noise-bypass");
     }
 
     #[test]
@@ -697,6 +797,44 @@ mod tests {
         let ordered = ordered_route_candidates(route_key, candidates);
         assert!(ordered.iter().any(|c| c.route_id() == "bypass:1"));
         assert!(!ordered.iter().any(|c| c.route_id() == "bypass:2"));
+        clear_route_state_for_test(route_key);
+        clear_global_bypass_health_for_test();
+    }
+
+    #[test]
+    fn cached_bypass_winner_is_kept_even_when_global_profile_is_weak() {
+        clear_global_bypass_health_for_test();
+        let route_key = "winner-kept-when-global-weak:443|any";
+        clear_route_state_for_test(route_key);
+
+        let bypass = RouteCandidate::bypass(
+            "adaptive-race",
+            "127.0.0.1:19080".parse().expect("addr"),
+            0,
+            1,
+        );
+        record_route_success(route_key, &bypass);
+
+        let now = now_unix_secs();
+        let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(DashMap::new);
+        map.insert(
+            "bypass:1".to_owned(),
+            BypassProfileHealth {
+                failures: 50,
+                connect_failures: 30,
+                soft_zero_replies: 20,
+                last_failure_unix: now,
+                ..BypassProfileHealth::default()
+            },
+        );
+
+        let ordered = ordered_route_candidates(
+            route_key,
+            vec![RouteCandidate::direct("adaptive"), bypass.clone()],
+        );
+        assert!(ordered.iter().any(|c| c.route_id() == "bypass:1"));
+        assert_eq!(ordered.first().map(|c| c.route_id()), Some("bypass:1".to_owned()));
+
         clear_route_state_for_test(route_key);
         clear_global_bypass_health_for_test();
     }

@@ -1,4 +1,6 @@
-async fn handle_http_proxy(
+use super::*;
+
+pub(super) async fn handle_http_proxy(
     conn_id: u64,
     mut tcp: TcpStream,
     peer: SocketAddr,
@@ -69,7 +71,7 @@ async fn handle_http_proxy(
         let candidates = select_route_candidates(&relay_opts, &target_endpoint.addr, target_endpoint.port, &target_label);
         let ordered = ordered_route_candidates(&target_label, candidates);
 
-        info!(target: "socks5", conn_id, peer = %peer, client = %client, destination = %destination, "HTTP CONNECT requested");
+        debug!(target: "socks5", conn_id, peer = %peer, client = %client, destination = %destination, "HTTP CONNECT requested");
 
         let mut connected = match connect_via_best_route(
             conn_id,
@@ -92,7 +94,7 @@ async fn handle_http_proxy(
             }
         };
         if connected.candidate.kind == RouteKind::Bypass {
-            info!(
+            debug!(
                 target: "socks5",
                 conn_id,
                 peer = %peer,
@@ -107,7 +109,7 @@ async fn handle_http_proxy(
                 "HTTP CONNECT route selected"
             );
         } else {
-            info!(
+            debug!(
                 target: "socks5",
                 conn_id,
                 peer = %peer,
@@ -125,7 +127,7 @@ async fn handle_http_proxy(
             .await
         {
             if is_expected_disconnect(&e) {
-                info!(
+                debug!(
                     target: "socks5",
                     conn_id,
                     peer = %peer,
@@ -140,7 +142,7 @@ async fn handle_http_proxy(
         }
 
         if connected.candidate.kind == RouteKind::Bypass {
-            info!(
+            debug!(
                 target: "socks5",
                 conn_id,
                 destination = %destination,
@@ -160,7 +162,7 @@ async fn handle_http_proxy(
                         ""
                     };
 
-                    info!(
+                    debug!(
                         target: "socks5",
                         conn_id,
                         destination = %destination,
@@ -287,7 +289,7 @@ async fn handle_http_proxy(
             Ok((bytes_client_to_upstream, bytes_upstream_to_client)) => {
                 if should_skip_empty_session_scoring(bytes_client_to_upstream, bytes_upstream_to_client)
                 {
-                    info!(
+                    debug!(
                         target: "socks5.route",
                         conn_id,
                         route_key = %connected.route_key,
@@ -346,7 +348,7 @@ async fn handle_http_proxy(
                     record_destination_success(&destination, tuned.stage, tuned.source);
                     record_route_success(&connected.route_key, &connected.candidate);
                 }
-                info!(
+                debug!(
                     target: "socks5",
                     conn_id,
                     peer = %peer,
@@ -358,7 +360,7 @@ async fn handle_http_proxy(
                 );
             }
             Err(e) if is_expected_disconnect(&e) => {
-                info!(
+                debug!(
                     target: "socks5",
                     conn_id,
                     peer = %peer,
@@ -404,8 +406,8 @@ async fn handle_http_proxy(
         return Ok(());
     };
     let destination = format!("{}:{}", parsed.host, parsed.port);
-    info!(target: "socks5", conn_id, peer = %peer, client = %client, method = %method, destination = %destination, "HTTP proxy forward requested");
-    info!(
+    debug!(target: "socks5", conn_id, peer = %peer, client = %client, method = %method, destination = %destination, "HTTP proxy forward requested");
+    debug!(
         target: "socks5",
         conn_id,
         peer = %peer,
@@ -430,7 +432,11 @@ async fn handle_http_proxy(
     {
         Ok(stream) => stream,
         Err(e) => {
-            warn!(target: "socks5", conn_id, peer = %peer, client = %client, method = %method, destination = %destination, error = %e, "HTTP proxy forward upstream failed");
+            if is_noise_probe_http_destination(&destination) {
+                debug!(target: "socks5", conn_id, peer = %peer, client = %client, method = %method, destination = %destination, error = %e, "HTTP proxy forward probe upstream failed");
+            } else {
+                warn!(target: "socks5", conn_id, peer = %peer, client = %client, method = %method, destination = %destination, error = %e, "HTTP proxy forward upstream failed");
+            }
             let _ = tcp
                 .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
                 .await;
@@ -450,7 +456,7 @@ async fn handle_http_proxy(
         Ok((bytes_client_to_upstream, bytes_upstream_to_client)) => {
             if should_skip_empty_session_scoring(bytes_client_to_upstream, bytes_upstream_to_client)
             {
-                info!(
+                debug!(
                     target: "socks5",
                     conn_id,
                     peer = %peer,
@@ -483,7 +489,7 @@ async fn handle_http_proxy(
             } else {
                 record_destination_success(&destination, tuned.stage, tuned.source);
             }
-            info!(
+            debug!(
                 target: "socks5",
                 conn_id,
                 peer = %peer,
@@ -495,7 +501,7 @@ async fn handle_http_proxy(
             );
         }
         Err(e) if is_expected_disconnect(&e) => {
-            info!(
+            debug!(
                 target: "socks5",
                 conn_id,
                 peer = %peer,
@@ -514,22 +520,50 @@ async fn handle_http_proxy(
                 tuned.options.classifier_emit_interval_secs,
                 tuned.stage,
             );
-            warn!(
-                target: "socks5",
-                conn_id,
-                peer = %peer,
-                client = %client,
-                method = %method,
-                destination = %destination,
-                error = %e,
-                "HTTP proxy forward relay interrupted"
-            );
+            if is_noise_probe_http_destination(&destination) {
+                debug!(
+                    target: "socks5",
+                    conn_id,
+                    peer = %peer,
+                    client = %client,
+                    method = %method,
+                    destination = %destination,
+                    error = %e,
+                    "HTTP proxy forward probe relay interrupted"
+                );
+            } else {
+                warn!(
+                    target: "socks5",
+                    conn_id,
+                    peer = %peer,
+                    client = %client,
+                    method = %method,
+                    destination = %destination,
+                    error = %e,
+                    "HTTP proxy forward relay interrupted"
+                );
+            }
         }
     }
     Ok(())
 }
 
-fn tune_relay_for_target(
+fn is_noise_probe_http_destination(destination: &str) -> bool {
+    let host = destination
+        .split_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(destination)
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    host.contains("msftconnecttest")
+        || host.contains("msftncsi")
+        || host.contains("connectivitycheck")
+        || host.contains("captive")
+}
+
+pub(super) fn tune_relay_for_target(
     mut base: RelayOptions,
     port: u16,
     destination: &str,
@@ -672,7 +706,7 @@ fn tune_relay_for_target(
         },
     };
     if stage > 0 {
-        info!(
+        debug!(
             target: "socks5",
             destination = %destination,
             stage,
@@ -691,7 +725,7 @@ fn tune_relay_for_target(
     }
 }
 
-fn route_family_for_target(target: &TargetAddr) -> RouteIpFamily {
+pub(super) fn route_family_for_target(target: &TargetAddr) -> RouteIpFamily {
     match target {
         TargetAddr::Ip(std::net::IpAddr::V4(_)) => RouteIpFamily::V4,
         TargetAddr::Ip(std::net::IpAddr::V6(_)) => RouteIpFamily::V6,
@@ -701,14 +735,14 @@ fn route_family_for_target(target: &TargetAddr) -> RouteIpFamily {
     }
 }
 
-fn route_family_for_ip(ip: std::net::IpAddr) -> RouteIpFamily {
+pub(super) fn route_family_for_ip(ip: std::net::IpAddr) -> RouteIpFamily {
     match ip {
         std::net::IpAddr::V4(_) => RouteIpFamily::V4,
         std::net::IpAddr::V6(_) => RouteIpFamily::V6,
     }
 }
 
-fn route_decision_key(destination: &str, target: &TargetAddr) -> String {
+pub(super) fn route_decision_key(destination: &str, target: &TargetAddr) -> String {
     format!(
         "{}|{}",
         route_state_key(destination),
@@ -716,20 +750,34 @@ fn route_decision_key(destination: &str, target: &TargetAddr) -> String {
     )
 }
 
-fn route_destination_key(route_key: &str) -> &str {
+pub(super) fn route_destination_key(route_key: &str) -> &str {
     route_key
         .split_once('|')
         .map(|(k, _)| k)
         .unwrap_or(route_key)
 }
 
-fn route_service_key(route_key: &str) -> Option<String> {
+pub(super) fn route_service_key(route_key: &str) -> Option<String> {
     let (destination_key, family) = route_key.split_once('|')?;
     let service_destination = route_service_state_key(destination_key)?;
     Some(format!("{service_destination}|{family}"))
 }
 
-fn route_service_state_key(destination: &str) -> Option<String> {
+pub(super) fn route_meta_service_key(route_key: &str) -> Option<String> {
+    let (destination_key, family) = route_key.split_once('|')?;
+    let (host, port) = split_host_port_for_connect(destination_key)?;
+    let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if normalized_host.is_empty() || parse_ip_literal(&normalized_host).is_some() {
+        return None;
+    }
+    let bucket = host_service_bucket(&normalized_host);
+    if !bucket.starts_with("meta-group:") {
+        return None;
+    }
+    Some(format!("{bucket}:{port}|{family}"))
+}
+
+pub(super) fn route_service_state_key(destination: &str) -> Option<String> {
     let (host, port) = split_host_port_for_connect(destination)?;
     let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
     if normalized_host.is_empty() {
@@ -742,7 +790,7 @@ fn route_service_state_key(destination: &str) -> Option<String> {
     Some(format!("{service_host}:{port}"))
 }
 
-fn registrable_domain_bucket(host: &str) -> Option<String> {
+pub(super) fn registrable_domain_bucket(host: &str) -> Option<String> {
     let labels: Vec<&str> = host.split('.').filter(|label| !label.is_empty()).collect();
     if labels.len() < 2 {
         return None;
@@ -759,7 +807,7 @@ fn registrable_domain_bucket(host: &str) -> Option<String> {
     Some(format!("{sld}.{tld}"))
 }
 
-fn route_state_key(destination: &str) -> String {
+pub(super) fn route_state_key(destination: &str) -> String {
     if let Some((host, port)) = split_host_port_for_connect(destination) {
         let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
         if normalized_host.is_empty() {
@@ -773,7 +821,7 @@ fn route_state_key(destination: &str) -> String {
     destination.trim().to_ascii_lowercase()
 }
 
-fn route_capability_is_available(kind: RouteKind, family: RouteIpFamily, now: u64) -> bool {
+pub(super) fn route_capability_is_available(kind: RouteKind, family: RouteIpFamily, now: u64) -> bool {
     let map = ROUTE_CAPABILITIES.get_or_init(|| std::sync::RwLock::new(RouteCapabilities::default()));
     let Ok(guard) = map.read() else {
         return true;

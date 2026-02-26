@@ -1,3 +1,5 @@
+use super::*;
+
 pub async fn connect_route_candidate(
     conn_id: u64,
     target: &TargetEndpoint,
@@ -157,7 +159,7 @@ pub async fn connect_via_best_route(
     Err(last_err.unwrap_or_else(|| EngineError::Internal("all route candidates failed".to_owned())))
 }
 
-async fn resolve_client_label(peer: SocketAddr, listen_addr: SocketAddr) -> String {
+pub(super) async fn resolve_client_label(peer: SocketAddr, listen_addr: SocketAddr) -> String {
     format!("client-{}-{}", peer, listen_addr)
 }
 
@@ -171,7 +173,7 @@ pub async fn handle_client(
     relay_opts: RelayOptions,
 ) -> Result<()> {
     let client = resolve_client_label(peer, listen_addr).await;
-    info!(target: "socks5", conn_id, client = %client, peer = %peer, "SOCKS5 client accepted");
+    debug!(target: "socks5", conn_id, client = %client, peer = %peer, "SOCKS5 client accepted");
     let _ = tcp.set_nodelay(true);
 
     let mut hdr = [0u8; 2];
@@ -242,7 +244,7 @@ pub async fn handle_client(
     }
 }
 
-async fn silent_or_err(tcp: &mut TcpStream, silent: bool, msg: &str) -> Result<()> {
+pub(super) async fn silent_or_err(tcp: &mut TcpStream, silent: bool, msg: &str) -> Result<()> {
     if !silent {
         let _ = tcp.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
     }

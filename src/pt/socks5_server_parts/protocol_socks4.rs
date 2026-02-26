@@ -1,5 +1,7 @@
+use super::*;
+
 #[allow(clippy::too_many_arguments)]
-async fn handle_socks4(
+pub(super) async fn handle_socks4(
     conn_id: u64,
     mut tcp: TcpStream,
     peer: SocketAddr,

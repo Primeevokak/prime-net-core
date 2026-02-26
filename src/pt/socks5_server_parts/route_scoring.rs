@@ -1,4 +1,6 @@
-fn route_health_score(route_key: &str, candidate: &RouteCandidate, now: u64) -> i64 {
+use super::*;
+
+pub(super) fn route_health_score(route_key: &str, candidate: &RouteCandidate, now: u64) -> i64 {
     let route_id = candidate.route_id();
     let mut bonus = 0i64;
     
@@ -52,7 +54,7 @@ fn route_health_score(route_key: &str, candidate: &RouteCandidate, now: u64) -> 
     local_score + global_bypass_profile_score(candidate, now) + bonus
 }
 
-fn global_bypass_profile_score(candidate: &RouteCandidate, now: u64) -> i64 {
+pub(super) fn global_bypass_profile_score(candidate: &RouteCandidate, now: u64) -> i64 {
     let route_id = candidate.route_id();
     if !route_id.starts_with("bypass:") {
         return 0;
@@ -82,7 +84,7 @@ fn global_bypass_profile_score(candidate: &RouteCandidate, now: u64) -> i64 {
     0
 }
 
-fn bypass_profile_score_from_health(health: &BypassProfileHealth, now: u64) -> i64 {
+pub(super) fn bypass_profile_score_from_health(health: &BypassProfileHealth, now: u64) -> i64 {
     let mut score = (health.successes as i64 * 5) - (health.failures as i64 * 6);
     score -= health.connect_failures as i64 * 8;
     score -= health.soft_zero_replies as i64 * 30;
@@ -96,7 +98,7 @@ fn bypass_profile_score_from_health(health: &BypassProfileHealth, now: u64) -> i
     score
 }
 
-fn should_reset_bypass_profile_health(health: &BypassProfileHealth, now: u64) -> bool {
+pub(super) fn should_reset_bypass_profile_health(health: &BypassProfileHealth, now: u64) -> bool {
     if health.successes == 0
         && (health.failures > 20 || health.connect_failures > 10)
         && now.saturating_sub(health.last_failure_unix) > 600
@@ -111,14 +113,14 @@ fn should_reset_bypass_profile_health(health: &BypassProfileHealth, now: u64) ->
     false
 }
 
-fn route_is_temporarily_weak(route_key: &str, route_id: &str, now: u64) -> bool {
+pub(super) fn route_is_temporarily_weak(route_key: &str, route_id: &str, now: u64) -> bool {
     let map = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
     map.get(route_key)
         .and_then(|m| m.get(route_id).map(|h| h.weak_until_unix > now))
         .unwrap_or(false)
 }
 
-fn route_winner_for_key(route_key: &str) -> Option<RouteWinner> {
+pub(super) fn route_winner_for_key(route_key: &str) -> Option<RouteWinner> {
     let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
     if let Some(winner) = map.get(route_key) {
         return Some(winner.clone());
@@ -128,10 +130,15 @@ fn route_winner_for_key(route_key: &str) -> Option<RouteWinner> {
             return Some(winner.clone());
         }
     }
+    if let Some(meta_key) = route_meta_service_key(route_key) {
+        if let Some(winner) = map.get(&meta_key) {
+            return Some(winner.clone());
+        }
+    }
     None
 }
 
-fn ordered_route_candidates(
+pub(super) fn ordered_route_candidates(
     route_key: &str,
     candidates: Vec<RouteCandidate>,
 ) -> Vec<RouteCandidate> {
@@ -146,6 +153,17 @@ fn ordered_route_candidates(
             if c.kind == RouteKind::Bypass {
                 let score = global_bypass_profile_score(c, now);
                 if score > GLOBAL_BYPASS_HARD_WEAK_SCORE {
+                    return true;
+                }
+
+                // Keep the currently cached winner in the candidate set even when its
+                // global profile score temporarily dips. Otherwise a transient global
+                // downgrade can force a direct-only decision for this destination.
+                if winner
+                    .as_ref()
+                    .map(|w| w.route_id == c.route_id())
+                    .unwrap_or(false)
+                {
                     return true;
                 }
                 
@@ -202,7 +220,7 @@ fn ordered_route_candidates(
     filtered
 }
 
-fn route_race_decision(
+pub(super) fn route_race_decision(
     port: u16,
     route_key: &str,
     candidates: &[RouteCandidate],
@@ -246,9 +264,11 @@ fn route_race_decision(
     (false, RouteRaceReason::WinnerHealthy)
 }
 
-fn record_route_success(route_key: &str, candidate: &RouteCandidate) {
+pub(super) fn record_route_success(route_key: &str, candidate: &RouteCandidate) {
     let now = now_unix_secs();
     let route_id = candidate.route_id();
+    let service_key = route_service_key(route_key);
+    let meta_key = route_meta_service_key(route_key);
     
     let health_map = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
     let per_route = health_map.entry(route_key.to_owned()).or_default();
@@ -261,29 +281,21 @@ fn record_route_success(route_key: &str, candidate: &RouteCandidate) {
     drop(per_route);
 
     let winner_map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
-    // Do not pin adaptive bypass winners when multiple bypass backends exist.
-    // Keeping winner sticky in this case overloads bypass:1 and defeats pool balancing.
-    let pin_winner = !(candidate.kind == RouteKind::Bypass
-        && candidate.source == "adaptive-race"
-        && candidate.bypass_profile_total > 1);
-
-    if pin_winner {
-        let winner = RouteWinner {
-            route_id: route_id.clone(),
-            updated_at_unix: now,
-        };
-        winner_map.insert(route_key.to_owned(), winner.clone());
-        if let Some(service_key) = route_service_key(route_key) {
-            if service_key != route_key {
-                winner_map.insert(service_key, winner);
-            }
+    let winner = RouteWinner {
+        route_id: route_id.clone(),
+        updated_at_unix: now,
+    };
+    winner_map.insert(route_key.to_owned(), winner.clone());
+    if let Some(service_key) = service_key.as_ref() {
+        if service_key != route_key {
+            winner_map.insert(service_key.clone(), winner.clone());
         }
-    } else {
-        winner_map.remove(route_key);
-        if let Some(service_key) = route_service_key(route_key) {
-            if service_key != route_key {
-                winner_map.remove(&service_key);
-            }
+    }
+    if let Some(meta_key) = meta_key.as_ref() {
+        if meta_key != route_key
+            && service_key.as_ref().map(|s| s != meta_key).unwrap_or(true)
+        {
+            winner_map.insert(meta_key.clone(), winner);
         }
     }
 
@@ -291,7 +303,7 @@ fn record_route_success(route_key: &str, candidate: &RouteCandidate) {
         record_global_bypass_profile_success(candidate, now);
     }
     mark_route_capability_healthy(candidate.kind, candidate.family);
-    info!(
+    debug!(
         target: "socks5.route",
         route_key = %route_key,
         route = %route_id,
@@ -300,9 +312,11 @@ fn record_route_success(route_key: &str, candidate: &RouteCandidate) {
     maybe_flush_classifier_store(false);
 }
 
-fn record_route_failure(route_key: &str, candidate: &RouteCandidate, reason: &'static str) {
+pub(super) fn record_route_failure(route_key: &str, candidate: &RouteCandidate, reason: &'static str) {
     let now = now_unix_secs();
     let route_id = candidate.route_id();
+    let service_key = route_service_key(route_key);
+    let meta_key = route_meta_service_key(route_key);
     
     let health_map = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
     let per_route = health_map.entry(route_key.to_owned()).or_default();
@@ -324,9 +338,9 @@ fn record_route_failure(route_key: &str, candidate: &RouteCandidate, reason: &'s
     }
     drop(entry);
 
-    if let Some(service_key) = route_service_key(route_key) {
+    if let Some(service_key) = service_key.as_ref() {
         if service_key != route_key {
-            let per_route_service = health_map.entry(service_key).or_default();
+            let per_route_service = health_map.entry(service_key.clone()).or_default();
             let mut entry_service = per_route_service.entry(route_id.clone()).or_default();
             entry_service.failures = entry_service.failures.saturating_add(1);
             entry_service.consecutive_failures =
@@ -334,11 +348,41 @@ fn record_route_failure(route_key: &str, candidate: &RouteCandidate, reason: &'s
             entry_service.last_failure_unix = now;
         }
     }
+    if let Some(meta_key) = meta_key.as_ref() {
+        if meta_key != route_key
+            && service_key.as_ref().map(|s| s != meta_key).unwrap_or(true)
+        {
+            let per_route_meta = health_map.entry(meta_key.clone()).or_default();
+            let mut entry_meta = per_route_meta.entry(route_id.clone()).or_default();
+            entry_meta.failures = entry_meta.failures.saturating_add(1);
+            entry_meta.consecutive_failures =
+                entry_meta.consecutive_failures.saturating_add(1).min(32);
+            entry_meta.last_failure_unix = now;
+        }
+    }
     drop(per_route);
 
     let winner_map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
     if winner_map.get(route_key).map(|w| w.route_id == route_id).unwrap_or(false) {
         winner_map.remove(route_key);
+    }
+    if let Some(service_key) = service_key.as_ref() {
+        if winner_map
+            .get(service_key)
+            .map(|w| w.route_id == route_id)
+            .unwrap_or(false)
+        {
+            winner_map.remove(service_key);
+        }
+    }
+    if let Some(meta_key) = meta_key.as_ref() {
+        if winner_map
+            .get(meta_key)
+            .map(|w| w.route_id == route_id)
+            .unwrap_or(false)
+        {
+            winner_map.remove(meta_key);
+        }
     }
 
     if matches!(candidate.kind, RouteKind::Bypass) {
@@ -363,7 +407,7 @@ fn record_route_failure(route_key: &str, candidate: &RouteCandidate, reason: &'s
     maybe_flush_classifier_store(false);
 }
 
-fn record_global_bypass_profile_success(candidate: &RouteCandidate, now: u64) {
+pub(super) fn record_global_bypass_profile_success(candidate: &RouteCandidate, now: u64) {
     let route_id = candidate.route_id();
     if !route_id.starts_with("bypass:") {
         return;
@@ -379,7 +423,7 @@ fn record_global_bypass_profile_success(candidate: &RouteCandidate, now: u64) {
     entry.io_errors = entry.io_errors.saturating_sub(1);
 }
 
-fn record_global_bypass_profile_failure(candidate: &RouteCandidate, reason: &'static str, now: u64) {
+pub(super) fn record_global_bypass_profile_failure(candidate: &RouteCandidate, reason: &'static str, now: u64) {
     let route_id = candidate.route_id();
     if !route_id.starts_with("bypass:") {
         return;
@@ -400,21 +444,24 @@ fn record_global_bypass_profile_failure(candidate: &RouteCandidate, reason: &'st
     }
 }
 
-fn select_route_candidates(
+pub(super) fn select_route_candidates(
     relay_opts: &RelayOptions,
     target: &TargetAddr,
     port: u16,
     destination: &str,
 ) -> Vec<RouteCandidate> {
-    let dest_lower = destination.to_ascii_lowercase();
-    let is_noise = dest_lower.contains("localhost") || 
-                   dest_lower.contains("adguard.org") || 
-                   dest_lower.contains("kaspersky") || 
-                   dest_lower.contains("mullvad.net") ||
-                   dest_lower.contains(".local") ||
-                   dest_lower.contains(".lan") ||
-                   dest_lower.contains("msftconnecttest") ||
-                   dest_lower.contains("msftncsi");
+    let destination_key = route_destination_key(destination);
+    let host_lower = split_host_port_for_connect(destination_key)
+        .map(|(host, _)| host.trim().trim_end_matches('.').to_ascii_lowercase())
+        .unwrap_or_else(|| destination_key.to_ascii_lowercase());
+    let is_noise = host_lower == "localhost"
+        || host_lower.ends_with(".local")
+        || host_lower.ends_with(".lan")
+        || host_lower.contains("msftconnecttest")
+        || host_lower.contains("msftncsi")
+        || host_lower.contains("kaspersky")
+        || host_lower.contains("mullvad.net")
+        || host_lower.contains("adguard.org");
 
     if is_noise {
         return vec![RouteCandidate::direct_with_family("noise-bypass", RouteIpFamily::Any)];
@@ -443,7 +490,7 @@ fn select_route_candidates(
     });
 
     if source != "none" {
-        for (addr, idx, total) in select_bypass_candidates(relay_opts, destination) {
+        for (addr, idx, total) in select_bypass_candidates(relay_opts, destination_key) {
             out.push(RouteCandidate::bypass_with_family(
                 source, addr, idx, total, family,
             ));
@@ -452,7 +499,7 @@ fn select_route_candidates(
     out
 }
 
-fn host_service_bucket(host: &str) -> String {
+pub(super) fn host_service_bucket(host: &str) -> String {
     let host = host.to_ascii_lowercase();
     if host.contains("discord") || host.contains("discordapp") || host.contains("discord.gg") || host.contains("discord.media") || host.contains("discord-attachments") {
         return "meta-group:discord".to_owned();
@@ -480,7 +527,7 @@ fn host_service_bucket(host: &str) -> String {
     sld.to_owned()
 }
 
-fn destination_bypass_profile_idx_known(destination: &str, total: u8) -> Option<u8> {
+pub(super) fn destination_bypass_profile_idx_known(destination: &str, total: u8) -> Option<u8> {
     if total <= 1 {
         return Some(0);
     }
@@ -497,23 +544,38 @@ fn destination_bypass_profile_idx_known(destination: &str, total: u8) -> Option<
             return Some(normalized);
         }
     }
+    if let Some(meta_key) = bypass_profile_meta_service_key(destination) {
+        if meta_key != key && meta_key != legacy_key {
+            if let Some(v) = map.get(&meta_key) {
+                let normalized = (*v).min(total.saturating_sub(1));
+                map.insert(key, normalized);
+                return Some(normalized);
+            }
+        }
+    }
     None
 }
 
 #[cfg(test)]
-fn destination_bypass_profile_idx(destination: &str, total: u8) -> u8 {
+pub(super) fn destination_bypass_profile_idx(destination: &str, total: u8) -> u8 {
     destination_bypass_profile_idx_known(destination, total).unwrap_or(0)
 }
 
-fn record_bypass_profile_failure(destination: &str, current_idx: u8, total: u8, reason: &'static str) {
+pub(super) fn record_bypass_profile_failure(destination: &str, current_idx: u8, total: u8, reason: &'static str) {
     if total == 0 { return; }
     let key = bypass_profile_key(destination);
     let service_key = bypass_profile_legacy_service_key(destination);
+    let meta_key = bypass_profile_meta_service_key(destination);
     let next_idx = if total > 1 { (current_idx + 1) % total } else { 0 };
     let idx_map = DEST_BYPASS_PROFILE_IDX.get_or_init(DashMap::new);
     idx_map.insert(key.clone(), next_idx);
     if service_key != key {
         idx_map.insert(service_key.clone(), next_idx);
+    }
+    if let Some(meta_key) = meta_key.as_ref() {
+        if meta_key != &key && meta_key != &service_key {
+            idx_map.insert(meta_key.clone(), next_idx);
+        }
     }
     let fail_map = DEST_BYPASS_PROFILE_FAILURES.get_or_init(DashMap::new);
     let mut entry = fail_map.entry(key.clone()).or_insert(0);
@@ -524,11 +586,17 @@ fn record_bypass_profile_failure(destination: &str, current_idx: u8, total: u8, 
         let mut s_entry = fail_map.entry(service_key).or_insert(0);
         *s_entry = s_entry.saturating_add(1);
     }
+    if let Some(meta_key) = meta_key {
+        if meta_key != key && meta_key != bypass_profile_legacy_service_key(destination) {
+            let mut m_entry = fail_map.entry(meta_key).or_insert(0);
+            *m_entry = m_entry.saturating_add(1);
+        }
+    }
     info!(target: "socks5.bypass", destination, profile_key = %key, reason, next_profile = next_idx + 1, failures, "bypass profile rotated");
     maybe_flush_classifier_store(false);
 }
 
-fn should_bypass_by_classifier_host(host: &str, port: u16) -> bool {
+pub(super) fn should_bypass_by_classifier_host(host: &str, port: u16) -> bool {
     if port != 443 { return false; }
     let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
     if host == "localhost" || host.ends_with(".local") || host.contains("adguard.org") { return false; }
@@ -537,14 +605,14 @@ fn should_bypass_by_classifier_host(host: &str, port: u16) -> bool {
     map.get(&key).map(|r| *r).unwrap_or(0) >= LEARNED_BYPASS_MIN_FAILURES_DOMAIN
 }
 
-fn should_bypass_by_classifier_ip(ip: std::net::IpAddr, port: u16) -> bool {
+pub(super) fn should_bypass_by_classifier_ip(ip: std::net::IpAddr, port: u16) -> bool {
     if port != 443 || !is_bypassable_public_ip(ip) { return false; }
     let key = format!("{ip}:{port}");
     let map = DEST_FAILURES.get_or_init(DashMap::new);
     map.get(&key).map(|r| *r).unwrap_or(0) >= LEARNED_BYPASS_MIN_FAILURES_IP
 }
 
-fn is_bypassable_public_ip(ip: std::net::IpAddr) -> bool {
+pub(super) fn is_bypassable_public_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             !v4.is_private()
@@ -563,7 +631,7 @@ fn is_bypassable_public_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-fn bypass_profile_health_key(route_id: &str, family: RouteIpFamily) -> String {
+pub(super) fn bypass_profile_health_key(route_id: &str, family: RouteIpFamily) -> String {
     if family == RouteIpFamily::Any {
         route_id.to_owned()
     } else {
@@ -571,11 +639,12 @@ fn bypass_profile_health_key(route_id: &str, family: RouteIpFamily) -> String {
     }
 }
 
-fn bypass_profile_key(destination: &str) -> String {
-    route_state_key(destination)
+pub(super) fn bypass_profile_key(destination: &str) -> String {
+    route_state_key(route_destination_key(destination))
 }
 
-fn bypass_profile_legacy_service_key(destination: &str) -> String {
+pub(super) fn bypass_profile_legacy_service_key(destination: &str) -> String {
+    let destination = route_destination_key(destination);
     if let Some((host, port)) = split_host_port_for_connect(destination) {
         let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
         if !normalized_host.is_empty() {
@@ -589,7 +658,21 @@ fn bypass_profile_legacy_service_key(destination: &str) -> String {
     destination.trim().to_ascii_lowercase()
 }
 
-fn bypass_profile_health_is_empty(health: &BypassProfileHealth) -> bool {
+pub(super) fn bypass_profile_meta_service_key(destination: &str) -> Option<String> {
+    let destination = route_destination_key(destination);
+    let (host, port) = split_host_port_for_connect(destination)?;
+    let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if normalized_host.is_empty() || parse_ip_literal(&normalized_host).is_some() {
+        return None;
+    }
+    let bucket = host_service_bucket(&normalized_host);
+    if !bucket.starts_with("meta-group:") {
+        return None;
+    }
+    Some(format!("{bucket}:{port}"))
+}
+
+pub(super) fn bypass_profile_health_is_empty(health: &BypassProfileHealth) -> bool {
     health.successes == 0
         && health.failures == 0
         && health.connect_failures == 0
@@ -599,11 +682,11 @@ fn bypass_profile_health_is_empty(health: &BypassProfileHealth) -> bool {
         && health.last_failure_unix == 0
 }
 
-fn bypass_profile_health_last_seen_unix(health: &BypassProfileHealth) -> u64 {
+pub(super) fn bypass_profile_health_last_seen_unix(health: &BypassProfileHealth) -> u64 {
     health.last_success_unix.max(health.last_failure_unix)
 }
 
-fn learned_bypass_threshold(destination: &str) -> Option<u8> {
+pub(super) fn learned_bypass_threshold(destination: &str) -> Option<u8> {
     let (host, port) = split_host_port_for_connect(destination)?;
     if port != 443 { return None; }
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
@@ -615,7 +698,7 @@ fn learned_bypass_threshold(destination: &str) -> Option<u8> {
     Some(LEARNED_BYPASS_MIN_FAILURES_DOMAIN)
 }
 
-fn select_bypass_source(
+pub(super) fn select_bypass_source(
     relay_opts: &RelayOptions,
     target: &TargetAddr,
     port: u16,
@@ -664,7 +747,7 @@ fn select_bypass_source(
     }
 }
 
-fn select_bypass_candidates(
+pub(super) fn select_bypass_candidates(
     relay_opts: &RelayOptions,
     destination: &str,
 ) -> Vec<(SocketAddr, u8, u8)> {
@@ -686,7 +769,7 @@ fn select_bypass_candidates(
         .unwrap_or_default()
 }
 
-fn mark_route_capability_weak(
+pub(super) fn mark_route_capability_weak(
     kind: RouteKind,
     family: RouteIpFamily,
     reason: &'static str,
@@ -716,7 +799,7 @@ fn mark_route_capability_weak(
     );
 }
 
-fn mark_route_capability_healthy(kind: RouteKind, family: RouteIpFamily) {
+pub(super) fn mark_route_capability_healthy(kind: RouteKind, family: RouteIpFamily) {
     if family == RouteIpFamily::Any {
         return;
     }
@@ -728,7 +811,7 @@ fn mark_route_capability_healthy(kind: RouteKind, family: RouteIpFamily) {
     }
 }
 
-fn record_route_race_decision(race: bool, reason: RouteRaceReason) {
+pub(super) fn record_route_race_decision(race: bool, reason: RouteRaceReason) {
     if let Ok(mut m) = ROUTE_METRICS.get_or_init(|| RwLock::new(RouteMetrics::default())).write() {
         if race {
             m.race_started = m.race_started.saturating_add(1);
@@ -748,7 +831,7 @@ fn record_route_race_decision(race: bool, reason: RouteRaceReason) {
     }
 }
 
-fn record_route_selected(candidate: &RouteCandidate, raced: bool) {
+pub(super) fn record_route_selected(candidate: &RouteCandidate, raced: bool) {
     if let Ok(mut m) = ROUTE_METRICS.get_or_init(|| RwLock::new(RouteMetrics::default())).write() {
         match candidate.kind {
             RouteKind::Direct => {
@@ -763,7 +846,7 @@ fn record_route_selected(candidate: &RouteCandidate, raced: bool) {
     }
 }
 
-fn should_enable_universal_bypass_domain(host: &str) -> bool {
+pub(super) fn should_enable_universal_bypass_domain(host: &str) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let enabled = *ENABLED.get_or_init(|| {
         std::env::var("PRIME_PACKET_BYPASS_UNIVERSAL_DOMAINS")
