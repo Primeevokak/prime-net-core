@@ -48,6 +48,7 @@ where
             level: *event.metadata().level(),
             message,
             target: event.metadata().target().to_owned(),
+            count: 1,
         };
         if let Err(err) = self.tx.send(entry) {
             self.log_viewer.add_log(err.0);

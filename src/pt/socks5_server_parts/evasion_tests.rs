@@ -2,6 +2,7 @@
 mod evasion_integration_tests {
     use super::*;
     use rand::Rng;
+    use crate::evasion::fragmenting_io::find_sni_info;
 
     #[test]
     fn test_is_tls_client_hello_detection() {

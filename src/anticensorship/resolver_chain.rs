@@ -386,6 +386,10 @@ impl ResolverChain {
                 provider_bootstrap_ips.extend(["9.9.9.9".parse::<IpAddr>().unwrap(), "149.112.112.112".parse::<IpAddr>().unwrap()]);
             } else if host == "dns.adguard.com" && provider_bootstrap_ips.is_empty() {
                 provider_bootstrap_ips.extend(["94.140.14.14".parse::<IpAddr>().unwrap(), "94.140.15.15".parse::<IpAddr>().unwrap()]);
+            } else if host == "doh.mullvad.net" && provider_bootstrap_ips.is_empty() {
+                provider_bootstrap_ips.extend(["194.242.2.2".parse::<IpAddr>().unwrap()]);
+            } else if host == "doh.opendns.com" && provider_bootstrap_ips.is_empty() {
+                provider_bootstrap_ips.extend(["208.67.222.222".parse::<IpAddr>().unwrap(), "208.67.220.220".parse::<IpAddr>().unwrap()]);
             }
 
             if !provider_bootstrap_ips.is_empty() {

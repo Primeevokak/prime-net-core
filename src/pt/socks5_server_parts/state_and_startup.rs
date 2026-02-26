@@ -392,11 +392,21 @@ async fn connect_bypass_upstream(
         let pool_addr = bypass_addr;
         tokio::spawn(async move {
             let pool_map = BYPASS_POOL.get_or_init(DashMap::new);
-            let current_len = pool_map.get(&pool_addr).map(|l| l.len()).unwrap_or(0);
-            if current_len < 4 {
-                if let Ok(Ok(s)) = tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(pool_addr)).await {
+            let needs_warmup = pool_map.get(&pool_addr).map(|l| l.len() < 4).unwrap_or(true);
+            
+            if needs_warmup {
+                // Pre-warm a connection: connect and do the initial SOCKS5 handshake
+                if let Ok(Ok(mut s)) = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(pool_addr)).await {
                     let _ = s.set_nodelay(true);
-                    pool_map.entry(pool_addr).or_default().push(s);
+                    // Perform initial handshake (HELLO + NO AUTH)
+                    if s.write_all(&[0x05, 0x01, 0x00]).await.is_ok() {
+                        let mut method = [0u8; 2];
+                        if tokio::time::timeout(Duration::from_millis(500), s.read_exact(&mut method)).await.is_ok() {
+                            if method[0] == 0x05 && method[1] == 0x00 {
+                                pool_map.entry(pool_addr).or_default().push(s);
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -414,7 +424,25 @@ async fn connect_bypass_upstream(
             }
         }
         match connected {
-            Some(s) => s,
+            Some(s) => {
+                let mut s = s;
+                let _ = s.set_nodelay(true);
+                // Since this is a fresh connection, we must do the HELLO handshake here
+                if let Err(e) = s.write_all(&[0x05, 0x01, 0x00]).await {
+                    record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "handshake-io");
+                    return Err(e.into());
+                }
+                let mut method = [0u8; 2];
+                if let Err(e) = s.read_exact(&mut method).await {
+                    record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "handshake-io");
+                    return Err(e.into());
+                }
+                if method[0] != 0x05 || method[1] != 0x00 {
+                    record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "auth-rejected");
+                    return Err(EngineError::Internal(format!("bypass socks5 auth rejected: {:02x} {:02x}", method[0], method[1])));
+                }
+                s
+            },
             None => {
                 let e = last_e.unwrap_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::TimedOut, "bypass connect timeout")
@@ -425,8 +453,6 @@ async fn connect_bypass_upstream(
             }
         }
     };
-
-    let _ = bypass.set_nodelay(true);
 
     let resolved_target_addr = if let TargetAddr::Domain(host) = &target.addr {
         if let Some(r) = &resolver {
@@ -450,20 +476,6 @@ async fn connect_bypass_upstream(
     };
 
     let addr_to_send = resolved_target_addr.as_ref().unwrap_or(&target.addr);
-
-    if let Err(e) = bypass.write_all(&[0x05, 0x01, 0x00]).await {
-        record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "handshake-io");
-        return Err(e.into());
-    }
-    let mut method = [0u8; 2];
-    if let Err(e) = bypass.read_exact(&mut method).await {
-        record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "handshake-io");
-        return Err(e.into());
-    }
-    if method[0] != 0x05 || method[1] != 0x00 {
-        record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "auth-rejected");
-        return Err(EngineError::Internal(format!("bypass socks5 auth rejected: {:02x} {:02x}", method[0], method[1])));
-    }
 
     let mut req: Vec<u8> = vec![0x05, 0x01, 0x00];
     match addr_to_send {

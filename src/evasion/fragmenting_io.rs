@@ -188,7 +188,15 @@ impl<T> FragmentingIo<T> {
 
         if self.cfg.randomize_fragment_size {
             let min = self.cfg.fragment_size_min.max(1);
-            let max = self.cfg.fragment_size_max.min(buf_len.max(1)).max(min);
+            let mut max = self.cfg.fragment_size_max.max(min);
+            
+            // Limit by current buffer size to avoid out-of-bounds
+            let limit = buf_len.max(1);
+            if min >= limit {
+                return limit;
+            }
+            
+            max = max.min(limit);
             if min >= max {
                 return min;
             }
@@ -198,7 +206,7 @@ impl<T> FragmentingIo<T> {
     }
 }
 
-fn find_sni_info(client_hello: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn find_sni_info(client_hello: &[u8]) -> Option<(usize, usize)> {
     let b = client_hello;
     if b.len() < 5 {
         return None;
@@ -300,6 +308,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for FragmentingIo<T> {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         if !self.enabled() {
+            self.sleep = None; // Reset any pending sleep if disabled mid-operation
             return Pin::new(&mut self.inner).poll_write(cx, buf);
         }
 
@@ -330,7 +339,10 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for FragmentingIo<T> {
                         }
                     }
 
-                    self.first_write = false;
+                    // Only advance from first_write if we actually wrote something
+                    if self.first_write && self.cfg.first_write_plan.is_none() {
+                        self.first_write = false;
+                    }
 
                     let sleep_ms = self.next_sleep_ms();
                     if sleep_ms > 0 && self.enabled() {

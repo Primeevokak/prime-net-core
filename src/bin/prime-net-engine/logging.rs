@@ -199,13 +199,14 @@ impl RotatingWriter {
     fn write_line(&mut self, line: &str) -> io::Result<()> {
         self.rotate_if_needed()?;
 
-        // Always log to stderr (operational default). File logging is optional.
+        // Operational default: log to stderr
         let mut stderr = io::stderr();
         let _ = writeln!(stderr, "{line}");
 
         if let Some(f) = &mut self.file {
-            writeln!(f, "{line}")?;
-            f.flush()?;
+            let _ = writeln!(f, "{line}");
+            // Removed redundant flush on every line for performance.
+            // OS will flush periodically or we flush on rotation.
         }
         Ok(())
     }

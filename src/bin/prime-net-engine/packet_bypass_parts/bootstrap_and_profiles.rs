@@ -1,21 +1,19 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration};
 use std::fs;
+use std::sync::{Mutex, OnceLock};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use prime_net_engine_core::error::{EngineError, Result};
-use prime_net_engine_core::version::APP_VERSION;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, OnceCell};
 use tracing::{info, warn};
 
-static RELEASE_CACHE: OnceCell<Mutex<HashMap<String, Option<String>>>> = OnceCell::const_new();
-static RELEASE_ASSET_SHA256_CACHE: OnceCell<Mutex<HashMap<String, Option<String>>>> =
-    OnceCell::const_new();
+static RELEASE_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+static RELEASE_ASSET_SHA256_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
 
 #[derive(Debug)]
 pub struct PacketBypassGuard {
@@ -96,17 +94,53 @@ pub async fn maybe_start_packet_bypass(
     }))
 }
 
+pub fn candidate_binary_names() -> Vec<String> {
+    if cfg!(windows) { vec!["ciadpi.exe".into()] } else { vec!["ciadpi".into()] }
+}
+
+pub async fn build_mirror_urls(_name: &str) -> Vec<String> {
+    let repo = "hufrea/byedpi";
+    let tag = match get_latest_release_tag(repo).await {
+        Ok(Some(t)) => t,
+        _ => "v0.17.3".to_owned(),
+    };
+    let asset_name = if cfg!(windows) {
+        format!("byedpi-{}-x86_64-w64.zip", tag.trim_start_matches('v').replace('.', ""))
+    } else {
+        format!("byedpi-{}-x86_64-linux.zip", tag.trim_start_matches('v').replace('.', ""))
+    };
+    let asset_name = asset_name.replace("173", "17.3"); 
+    vec![format!("https://github.com/{repo}/releases/download/{tag}/{asset_name}")]
+}
+
+async fn get_latest_release_tag(repo: &str) -> Result<Option<String>> {
+    {
+        let cache = RELEASE_CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+        if let Some(tag) = cache.get(repo) { return Ok(tag.clone()); }
+    }
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let client = reqwest::Client::builder().user_agent("prime-net-engine").build().map_err(|e| EngineError::Config(e.to_string()))?;
+    let resp = client.get(url).send().await.map_err(|e| EngineError::Config(e.to_string()))?;
+    if !resp.status().is_success() { return Ok(None); }
+    let json: Value = resp.json().await.map_err(|e| EngineError::Config(e.to_string()))?;
+    let tag = json["tag_name"].as_str().map(|s| s.to_owned());
+    let mut cache = RELEASE_CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    cache.insert(repo.to_owned(), tag.clone());
+    Ok(tag)
+}
+
+pub fn release_asset_sha256_hex(url: &str) -> Option<String> {
+    let cache = RELEASE_ASSET_SHA256_CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    cache.get(url).cloned().flatten()
+}
+
 fn parse_port_arg(args: &[String]) -> Option<u16> {
     let mut idx = 0usize;
     while idx < args.len() {
         if args[idx] == "--port" {
-            if let Some(v) = args.get(idx + 1) {
-                return v.parse::<u16>().ok();
-            }
+            if let Some(v) = args.get(idx + 1) { return v.parse::<u16>().ok(); }
         }
-        if let Some(v) = args[idx].strip_prefix("--port=") {
-            return v.parse::<u16>().ok();
-        }
+        if let Some(v) = args[idx].strip_prefix("--port=") { return v.parse::<u16>().ok(); }
         idx += 1;
     }
     None
@@ -132,10 +166,7 @@ fn resolve_packet_profiles() -> Vec<PacketBypassProfile> {
 }
 
 fn find_free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .map(|a| a.port())
-        .unwrap_or(10801)
+    std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map(|a| a.port()).unwrap_or(10801)
 }
 
 fn set_port_arg(args: &mut Vec<String>, port: u16) {
@@ -145,96 +176,59 @@ fn set_port_arg(args: &mut Vec<String>, port: u16) {
             if i + 1 < args.len() { args[i + 1] = port_str.clone(); }
             return;
         }
-        if args[i].starts_with("--port=") {
-            args[i] = format!("--port={port_str}");
-            return;
-        }
+        if args[i].starts_with("--port=") { args[i] = format!("--port={port_str}"); return; }
     }
-    args.push("--port".to_owned());
-    args.push(port_str);
+    args.push("--port".to_owned()); args.push(port_str);
 }
 
 fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
     #[cfg(target_os = "windows")]
     {
         let mut profiles = vec![
-            PacketBypassProfile {
-                name: "clean-split-1".to_owned(),
-                args: vec!["--split".into(), "1".into(), "--timeout".into(), "10".into()],
-            },
-            PacketBypassProfile {
-                name: "tlsrec-1s".to_owned(),
-                args: vec!["--tlsrec".into(), "1+s".into(), "--timeout".into(), "10".into()],
-            },
-            PacketBypassProfile {
-                name: "discord-optimized".to_owned(),
-                args: vec!["--split".into(), "1".into(), "--tlsrec".into(), "1+s".into(), "--timeout".into(), "10".into()],
-            },
+            PacketBypassProfile { name: "clean-split-1".to_owned(), args: vec!["--split".into(), "1".into(), "--timeout".into(), "10".into()] },
+            PacketBypassProfile { name: "discord-optimized".to_owned(), args: vec!["--split".into(), "2".into(), "--tlsrec".into(), "1+s".into(), "--timeout".into(), "10".into()] },
+            PacketBypassProfile { name: "tlsrec-1s".to_owned(), args: vec!["--tlsrec".into(), "1+s".into(), "--timeout".into(), "10".into()] },
         ];
-        for p in &mut profiles {
-            set_port_arg(&mut p.args, find_free_port());
-        }
+        for p in &mut profiles { set_port_arg(&mut p.args, find_free_port()); }
         profiles
     }
     #[cfg(not(target_os = "windows"))]
     { vec![] }
 }
 
-async fn start_packet_bypass_process(
-    bin: &Path,
-    profile: &PacketBypassProfile,
-) -> Result<(Child, Vec<tokio::task::JoinHandle<()>>, Option<u16>)> {
+async fn start_packet_bypass_process(bin: &Path, profile: &PacketBypassProfile) -> Result<(Child, Vec<tokio::task::JoinHandle<()>>, Option<u16>)> {
     let socks5_port = parse_port_arg(&profile.args);
     let mut cmd = Command::new(bin);
-    cmd.args(&profile.args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .stdin(std::process::Stdio::null());
-
+    cmd.args(&profile.args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).stdin(std::process::Stdio::null());
     let mut child = cmd.spawn().map_err(EngineError::Io)?;
     let mut log_tasks = Vec::new();
-    
     if let Some(stdout) = child.stdout.take() {
         let name = profile.name.clone();
         log_tasks.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                info!(target: "packet_bypass", profile = %name, "{line}");
-            }
+            while let Ok(Some(line)) = lines.next_line().await { info!(target: "packet_bypass", profile = %name, "{line}"); }
         }));
     }
     if let Some(stderr) = child.stderr.take() {
         let name = profile.name.clone();
         log_tasks.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                info!(target: "packet_bypass", profile = %name, "{line}");
-            }
+            while let Ok(Some(line)) = lines.next_line().await { info!(target: "packet_bypass", profile = %name, "{line}"); }
         }));
     }
-
     tokio::time::sleep(Duration::from_millis(1000)).await;
-    if let Some(status) = child.try_wait().map_err(EngineError::Io)? {
-        return Err(EngineError::Config(format!("profile {} exited with {}", profile.name, status)));
-    }
-
+    if let Some(status) = child.try_wait().map_err(EngineError::Io)? { return Err(EngineError::Config(format!("profile {} exited with {}", profile.name, status))); }
     Ok((child, log_tasks, socks5_port))
 }
 
 fn bootstrap_install_dir() -> Result<PathBuf> {
-    let p = if let Ok(v) = std::env::var("PRIME_PT_BOOTSTRAP_DIR") {
-        PathBuf::from(v)
-    } else {
-        std::env::current_exe()?.parent().unwrap().join("pt-tools")
-    };
-    let _ = fs::create_dir_all(&p);
-    Ok(p)
+    let p = if let Ok(v) = std::env::var("PRIME_PT_BOOTSTRAP_DIR") { PathBuf::from(v) } else { std::env::current_exe()?.parent().unwrap().join("pt-tools") };
+    let _ = fs::create_dir_all(&p); Ok(p)
 }
 
 async fn resolve_or_bootstrap_binary(install_dir: &Path) -> Result<PathBuf> {
     let name = if cfg!(windows) { "ciadpi.exe" } else { "ciadpi" };
     let p = install_dir.join(name);
     if p.exists() { return Ok(p); }
-    // Note: this depends on the function being available in the same binary
-    super::download_and_permissions::download_best_binary(install_dir).await
+    download_best_binary(install_dir).await
 }

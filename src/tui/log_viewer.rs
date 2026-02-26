@@ -34,6 +34,7 @@ pub struct LogEntry {
     pub level: Level,
     pub message: String,
     pub target: String,
+    pub count: usize,
 }
 
 impl LogEntry {
@@ -59,10 +60,21 @@ impl LogViewer {
     }
 
     pub fn add_log(&self, entry: LogEntry) {
-        let entry_size = entry.approx_size();
         let mut logs = self.logs.write();
         
-        let mut current_size = self.approx_size_bytes.load(Ordering::Relaxed);
+        // Collapse consecutive duplicates
+        if let Some(last) = logs.back_mut() {
+            if last.message == entry.message && last.level == entry.level && last.target == entry.target {
+                last.count = last.count.saturating_add(1);
+                last.timestamp = entry.timestamp;
+                self.cache_dirty.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
+
+        let entry_size = entry.approx_size();
+        let mut current_size = self.approx_size_bytes.load(Ordering::Acquire);
+        
         while current_size + entry_size > MAX_LOGS_SIZE_BYTES && !logs.is_empty() {
             if let Some(oldest) = logs.pop_front() {
                 current_size = current_size.saturating_sub(oldest.approx_size());
@@ -71,8 +83,8 @@ impl LogViewer {
         
         current_size += entry_size;
         logs.push_back(entry);
-        self.approx_size_bytes.store(current_size, Ordering::Relaxed);
-        self.cache_dirty.store(true, Ordering::Relaxed);
+        self.approx_size_bytes.store(current_size, Ordering::Release);
+        self.cache_dirty.store(true, Ordering::SeqCst);
     }
 
     pub fn clear(&self) {

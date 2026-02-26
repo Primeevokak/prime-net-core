@@ -34,7 +34,7 @@ fn extract_from_zip(zip_bytes: &[u8], target_filename: &str) -> Result<Vec<u8>> 
     )))
 }
 
-async fn download_best_binary(install_dir: &Path) -> Result<PathBuf> {
+pub async fn download_best_binary(install_dir: &Path) -> Result<PathBuf> {
     let candidates = candidate_binary_names();
     if candidates.is_empty() {
         return Err(EngineError::Config(
@@ -45,7 +45,7 @@ async fn download_best_binary(install_dir: &Path) -> Result<PathBuf> {
     let mut last_err = EngineError::Config("no mirrors tried".to_owned());
 
     for name in &candidates {
-        let urls = build_mirror_urls(name).await;
+        let urls: Vec<String> = build_mirror_urls(name).await;
         if urls.is_empty() {
             warn!(
                 target: "packet_bypass",
@@ -112,19 +112,10 @@ async fn download_best_binary(install_dir: &Path) -> Result<PathBuf> {
     )))
 }
 
-fn which_binary(name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var("PATH").ok()?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(name);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 #[cfg(unix)]
 fn make_executable(path: &Path) -> Result<()> {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     let mut perms = fs::metadata(path).map_err(EngineError::Io)?.permissions();
     perms.set_mode(0o755);
     fs::set_permissions(path, perms).map_err(EngineError::Io)?;
@@ -197,7 +188,7 @@ async fn verify_downloaded_payload_integrity(
                 "PRIME_PACKET_BYPASS_PAYLOAD_SHA256 must contain a 64-hex sha256 digest".to_owned(),
             )
         })?
-    } else if let Some(hex) = release_asset_sha256_hex(source_url).await {
+    } else if let Some(hex) = release_asset_sha256_hex(source_url) {
         let parsed = parse_sha256_hex(&hex).ok_or_else(|| {
             EngineError::Config(format!(
                 "cached release asset digest is invalid for '{source_url}'"
@@ -368,33 +359,4 @@ fn extract_sha256_from_text(s: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn ensure_dir_writable(path: &Path) -> Result<()> {
-    std::fs::create_dir_all(path)?;
-    let probe = path.join(".prime-write-test");
-    std::fs::write(&probe, b"ok").map_err(|e| {
-        if e.kind() == std::io::ErrorKind::PermissionDenied {
-            EngineError::Config(format!(
-                "permission denied for '{}'; administrator rights may be required",
-                path.display()
-            ))
-        } else {
-            EngineError::Io(e)
-        }
-    })?;
-    let _ = std::fs::remove_file(probe);
-    Ok(())
-}
-
-#[cfg(windows)]
-fn is_elevated() -> bool {
-    std::process::Command::new("net")
-        .args(["session"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }

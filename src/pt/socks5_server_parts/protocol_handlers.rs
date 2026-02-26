@@ -537,11 +537,13 @@ fn tune_relay_for_target(
     is_bypass: bool,
 ) -> TunedRelay {
     if is_bypass {
-        // In bypass mode (external tool like ciadpi), we should NOT force internal fragmentation.
-        // Doing so often breaks the connection because ciadpi already applies its own evasion.
-        // We use base options but explicitly disable our own fragmentation to avoid "double-evasion".
+        // In bypass mode (external tool like ciadpi), we MUST disable all internal evasion.
+        // Otherwise, double-evasion triggers antivirus/ISP resets.
         let mut opts = base.clone();
         opts.fragment_client_hello = false;
+        opts.tcp_window_trick = false;
+        opts.sni_spoofing = false;
+        opts.sni_case_toggle = false;
         
         return TunedRelay {
             options: opts,
@@ -591,10 +593,9 @@ fn tune_relay_for_target(
         base.tcp_window_trick = true;
         if failures == 0 {
             // Discord doesn't like Stage 4 fragmentation on some ISPs/AVs.
-            // Keep it at Stage 2 for Discord initially to be safe but effective.
-            // CRITICAL: For Discord, STICK to Stage 2. Do not escalate to 3 or 4.
-            if destination.contains("discord") || destination.contains("discordapp") || destination.contains("discord.gg") {
-                stage = 2; 
+            // Stick to Stage 2 for Discord.
+            if destination.contains("discord") {
+                stage = stage.max(2); 
             } else {
                 stage = stage.max(4);
             }
@@ -602,7 +603,7 @@ fn tune_relay_for_target(
     }
 
     if failures >= base.stage1_failures {
-        stage = stage.max(2); // Jump to Stage 2 immediately if Stage 1 failed
+        stage = stage.max(2); 
     }
     if failures >= base.stage2_failures {
         stage = stage.max(3);
@@ -627,19 +628,19 @@ fn tune_relay_for_target(
         },
         1 => RelayOptions {
             fragment_client_hello: true,
-            // Безопасная фрагментация: имитируем малый MTU, не трогая заголовок TLS слишком сильно
             fragment_size_min: 128,
             fragment_size_max: 256,
             fragment_sleep_ms: base.fragment_sleep_ms.min(1),
             fragment_budget_bytes: base.fragment_budget_bytes.clamp(4096, 8192),
-            client_hello_split_offsets: vec![], // Без разрезов SNI на первой стадии
+            client_hello_split_offsets: vec![],
             ..base
         },
         2 => RelayOptions {
             fragment_client_hello: true,
+            // For sensitive services, use MTU-safe fragments
             fragment_size_min: 64,
             fragment_size_max: 128,
-            fragment_sleep_ms: base.fragment_sleep_ms.max(5), // Increased sleep for stability
+            fragment_sleep_ms: base.fragment_sleep_ms.max(2),
             fragment_budget_bytes: base.fragment_budget_bytes.clamp(4096, 8192),
             client_hello_split_offsets: vec![16, 32],
             ..base
@@ -656,14 +657,9 @@ fn tune_relay_for_target(
         },
         _ => RelayOptions {
             fragment_client_hello: true,
-            #[cfg(windows)]
-            fragment_size_min: 64,
-            #[cfg(windows)]
+            // Avoid 1-byte fragments even on non-windows, use 16 as safe minimum
+            fragment_size_min: 16,
             fragment_size_max: 128,
-            #[cfg(not(windows))]
-            fragment_size_min: 1,
-            #[cfg(not(windows))]
-            fragment_size_max: 1,
             fragment_sleep_ms: base.fragment_sleep_ms.min(1), 
             fragment_budget_bytes: base.fragment_budget_bytes.clamp(4096, 8192),
             client_hello_split_offsets: vec![16, 32, 64],

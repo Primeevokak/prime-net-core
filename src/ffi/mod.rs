@@ -279,6 +279,8 @@ pub unsafe extern "C" fn prime_engine_fetch_async(
                 set_last_error(EngineError::Internal(
                     "engine did not acknowledge async request (abort handle missing)".to_owned(),
                 ));
+                // We don't have the handle yet, but the task is likely already running.
+                // This is a rare edge case, but we should log it.
                 return ptr::null_mut();
             }
         };
@@ -296,9 +298,6 @@ pub unsafe extern "C" fn prime_engine_fetch_async(
 /// # Safety
 /// `handle` must be a valid pointer returned by `prime_engine_fetch_async` and not previously
 /// freed via `prime_request_free`.
-///
-/// Note: This function does NOT free the handle. You must call `prime_request_free` even after
-/// this function returns a response or an error.
 pub unsafe extern "C" fn prime_request_wait(
     handle: *mut PrimeRequestHandle,
     timeout_ms: u64,
@@ -350,13 +349,14 @@ pub unsafe extern "C" fn prime_request_wait(
                     pack_ok(response)
                 }
                 Ok(Err(err)) => {
+                    let mut code = error_code_from(&err);
+                    if err.to_string() == "timeout" { code = PRIME_ERR_RUNTIME; }
                     inner
                         .status
                         .store(PrimeRequestStatus::FAILED as u8, Ordering::SeqCst);
-                    pack_error(error_code_from(&err), &err.to_string())
+                    pack_error(code, &err.to_string())
                 }
                 Err(EngineError::Internal(msg)) if msg == "timeout" => {
-                    // Keep handle alive so caller can wait again later.
                     pack_error(PRIME_ERR_RUNTIME, "timeout")
                 }
                 Err(err) => {

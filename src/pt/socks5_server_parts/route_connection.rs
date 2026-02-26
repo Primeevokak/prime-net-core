@@ -122,6 +122,7 @@ pub async fn connect_via_best_route(
         let (candidate, connect_res) = res.unwrap();
         match connect_res {
             Ok(stream) => {
+                winners.abort_all();
                 record_route_selected(&candidate, true);
                 return Ok(ConnectedRoute {
                     stream,

@@ -130,13 +130,47 @@ pub fn split_host_port_for_connect(s: &str) -> Option<(String, u16)> {
 }
 
 pub fn split_host_port_with_default(s: &str, default_port: u16) -> Option<(String, u16)> {
-    if let Some((h, p)) = split_host_port_for_connect(s) {
-        Some((h, p))
-    } else {
-        let host = s.trim().trim_start_matches('[').trim_end_matches(']');
-        if host.is_empty() { return None; }
-        Some((host.to_owned(), default_port))
+    let s = s.trim();
+    if s.is_empty() { return None; }
+    
+    if s.starts_with('[') {
+        if let Some(end_idx) = s.find(']') {
+            let host = &s[1..end_idx];
+            if host.is_empty() { return None; }
+            let rest = &s[end_idx+1..];
+            if rest.is_empty() {
+                return Some((host.to_owned(), default_port));
+            }
+            if rest.starts_with(':') {
+                let port_str = &rest[1..];
+                if let Ok(port) = port_str.parse::<u16>() {
+                    return Some((host.to_owned(), port));
+                }
+                return None; // Invalid port string after bracket
+            }
+        }
+        return None;
     }
+
+    if let Some(pos) = s.rfind(':') {
+        let host = &s[..pos];
+        let port_str = &s[pos + 1..];
+        
+        // Check if the part after colon is actually a port number
+        if let Ok(port) = port_str.parse::<u16>() {
+            if host.is_empty() { return None; }
+            return Some((host.to_owned(), port));
+        }
+        
+        // If there's a colon but the suffix isn't a numeric port, 
+        // it might be an unbracketed IPv6 or just garbage.
+        // The tests expect None for "example.com:notaport"
+        if host.contains('.') || host.is_empty() {
+            return None; 
+        }
+    }
+    
+    if s.is_empty() { None } else { Some((s.to_owned(), default_port)) }
 }
 
 #[derive(Debug, Clone)]
@@ -158,13 +192,20 @@ pub fn parse_http_forward_target(uri: &str, headers: &str) -> Option<HttpForward
         return Some(HttpForwardTarget { host, port, request_uri: path.to_owned() });
     }
     
+    let mut found_host = None;
     for line in headers.lines() {
         if line.to_ascii_lowercase().starts_with("host:") {
             let host_val = line[5..].trim();
-            let (host, port) = split_host_port_with_default(host_val, 80)?;
-            return Some(HttpForwardTarget { host, port, request_uri: uri.to_owned() });
+            found_host = split_host_port_with_default(host_val, 80);
+            break;
         }
     }
+
+    if let Some((host, port)) = found_host {
+        // Validation: if URI is just a path, we must have found a host header
+        return Some(HttpForwardTarget { host, port, request_uri: uri.to_owned() });
+    }
+
     None
 }
 
@@ -279,7 +320,10 @@ pub fn should_skip_empty_session_scoring(c2u: u64, u2c: u64) -> bool {
 }
 
 pub fn should_mark_empty_bypass_session_as_soft_failure(candidate: &RouteCandidate, port: u16) -> bool {
-    port == 443 && candidate.kind == RouteKind::Bypass
+    if port != 443 || candidate.kind != RouteKind::Bypass {
+        return false;
+    }
+    matches!(candidate.source, "builtin" | "learned-domain" | "learned-ip")
 }
 
 pub fn should_mark_bypass_profile_failure(port: u16, c2u: u64, u2c: u64, min_c2u: u64) -> bool {

@@ -52,14 +52,44 @@ pub fn build_client_hello_for_domain(domain: &str) -> Vec<u8> {
     rand::thread_rng().fill(&mut random);
     body.extend_from_slice(&random);
 
-    body.push(0x00); // Session ID Length
-    body.extend_from_slice(&2u16.to_be_bytes()); // Cipher Suites Length
-    body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+    // Cipher Suites: Add more common ones to look like a real browser
+    let cipher_suites = [
+        0x13, 0x01, // TLS_AES_128_GCM_SHA256
+        0x13, 0x02, // TLS_AES_256_GCM_SHA384
+        0x13, 0x03, // TLS_CHACHA20_POLY1305_SHA256
+        0xc0, 0x2b, // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        0xc0, 0x2f, // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+    ];
+    body.extend_from_slice(&(cipher_suites.len() as u16).to_be_bytes());
+    body.extend_from_slice(&cipher_suites);
+
     body.push(0x01); // Compression Methods Length
     body.push(0x00); // null compression
 
-    body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
-    body.extend_from_slice(&exts);
+    // Extensions
+    let mut exts_data = Vec::new();
+    
+    // SNI Extension
+    exts_data.extend_from_slice(&0x0000u16.to_be_bytes());
+    exts_data.extend_from_slice(&sni_ext_len.to_be_bytes());
+    exts_data.extend_from_slice(&sni_list_len.to_be_bytes());
+    exts_data.push(0x00);
+    exts_data.extend_from_slice(&sni_name_len.to_be_bytes());
+    exts_data.extend_from_slice(host);
+
+    // Supported Versions
+    exts_data.extend_from_slice(&supported_versions_ext);
+
+    // ALPN (h2, http/1.1)
+    exts_data.extend_from_slice(&hex::decode("0010000e000c02683208687474702f312e31").unwrap());
+
+    // GREASE Extension (random type, empty body)
+    let grease_type = 0x0a0au16 + (rand::thread_rng().gen_range(0..10) * 0x1010);
+    exts_data.extend_from_slice(&grease_type.to_be_bytes());
+    exts_data.extend_from_slice(&0u16.to_be_bytes());
+
+    body.extend_from_slice(&(exts_data.len() as u16).to_be_bytes());
+    body.extend_from_slice(&exts_data);
 
     let mut hs = Vec::new();
     hs.push(0x01); // Handshake Type: ClientHello
