@@ -78,6 +78,7 @@ async fn resolve_socket_addrs(
     host: &str,
     port: u16,
     bootstrap_ips: &[IpAddr],
+    allow_system_fallback: bool,
 ) -> Result<Vec<SocketAddr>> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![SocketAddr::new(ip, port)]);
@@ -92,6 +93,11 @@ async fn resolve_socket_addrs(
             .map(|ip| SocketAddr::new(ip, port))
             .collect()
     } else {
+        if !allow_system_fallback {
+            return Err(EngineError::Config(format!(
+                "bootstrap DNS is required to resolve upstream '{host}:{port}' without system DNS leak; set dns.bootstrap_ips or use an IP literal"
+            )));
+        }
         tracing::warn!(
             host = host,
             port = port,
@@ -177,10 +183,19 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_ips_are_used_without_system_dns() {
         let bootstrap = [IpAddr::from([1, 2, 3, 4])];
-        let addrs = resolve_socket_addrs("does-not-exist.invalid", 853, &bootstrap)
+        let addrs = resolve_socket_addrs("does-not-exist.invalid", 853, &bootstrap, false)
             .await
             .expect("bootstrap should bypass system DNS resolution");
         assert_eq!(addrs, vec![SocketAddr::new(bootstrap[0], 853)]);
+    }
+
+    #[cfg(feature = "hickory-dns")]
+    #[tokio::test]
+    async fn encrypted_upstream_without_bootstrap_is_rejected() {
+        let err = resolve_socket_addrs("dns.google", 443, &[], false)
+            .await
+            .expect_err("DoH/DoT/DoQ upstream without bootstrap must fail closed");
+        assert!(format!("{err}").contains("bootstrap DNS is required"));
     }
 
     #[cfg(feature = "hickory-dns")]

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use rand::Rng;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::time::Instant;
 use tokio::time::Sleep;
 
 #[derive(Debug, Clone)]
@@ -346,9 +347,17 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for FragmentingIo<T> {
 
                     let sleep_ms = self.next_sleep_ms();
                     if sleep_ms > 0 && self.enabled() {
-                        self.sleep = Some(Box::pin(tokio::time::sleep(Duration::from_millis(
-                            sleep_ms,
-                        ))));
+                        if tokio::runtime::Handle::try_current().is_ok() {
+                            if let Some(sleep) = self.sleep.as_mut() {
+                                sleep
+                                    .as_mut()
+                                    .reset(Instant::now() + Duration::from_millis(sleep_ms));
+                            } else {
+                                self.sleep = Some(Box::pin(tokio::time::sleep(
+                                    Duration::from_millis(sleep_ms),
+                                )));
+                            }
+                        }
                     }
                 }
                 Poll::Ready(Ok(n))
@@ -369,6 +378,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for FragmentingIo<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use tokio::io::AsyncWrite;
 
     fn build_client_hello(host: &str, include_padding_extension: bool) -> Vec<u8> {
         let host = host.as_bytes();
@@ -436,5 +448,52 @@ mod tests {
         let (mut io, _handle) = FragmentingIo::new(tokio::io::sink(), cfg);
         let first = io.next_write_limit(b"not a tls client hello");
         assert_eq!(first, 7);
+    }
+
+    struct DummyWriter;
+
+    impl AsyncWrite for DummyWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn noop_waker() -> Waker {
+        // SAFETY: vtable functions never dereference the data pointer.
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        unsafe fn wake(_: *const ()) {}
+        unsafe fn wake_by_ref(_: *const ()) {}
+        unsafe fn drop(_: *const ()) {}
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+        // SAFETY: vtable satisfies RawWaker contract for no-op behavior.
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    #[test]
+    fn poll_write_without_tokio_runtime_does_not_panic() {
+        let cfg = FragmentConfig {
+            sleep_ms: 5,
+            ..FragmentConfig::default()
+        };
+        let (mut io, _handle) = FragmentingIo::new(DummyWriter, cfg);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut pinned = Pin::new(&mut io);
+        let res = AsyncWrite::poll_write(pinned.as_mut(), &mut cx, b"hello");
+        assert!(matches!(res, Poll::Ready(Ok(5))));
     }
 }

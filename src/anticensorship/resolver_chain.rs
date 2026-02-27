@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::config::{AntiCensorshipConfig, DnsResolverKind};
 use crate::error::{EngineError, Result};
@@ -58,7 +58,9 @@ impl ResolverChain {
             return Ok(vec![ip]);
         }
 
-        if self.cfg.dns_parallel_racing && self.chain.len() > 1 {
+        // Privacy guardrail: never race System DNS against encrypted resolvers.
+        // Otherwise System often wins first and leaks the query to the ISP.
+        if self.cfg.dns_parallel_racing && self.chain.len() > 1 && !self.parallel_race_leaks_dns() {
             return self.resolve_parallel(domain).await;
         }
 
@@ -82,6 +84,18 @@ impl ResolverChain {
                 "dns_fallback_chain is empty: no resolvers to try".to_owned(),
             )),
         }
+    }
+
+    fn parallel_race_leaks_dns(&self) -> bool {
+        let has_system = self
+            .chain
+            .iter()
+            .any(|k| matches!(k, DnsResolverKind::System));
+        let has_encrypted = self
+            .chain
+            .iter()
+            .any(|k| matches!(k, DnsResolverKind::Doh | DnsResolverKind::Dot | DnsResolverKind::Doq));
+        has_system && has_encrypted
     }
 
     async fn resolve_parallel(&self, domain: &str) -> Result<Vec<IpAddr>> {
@@ -375,23 +389,13 @@ impl ResolverChain {
             }
 
             let mut provider_bootstrap_ips = self.cfg.bootstrap_ips.clone();
-
-            // Hardcoded safe fallbacks for common providers to avoid system DNS dependency
-            if host == "dns.google" && provider_bootstrap_ips.is_empty() {
-                provider_bootstrap_ips.extend(fallback_ipv4s(&[[8, 8, 8, 8], [8, 8, 4, 4]]));
-            } else if host == "cloudflare-dns.com" && provider_bootstrap_ips.is_empty() {
-                provider_bootstrap_ips.extend(fallback_ipv4s(&[[1, 1, 1, 1], [1, 0, 0, 1]]));
-            } else if host == "dns.quad9.net" && provider_bootstrap_ips.is_empty() {
-                provider_bootstrap_ips
-                    .extend(fallback_ipv4s(&[[9, 9, 9, 9], [149, 112, 112, 112]]));
-            } else if host == "dns.adguard.com" && provider_bootstrap_ips.is_empty() {
-                provider_bootstrap_ips
-                    .extend(fallback_ipv4s(&[[94, 140, 14, 14], [94, 140, 15, 15]]));
-            } else if host == "doh.mullvad.net" && provider_bootstrap_ips.is_empty() {
-                provider_bootstrap_ips.extend(fallback_ipv4s(&[[194, 242, 2, 2]]));
-            } else if host == "doh.opendns.com" && provider_bootstrap_ips.is_empty() {
-                provider_bootstrap_ips
-                    .extend(fallback_ipv4s(&[[208, 67, 222, 222], [208, 67, 220, 220]]));
+            if provider_bootstrap_ips.is_empty() {
+                provider_bootstrap_ips.extend(known_doh_provider_bootstrap_ips(&host));
+            }
+            if provider_bootstrap_ips.is_empty() {
+                if let Ok(ip) = host.parse::<IpAddr>() {
+                    provider_bootstrap_ips.push(ip);
+                }
             }
 
             if !provider_bootstrap_ips.is_empty() {
@@ -406,23 +410,9 @@ impl ResolverChain {
                 continue;
             }
 
-            // Bootstrapping fallback: system DNS leakage can occur here; prefer bootstrap_ips in config.
-            let resolved = tokio::net::lookup_host((host.as_str(), 443))
-                .await
-                .map_err(|e| {
-                    EngineError::Internal(format!("bootstrap resolve failed for {host}: {e}"))
-                })?;
-            let mut ips: Vec<IpAddr> = resolved.map(|sa| sa.ip()).collect();
-            ips.sort_unstable();
-            ips.dedup();
-
-            for ip in ips.into_iter() {
-                let mut ns =
-                    NameServerConfig::new(std::net::SocketAddr::new(ip, 443), Protocol::Https);
-                ns.tls_dns_name = Some(host.clone());
-                // Default http_endpoint is /dns-query when None.
-                group.push(ns);
-            }
+            return Err(EngineError::Config(format!(
+                "DoH provider '{host}' requires bootstrap_ips to avoid system DNS leak"
+            )));
         }
 
         if group.is_empty() {
@@ -615,6 +605,56 @@ fn fallback_ipv4s(addrs: &[[u8; 4]]) -> Vec<IpAddr> {
 }
 
 #[cfg(feature = "hickory-dns")]
+fn fallback_ipv6s(addrs: &[[u16; 8]]) -> Vec<IpAddr> {
+    addrs
+        .iter()
+        .copied()
+        .map(|segments| IpAddr::V6(Ipv6Addr::from(segments)))
+        .collect()
+}
+
+#[cfg(feature = "hickory-dns")]
+fn known_doh_provider_bootstrap_ips(host: &str) -> Vec<IpAddr> {
+    match host.trim().to_ascii_lowercase().as_str() {
+        "dns.google" => {
+            let mut out = fallback_ipv4s(&[[8, 8, 8, 8], [8, 8, 4, 4]]);
+            out.extend(fallback_ipv6s(&[
+                [0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888],
+                [0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8844],
+            ]));
+            out
+        }
+        "cloudflare-dns.com" => {
+            let mut out = fallback_ipv4s(&[[1, 1, 1, 1], [1, 0, 0, 1]]);
+            out.extend(fallback_ipv6s(&[
+                [0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111],
+                [0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1001],
+            ]));
+            out
+        }
+        "dns.quad9.net" => {
+            let mut out = fallback_ipv4s(&[[9, 9, 9, 9], [149, 112, 112, 112]]);
+            out.extend(fallback_ipv6s(&[
+                [0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x00fe],
+                [0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x0009],
+            ]));
+            out
+        }
+        "dns.adguard.com" => {
+            let mut out = fallback_ipv4s(&[[94, 140, 14, 14], [94, 140, 15, 15]]);
+            out.extend(fallback_ipv6s(&[
+                [0x2a10, 0x50c0, 0, 0, 0, 0, 0, 0x0ad1],
+                [0x2a10, 0x50c0, 0, 0, 0, 0, 0, 0x0ad2],
+            ]));
+            out
+        }
+        "doh.mullvad.net" => fallback_ipv4s(&[[194, 242, 2, 2]]),
+        "doh.opendns.com" => fallback_ipv4s(&[[208, 67, 222, 222], [208, 67, 220, 220]]),
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(feature = "hickory-dns")]
 fn doh_host_for_provider(provider: &str) -> String {
     let v = provider.trim();
     if v.contains("://") {
@@ -737,6 +777,39 @@ mod tests {
 
         let ips = chain.resolve("1.2.3.4").await.expect("ip literal");
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+    }
+
+    #[test]
+    fn parallel_race_is_disabled_when_system_and_encrypted_mix() {
+        let mut cfg = EngineConfig::default();
+        cfg.anticensorship.dns_fallback_chain =
+            vec![DnsResolverKind::Doh, DnsResolverKind::System];
+        let chain = ResolverChain::from_config(&cfg.anticensorship).expect("build chain");
+        assert!(chain.parallel_race_leaks_dns());
+    }
+
+    #[cfg(feature = "hickory-dns")]
+    #[test]
+    fn known_doh_providers_have_ipv6_bootstrap() {
+        let google = known_doh_provider_bootstrap_ips("dns.google");
+        assert!(google.iter().any(IpAddr::is_ipv6));
+        let cloudflare = known_doh_provider_bootstrap_ips("cloudflare-dns.com");
+        assert!(cloudflare.iter().any(IpAddr::is_ipv6));
+    }
+
+    #[cfg(feature = "hickory-dns")]
+    #[tokio::test]
+    async fn custom_doh_without_bootstrap_fails_closed() {
+        let mut cfg = EngineConfig::default();
+        cfg.anticensorship.doh_enabled = true;
+        cfg.anticensorship.dns_parallel_racing = false;
+        cfg.anticensorship.bootstrap_ips.clear();
+        cfg.anticensorship.doh_providers = vec!["https://my.custom.doh.example/dns-query".into()];
+        cfg.anticensorship.dns_fallback_chain = vec![DnsResolverKind::Doh];
+        let chain = ResolverChain::from_config(&cfg.anticensorship).expect("build chain");
+
+        let err = chain.resolve("example.com").await.expect_err("must fail closed");
+        assert!(err.to_string().contains("requires bootstrap_ips"));
     }
 
     #[test]

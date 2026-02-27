@@ -3,23 +3,31 @@ use crate::error::Result;
 
 pub struct SignatureVerifier {
     public_key: &'static str,
+    public_key_fingerprint: &'static str,
 }
 
 impl SignatureVerifier {
     pub fn new() -> Self {
         Self {
             public_key: PRIME_NET_PUBLIC_KEY,
+            public_key_fingerprint: PRIME_NET_PUBLIC_KEY_FINGERPRINT,
         }
     }
 
     fn ensure_public_key_configured(&self) -> Result<()> {
-        if self
-            .public_key
-            .contains("REPLACE_WITH_REAL_RELEASE_SIGNING_KEY")
+        if self.public_key.contains("REPLACE_WITH_REAL_RELEASE_SIGNING_KEY")
+            || self
+                .public_key_fingerprint
+                .contains("REPLACE_WITH_REAL_RELEASE_SIGNING_FINGERPRINT")
         {
             return Err(EngineError::Internal(
-                "release signature verification is not configured: public key placeholder is still set"
+                "release signature verification is not configured: public key/fingerprint placeholders are still set"
                     .to_owned(),
+            ));
+        }
+        if normalize_fingerprint(self.public_key_fingerprint).is_none() {
+            return Err(EngineError::Internal(
+                "release signing fingerprint has invalid format".to_owned(),
             ));
         }
         Ok(())
@@ -31,15 +39,41 @@ impl SignatureVerifier {
 
         self.ensure_public_key_configured()?;
 
+        let expected_fpr = normalize_fingerprint(self.public_key_fingerprint).ok_or_else(|| {
+            EngineError::Internal("configured release signing fingerprint is invalid".to_owned())
+        })?;
+
+        // Isolate verifier keyring from user/system keychain to avoid trust poisoning.
+        let gpg_home = tempfile::tempdir().map_err(|e| {
+            EngineError::Internal(format!("failed to create temporary keyring directory: {e}"))
+        })?;
+        let gpg_home_path = gpg_home.path().to_string_lossy().to_string();
+
         let mut ctx = Context::from_protocol(Protocol::OpenPgp)
             .map_err(|e| EngineError::Internal(format!("failed to create GPG context: {e}")))?;
+        ctx.set_engine_home_dir(gpg_home_path.as_str())
+            .map_err(|e| {
+                EngineError::Internal(format!("failed to set isolated GPG home dir: {e}"))
+            })?;
+
         let key_data = self.public_key.as_bytes();
         ctx.import(key_data)
             .map_err(|e| EngineError::Internal(format!("failed to import public key: {e}")))?;
         let result = ctx
             .verify_detached(signature, binary)
             .map_err(|e| EngineError::Internal(format!("signature verification failed: {e}")))?;
-        Ok(result.signatures().any(|sig| sig.status().is_ok()))
+
+        let has_expected_signature = result.signatures().any(|sig| {
+            if sig.status().is_err() {
+                return false;
+            }
+            let Ok(fpr) = sig.fingerprint() else {
+                return false;
+            };
+            normalize_fingerprint(fpr).is_some_and(|f| f == expected_fpr)
+        });
+
+        Ok(has_expected_signature)
     }
 
     #[cfg(not(feature = "signature-verification"))]
@@ -58,6 +92,37 @@ impl Default for SignatureVerifier {
     }
 }
 
+fn normalize_fingerprint(value: &str) -> Option<String> {
+    let normalized: String = value
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    if normalized.len() < 16 {
+        return None;
+    }
+    Some(normalized)
+}
+
 const PRIME_NET_PUBLIC_KEY: &str = r#"-----BEGIN PGP PUBLIC KEY BLOCK-----
 REPLACE_WITH_REAL_RELEASE_SIGNING_KEY
 -----END PGP PUBLIC KEY BLOCK-----"#;
+
+const PRIME_NET_PUBLIC_KEY_FINGERPRINT: &str = "REPLACE_WITH_REAL_RELEASE_SIGNING_FINGERPRINT";
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_fingerprint;
+
+    #[test]
+    fn normalize_fingerprint_accepts_spaced_lowercase() {
+        let got = normalize_fingerprint("ab cd ef 12 34 56 78 90")
+            .expect("must normalize valid fingerprint");
+        assert_eq!(got, "ABCDEF1234567890");
+    }
+
+    #[test]
+    fn normalize_fingerprint_rejects_too_short() {
+        assert!(normalize_fingerprint("1234").is_none());
+    }
+}

@@ -118,6 +118,7 @@ pub(super) fn record_destination_failure(
         stats.last_seen_unix = now;
     }
     record_stage_outcome(stage, false);
+    maybe_prune_runtime_classifier_state(now);
     maybe_flush_classifier_store(false);
     maybe_emit_classifier_summary(classifier_emit_interval_secs.max(5));
 }
@@ -149,6 +150,7 @@ pub(super) fn record_destination_success(
         stats.last_seen_unix = now;
     }
     record_stage_outcome(stage, true);
+    maybe_prune_runtime_classifier_state(now);
     maybe_flush_classifier_store(false);
 }
 
@@ -361,11 +363,176 @@ pub(super) fn maybe_emit_classifier_summary(interval_secs: u64) {
     maybe_flush_classifier_store(false);
 }
 
+pub(super) static CLASSIFIER_RUNTIME_LAST_PRUNE_UNIX: AtomicU64 = AtomicU64::new(0);
+pub(super) const CLASSIFIER_RUNTIME_PRUNE_INTERVAL_SECS: u64 = 30;
+pub(super) const CLASSIFIER_RUNTIME_MAX_DEST_ENTRIES: usize = 6000;
+pub(super) const CLASSIFIER_RUNTIME_KEEP_DEST_ENTRIES: usize = 4500;
+pub(super) const CLASSIFIER_RUNTIME_MAX_GLOBAL_BYPASS_ENTRIES: usize = 256;
+pub(super) const CLASSIFIER_RUNTIME_KEEP_GLOBAL_BYPASS_ENTRIES: usize = 192;
+
+pub(super) fn maybe_prune_runtime_classifier_state(now: u64) {
+    let last = CLASSIFIER_RUNTIME_LAST_PRUNE_UNIX.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < CLASSIFIER_RUNTIME_PRUNE_INTERVAL_SECS {
+        return;
+    }
+    if CLASSIFIER_RUNTIME_LAST_PRUNE_UNIX
+        .compare_exchange(last, now, Ordering::SeqCst, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let (removed_destinations, removed_global_profiles) = prune_runtime_classifier_state_with_caps(
+        CLASSIFIER_RUNTIME_MAX_DEST_ENTRIES,
+        CLASSIFIER_RUNTIME_KEEP_DEST_ENTRIES,
+        CLASSIFIER_RUNTIME_MAX_GLOBAL_BYPASS_ENTRIES,
+        CLASSIFIER_RUNTIME_KEEP_GLOBAL_BYPASS_ENTRIES,
+    );
+    if removed_destinations > 0 || removed_global_profiles > 0 {
+        info!(
+            target: "socks5.classifier",
+            removed_destinations,
+            removed_global_profiles,
+            "runtime classifier cache pruned"
+        );
+    }
+}
+
+fn prune_runtime_classifier_state_with_caps(
+    max_dest_entries: usize,
+    keep_dest_entries: usize,
+    max_global_bypass_entries: usize,
+    keep_global_bypass_entries: usize,
+) -> (usize, usize) {
+    let removed_destinations = prune_destination_runtime_state(max_dest_entries, keep_dest_entries);
+    let removed_global_profiles =
+        prune_global_bypass_runtime_state(max_global_bypass_entries, keep_global_bypass_entries);
+    (removed_destinations, removed_global_profiles)
+}
+
+fn prune_destination_runtime_state(max_entries: usize, keep_entries: usize) -> usize {
+    if max_entries == 0 {
+        return 0;
+    }
+    let failures = DEST_FAILURES.get_or_init(DashMap::new);
+    let preferred = DEST_PREFERRED_STAGE.get_or_init(DashMap::new);
+    let classifier = DEST_CLASSIFIER.get_or_init(DashMap::new);
+    let bypass_idx = DEST_BYPASS_PROFILE_IDX.get_or_init(DashMap::new);
+    let bypass_failures = DEST_BYPASS_PROFILE_FAILURES.get_or_init(DashMap::new);
+    let route_winner = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
+    let route_health = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
+
+    let mut last_seen_by_destination: HashMap<String, u64> = HashMap::new();
+    for r in failures.iter() {
+        last_seen_by_destination.entry(r.key().clone()).or_insert(0);
+    }
+    for r in preferred.iter() {
+        last_seen_by_destination.entry(r.key().clone()).or_insert(0);
+    }
+    for r in bypass_idx.iter() {
+        last_seen_by_destination.entry(r.key().clone()).or_insert(0);
+    }
+    for r in bypass_failures.iter() {
+        last_seen_by_destination.entry(r.key().clone()).or_insert(0);
+    }
+    for r in classifier.iter() {
+        let entry = last_seen_by_destination.entry(r.key().clone()).or_insert(0);
+        *entry = (*entry).max(r.value().last_seen_unix);
+    }
+    for r in route_winner.iter() {
+        let entry = last_seen_by_destination.entry(r.key().clone()).or_insert(0);
+        *entry = (*entry).max(r.value().updated_at_unix);
+    }
+    for r in route_health.iter() {
+        let mut last_seen = 0u64;
+        for health in r.value().iter() {
+            last_seen = last_seen.max(route_health_last_seen_unix(health.value()));
+        }
+        let entry = last_seen_by_destination.entry(r.key().clone()).or_insert(0);
+        *entry = (*entry).max(last_seen);
+    }
+
+    if last_seen_by_destination.len() <= max_entries {
+        return 0;
+    }
+
+    let keep = keep_entries.min(max_entries).max(1);
+    let mut ranked: Vec<(String, u64)> = last_seen_by_destination.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let keep_keys: std::collections::HashSet<String> =
+        ranked.iter().take(keep).map(|(k, _)| k.clone()).collect();
+    let evict_keys: Vec<String> = ranked
+        .into_iter()
+        .skip(keep)
+        .map(|(key, _)| key)
+        .filter(|key| !keep_keys.contains(key))
+        .collect();
+
+    for key in &evict_keys {
+        failures.remove(key);
+        preferred.remove(key);
+        classifier.remove(key);
+        bypass_idx.remove(key);
+        bypass_failures.remove(key);
+        route_winner.remove(key);
+        route_health.remove(key);
+    }
+    evict_keys.len()
+}
+
+fn prune_global_bypass_runtime_state(max_entries: usize, keep_entries: usize) -> usize {
+    if max_entries == 0 {
+        return 0;
+    }
+    let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(DashMap::new);
+    if map.len() <= max_entries {
+        return 0;
+    }
+    let keep = keep_entries.min(max_entries).max(1);
+    let mut ranked: Vec<(String, u64)> = map
+        .iter()
+        .map(|r| {
+            (
+                r.key().clone(),
+                bypass_profile_health_last_seen_unix(r.value()),
+            )
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let keep_keys: std::collections::HashSet<String> =
+        ranked.iter().take(keep).map(|(k, _)| k.clone()).collect();
+    let evict_keys: Vec<String> = ranked
+        .into_iter()
+        .skip(keep)
+        .map(|(key, _)| key)
+        .filter(|key| !keep_keys.contains(key))
+        .collect();
+    for key in &evict_keys {
+        map.remove(key);
+    }
+    evict_keys.len()
+}
+
+#[cfg(test)]
+pub(super) fn prune_runtime_classifier_state_for_test(
+    max_dest_entries: usize,
+    keep_dest_entries: usize,
+    max_global_bypass_entries: usize,
+    keep_global_bypass_entries: usize,
+) -> (usize, usize) {
+    prune_runtime_classifier_state_with_caps(
+        max_dest_entries,
+        keep_dest_entries,
+        max_global_bypass_entries,
+        keep_global_bypass_entries,
+    )
+}
+
 pub(super) static CLASSIFIER_STORE_CFG: OnceLock<Option<ClassifierStoreConfig>> = OnceLock::new();
 pub(super) static CLASSIFIER_STORE_LOADED: AtomicBool = AtomicBool::new(false);
 pub(super) static CLASSIFIER_STORE_DIRTY: AtomicBool = AtomicBool::new(false);
 pub(super) static CLASSIFIER_STORE_LAST_FLUSH_UNIX: AtomicU64 = AtomicU64::new(0);
 pub(super) const CLASSIFIER_PERSIST_DEBOUNCE_SECS: u64 = 30;
+pub(super) const CLASSIFIER_PERSIST_MAX_ENTRIES: usize = 5000;
 
 pub(super) fn init_classifier_store(relay_opts: &RelayOptions) {
     let _ = CLASSIFIER_STORE_CFG.get_or_init(|| {
@@ -485,6 +652,7 @@ pub(super) fn load_classifier_store_if_needed() {
             "restored persisted relay classifier entries"
         );
     }
+    maybe_prune_runtime_classifier_state(now);
 }
 
 pub(super) fn destination_classifier_is_empty(stats: &DestinationClassifier) -> bool {
@@ -648,6 +816,19 @@ pub(super) fn write_classifier_snapshot(cfg: &ClassifierStoreConfig) -> std::io:
                 .unwrap_or(false)
             || !entry.route_health.is_empty()
     });
+    if entries.len() > CLASSIFIER_PERSIST_MAX_ENTRIES {
+        let mut ranked: Vec<(String, u64)> = entries
+            .iter()
+            .map(|(k, v)| (k.clone(), snapshot_entry_last_seen_unix(v)))
+            .collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let keep: std::collections::HashSet<String> = ranked
+            .into_iter()
+            .take(CLASSIFIER_PERSIST_MAX_ENTRIES)
+            .map(|(k, _)| k)
+            .collect();
+        entries.retain(|k, _| keep.contains(k));
+    }
     let mut global_bypass_health = HashMap::new();
     for r in global_bypass.iter() {
         let (route_id, health) = (r.key(), r.value());

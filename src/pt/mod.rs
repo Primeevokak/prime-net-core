@@ -41,7 +41,10 @@ pub struct TargetEndpoint {
 
 impl std::fmt::Display for TargetEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.addr, self.port)
+        match &self.addr {
+            TargetAddr::Ip(IpAddr::V6(ip)) => write!(f, "[{}]:{}", ip, self.port),
+            _ => write!(f, "{}:{}", self.addr, self.port),
+        }
     }
 }
 

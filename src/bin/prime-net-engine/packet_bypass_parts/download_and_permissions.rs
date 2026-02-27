@@ -200,24 +200,19 @@ async fn verify_downloaded_payload_integrity(
             "resolved packet bypass sha256 from release metadata cache"
         );
         parsed
-    } else {
+    } else if trust_remote_checksum_enabled() {
         match resolve_sha256_from_sidecar(source_url).await? {
             Some(v) => v,
             None => {
-                if allow_unverified_packet_bypass_bootstrap() {
-                    warn!(
-                        target: "packet_bypass",
-                        binary = binary_name,
-                        source = source_url,
-                        "packet bypass integrity sidecar not found; continuing because PRIME_PACKET_BYPASS_ALLOW_UNVERIFIED=1"
-                    );
-                    return Ok(());
-                }
                 return Err(EngineError::Config(format!(
-                    "packet bypass integrity check failed: no sha256 sidecar for '{source_url}'. set PRIME_PACKET_BYPASS_PAYLOAD_SHA256 or PRIME_PACKET_BYPASS_ALLOW_UNVERIFIED=1"
+                    "packet bypass integrity check failed: no sha256 sidecar for '{source_url}' while PRIME_PACKET_BYPASS_TRUST_REMOTE_CHECKSUM=1"
                 )));
             }
         }
+    } else {
+        return Err(EngineError::Config(format!(
+            "packet bypass integrity check failed for '{binary_name}': trusted digest is not configured for '{source_url}'. set PRIME_PACKET_BYPASS_PAYLOAD_SHA256 or explicitly allow remote checksum trust with PRIME_PACKET_BYPASS_TRUST_REMOTE_CHECKSUM=1"
+        )));
     };
 
     let got = sha256_bytes(payload);
@@ -263,6 +258,17 @@ fn verify_final_binary_integrity_if_configured(binary_name: &str, bytes: &[u8]) 
     Ok(())
 }
 
+fn trust_remote_checksum_enabled() -> bool {
+    std::env::var("PRIME_PACKET_BYPASS_TRUST_REMOTE_CHECKSUM")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 async fn resolve_sha256_from_sidecar(source_url: &str) -> Result<Option<[u8; 32]>> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -297,17 +303,6 @@ async fn resolve_sha256_from_sidecar(source_url: &str) -> Result<Option<[u8; 32]
         }
     }
     Ok(None)
-}
-
-fn allow_unverified_packet_bypass_bootstrap() -> bool {
-    std::env::var("PRIME_PACKET_BYPASS_ALLOW_UNVERIFIED")
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
 }
 
 fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {

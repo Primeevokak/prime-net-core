@@ -528,6 +528,7 @@ pub(super) fn record_global_bypass_profile_success(candidate: &RouteCandidate, n
     entry.connect_failures = entry.connect_failures.saturating_sub(1);
     entry.soft_zero_replies = entry.soft_zero_replies.saturating_sub(1);
     entry.io_errors = entry.io_errors.saturating_sub(1);
+    maybe_prune_runtime_classifier_state(now);
 }
 
 pub(super) fn record_global_bypass_profile_failure(
@@ -553,6 +554,7 @@ pub(super) fn record_global_bypass_profile_failure(
     if reason == "io-error" {
         entry.io_errors = entry.io_errors.saturating_add(1);
     }
+    maybe_prune_runtime_classifier_state(now);
 }
 
 pub(super) fn select_route_candidates(
@@ -636,19 +638,7 @@ pub(super) fn host_service_bucket(host: &str) -> String {
         return "meta-group:spotify".to_owned();
     }
 
-    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
-    if labels.len() < 2 {
-        return host.to_owned();
-    }
-    let tld = labels[labels.len() - 1];
-    let sld = labels[labels.len() - 2];
-    if labels.len() >= 3
-        && tld.len() == 2
-        && matches!(sld, "co" | "com" | "net" | "org" | "gov" | "edu" | "ac")
-    {
-        return labels[labels.len() - 3].to_owned();
-    }
-    sld.to_owned()
+    registrable_domain_bucket(&host).unwrap_or(host)
 }
 
 pub(super) fn destination_bypass_profile_idx_known(destination: &str, total: u8) -> Option<u8> {

@@ -42,10 +42,15 @@ pub(super) async fn handle_http_proxy(
             "HTTP proxy request is empty".to_owned(),
         ));
     };
-    let mut parts = first_line.split_whitespace();
-    let method = parts.next().unwrap_or_default().to_ascii_uppercase();
-    let target = parts.next().unwrap_or_default();
-    let _version = parts.next().unwrap_or("HTTP/1.1");
+    let Some(req_line) = parse_http_request_line(first_line) else {
+        let _ = tcp
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+            .await;
+        let _ = tcp.shutdown().await;
+        return Ok(());
+    };
+    let method = req_line.method.to_ascii_uppercase();
+    let target = req_line.target;
 
     if method == "CONNECT" {
         let Some((host, port)) = split_host_port_for_connect(target) else {
@@ -768,17 +773,16 @@ pub(super) fn tune_relay_for_target(
         || destination.contains("windowsupdate")
         || destination.contains("spotify");
 
+    let is_discord = destination.contains("discord")
+        || destination.contains("discordapp")
+        || destination.contains("discord.gg");
+
     if is_very_sensitive {
         base.tcp_window_trick = true;
         if failures == 0 {
-            // Discord doesn't like Stage 4 fragmentation on some ISPs/AVs.
-            // Keep it at Stage 2 for Discord initially to be safe but effective.
-            // CRITICAL: For Discord, STICK to Stage 2. Do not escalate to 3 or 4.
-            if destination.contains("discord")
-                || destination.contains("discordapp")
-                || destination.contains("discord.gg")
-            {
-                stage = 2;
+            // Start Discord conservatively, but allow adaptive escalation later.
+            if is_discord {
+                stage = stage.max(2);
             } else {
                 stage = stage.max(4);
             }
@@ -844,9 +848,9 @@ pub(super) fn tune_relay_for_target(
             #[cfg(windows)]
             fragment_size_max: 128,
             #[cfg(not(windows))]
-            fragment_size_min: 1,
+            fragment_size_min: 32,
             #[cfg(not(windows))]
-            fragment_size_max: 1,
+            fragment_size_max: 64,
             fragment_sleep_ms: base.fragment_sleep_ms.min(1),
             fragment_budget_bytes: base.fragment_budget_bytes.clamp(4096, 8192),
             client_hello_split_offsets: vec![16, 32, 64],
@@ -941,10 +945,44 @@ pub(super) fn route_service_state_key(destination: &str) -> Option<String> {
 }
 
 pub(super) fn registrable_domain_bucket(host: &str) -> Option<String> {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
     let labels: Vec<&str> = host.split('.').filter(|label| !label.is_empty()).collect();
     if labels.len() < 2 {
         return None;
     }
+
+    const PRIVATE_SUFFIXES: &[&str] = &[
+        "github.io",
+        "gitlab.io",
+        "pages.dev",
+        "workers.dev",
+        "vercel.app",
+        "netlify.app",
+        "herokuapp.com",
+        "blogspot.com",
+        "appspot.com",
+        "azurewebsites.net",
+        "firebaseapp.com",
+        "web.app",
+    ];
+
+    for suffix in PRIVATE_SUFFIXES {
+        if host == *suffix {
+            return Some(host.clone());
+        }
+        if let Some(prefix) = host.strip_suffix(suffix).and_then(|v| v.strip_suffix('.')) {
+            if prefix.is_empty() {
+                continue;
+            }
+            if let Some(last) = prefix.rsplit('.').next() {
+                return Some(format!("{last}.{suffix}"));
+            }
+        }
+    }
+
     let tld = labels[labels.len() - 1];
     let sld = labels[labels.len() - 2];
     if labels.len() >= 3

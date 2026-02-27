@@ -86,6 +86,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_http_request_line_is_strict() {
+        let line = parse_http_request_line("GET /path?q=1 HTTP/1.1").expect("parsed");
+        assert_eq!(line.method, "GET");
+        assert_eq!(line.target, "/path?q=1");
+        assert_eq!(line.version, "HTTP/1.1");
+        assert!(parse_http_request_line("GET /path HTTP/1.1 EXTRA").is_none());
+        assert!(parse_http_request_line("G E T / HTTP/1.1").is_none());
+        assert!(parse_http_request_line("GET /path NOTHTTP").is_none());
+    }
+
+    #[test]
     fn parse_http_forward_target_normalizes_ipv6_host_header() {
         let req = "GET /api HTTP/1.1\r\nHost: [2001:db8::1]:8080\r\n\r\n";
         let parsed = parse_http_forward_target("/api", req).expect("parsed");
@@ -110,6 +121,74 @@ mod tests {
             parse_ip_literal("[2001:db8::3]").map(|ip| ip.to_string()),
             Some("2001:db8::3".to_owned())
         );
+    }
+
+    #[test]
+    fn connect_target_parses_ipv6_with_port() {
+        let bracketed = split_host_port_for_connect("[2001:db8::10]:8443").expect("parsed");
+        assert_eq!(bracketed.0, "2001:db8::10");
+        assert_eq!(bracketed.1, 8443);
+
+        let unbracketed = split_host_port_for_connect("2001:db8::10:8443").expect("parsed");
+        assert_eq!(unbracketed.0, "2001:db8::10");
+        assert_eq!(unbracketed.1, 8443);
+    }
+
+    #[test]
+    fn target_endpoint_display_brackets_ipv6_literal() {
+        let endpoint = TargetEndpoint {
+            addr: TargetAddr::Ip("2001:db8::42".parse().expect("ip")),
+            port: 443,
+        };
+        assert_eq!(endpoint.to_string(), "[2001:db8::42]:443");
+    }
+
+    #[test]
+    fn registrable_domain_bucket_handles_private_suffixes() {
+        assert_eq!(
+            registrable_domain_bucket("api.user.github.io").as_deref(),
+            Some("user.github.io")
+        );
+        assert_eq!(
+            registrable_domain_bucket("x.myapp.vercel.app").as_deref(),
+            Some("myapp.vercel.app")
+        );
+    }
+
+    #[test]
+    fn host_service_bucket_uses_registrable_bucket_for_multitenant_suffixes() {
+        assert_eq!(host_service_bucket("api.user.github.io"), "user.github.io");
+        assert_eq!(
+            host_service_bucket("x.myapp.vercel.app"),
+            "myapp.vercel.app"
+        );
+    }
+
+    #[test]
+    fn validate_relay_topology_rejects_self_referential_proxy_loop() {
+        let listen: SocketAddr = "127.0.0.1:1080".parse().expect("addr");
+        let opts = RelayOptions {
+            upstream_socks5: Some(listen),
+            ..RelayOptions::default()
+        };
+        let err = validate_relay_topology(listen, &opts).expect_err("must reject loop");
+        assert!(format!("{err}").contains("forwarding loop"));
+    }
+
+    #[test]
+    fn stage4_fragmentation_is_not_one_byte_on_non_windows() {
+        let destination = "example.com:443";
+        let key = destination.to_owned();
+        DEST_FAILURES
+            .get_or_init(DashMap::new)
+            .insert(key.clone(), 8);
+        let _tuned = tune_relay_for_target(RelayOptions::default(), 443, destination, false, false);
+        #[cfg(not(windows))]
+        {
+            assert!(_tuned.options.fragment_size_min >= 32);
+            assert!(_tuned.options.fragment_size_max >= _tuned.options.fragment_size_min);
+        }
+        DEST_FAILURES.get_or_init(DashMap::new).remove(&key);
     }
 
     #[test]
@@ -1143,6 +1222,151 @@ mod tests {
         assert!(should_schedule_bypass_pool_warmup_at(addr, 2_001));
 
         warmup_map.remove(&addr);
+    }
+
+    #[test]
+    fn runtime_prune_evicts_stale_destination_entries_across_all_maps() {
+        let prefix = format!("runtime-prune-destination-{}", now_unix_secs());
+        let failures = DEST_FAILURES.get_or_init(DashMap::new);
+        let preferred = DEST_PREFERRED_STAGE.get_or_init(DashMap::new);
+        let classifier = DEST_CLASSIFIER.get_or_init(DashMap::new);
+        let bypass_idx = DEST_BYPASS_PROFILE_IDX.get_or_init(DashMap::new);
+        let bypass_failures = DEST_BYPASS_PROFILE_FAILURES.get_or_init(DashMap::new);
+        let winner = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
+        let route_health = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
+
+        let old_keys: Vec<String> = (0..3).map(|i| format!("{prefix}-old-{i}:443")).collect();
+        let fresh_keys: Vec<String> = (0..3).map(|i| format!("{prefix}-fresh-{i}:443")).collect();
+
+        for (idx, key) in old_keys.iter().enumerate() {
+            let ts = 10 + idx as u64;
+            failures.insert(key.clone(), 2);
+            preferred.insert(key.clone(), 2);
+            classifier.insert(
+                key.clone(),
+                DestinationClassifier {
+                    failures: 2,
+                    last_seen_unix: ts,
+                    ..DestinationClassifier::default()
+                },
+            );
+            bypass_idx.insert(key.clone(), 1);
+            bypass_failures.insert(key.clone(), 1);
+            winner.insert(
+                key.clone(),
+                RouteWinner {
+                    route_id: "bypass:1".to_owned(),
+                    updated_at_unix: ts,
+                },
+            );
+            {
+                let per_route = route_health.entry(key.clone()).or_default();
+                per_route.insert(
+                    "bypass:1".to_owned(),
+                    RouteHealth {
+                        failures: 1,
+                        last_failure_unix: ts,
+                        ..RouteHealth::default()
+                    },
+                );
+            }
+        }
+        for (idx, key) in fresh_keys.iter().enumerate() {
+            let ts = 9_000_000_000 + idx as u64;
+            failures.insert(key.clone(), 2);
+            preferred.insert(key.clone(), 2);
+            classifier.insert(
+                key.clone(),
+                DestinationClassifier {
+                    successes: 1,
+                    last_seen_unix: ts,
+                    ..DestinationClassifier::default()
+                },
+            );
+            bypass_idx.insert(key.clone(), 1);
+            bypass_failures.insert(key.clone(), 1);
+            winner.insert(
+                key.clone(),
+                RouteWinner {
+                    route_id: "bypass:1".to_owned(),
+                    updated_at_unix: ts,
+                },
+            );
+            {
+                let per_route = route_health.entry(key.clone()).or_default();
+                per_route.insert(
+                    "bypass:1".to_owned(),
+                    RouteHealth {
+                        successes: 1,
+                        last_success_unix: ts,
+                        ..RouteHealth::default()
+                    },
+                );
+            }
+        }
+
+        let (removed_destinations, _) =
+            prune_runtime_classifier_state_for_test(3, 3, usize::MAX, usize::MAX);
+        assert!(removed_destinations >= old_keys.len());
+
+        for key in &fresh_keys {
+            assert!(failures.contains_key(key));
+            assert!(preferred.contains_key(key));
+            assert!(classifier.contains_key(key));
+            assert!(bypass_idx.contains_key(key));
+            assert!(bypass_failures.contains_key(key));
+            assert!(winner.contains_key(key));
+            assert!(route_health.contains_key(key));
+        }
+        for key in &old_keys {
+            assert!(!failures.contains_key(key));
+            assert!(!preferred.contains_key(key));
+            assert!(!classifier.contains_key(key));
+            assert!(!bypass_idx.contains_key(key));
+            assert!(!bypass_failures.contains_key(key));
+            assert!(!winner.contains_key(key));
+            assert!(!route_health.contains_key(key));
+        }
+    }
+
+    #[test]
+    fn runtime_prune_evicts_stale_global_bypass_profile_health_entries() {
+        let prefix = format!("runtime-prune-bypass-{}", now_unix_secs());
+        let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(DashMap::new);
+        let old_keys: Vec<String> = (0..3).map(|i| format!("bypass:{prefix}-old-{i}")).collect();
+        let fresh_keys: Vec<String> = (0..3).map(|i| format!("bypass:{prefix}-fresh-{i}")).collect();
+
+        for (idx, key) in old_keys.iter().enumerate() {
+            map.insert(
+                key.clone(),
+                BypassProfileHealth {
+                    failures: 1,
+                    last_failure_unix: 10 + idx as u64,
+                    ..BypassProfileHealth::default()
+                },
+            );
+        }
+        for (idx, key) in fresh_keys.iter().enumerate() {
+            map.insert(
+                key.clone(),
+                BypassProfileHealth {
+                    successes: 1,
+                    last_success_unix: 9_000_000_000 + idx as u64,
+                    ..BypassProfileHealth::default()
+                },
+            );
+        }
+
+        let (_, removed_profiles) =
+            prune_runtime_classifier_state_for_test(usize::MAX, usize::MAX, 3, 3);
+        assert!(removed_profiles > 0);
+
+        for key in &fresh_keys {
+            assert!(map.contains_key(key));
+        }
+        for key in &old_keys {
+            assert!(!map.contains_key(key));
+        }
     }
 
     #[test]

@@ -24,7 +24,7 @@ impl BlocklistCache {
         }
         let raw = fs::read(path)?;
         if let Ok(parsed) = serde_json::from_slice::<BlocklistCache>(&raw) {
-            return Ok(Some(parsed));
+            return Ok(Some(normalize_cache(parsed)));
         }
 
         // Legacy compatibility: accept `updated_at` string and missing `source`.
@@ -39,6 +39,12 @@ impl BlocklistCache {
             .get("updated_at_unix")
             .and_then(Value::as_u64)
             .or_else(|| {
+                value
+                    .get("updated_at")
+                    .and_then(Value::as_u64)
+                    .or_else(|| value.get("updated_at").and_then(Value::as_i64).map(|v| v.max(0) as u64))
+            })
+            .or_else(|| {
                 value.get("updated_at").and_then(Value::as_str).map(|s| {
                     if s.starts_with("202") {
                         0
@@ -48,17 +54,17 @@ impl BlocklistCache {
                 })
             })
             .unwrap_or(0);
-        let domains = value
+        let domains_raw = value
             .get("domains")
             .and_then(Value::as_array)
             .map(|arr| {
                 arr.iter()
                     .filter_map(Value::as_str)
-                    .map(|v| v.to_ascii_lowercase())
+                    .map(|v| v.to_owned())
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let ips = value
+        let ips_raw = value
             .get("ips")
             .and_then(Value::as_array)
             .map(|arr| {
@@ -68,13 +74,12 @@ impl BlocklistCache {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-
-        Ok(Some(BlocklistCache {
+        Ok(Some(normalize_cache(BlocklistCache {
             source,
             updated_at_unix,
-            domains,
-            ips,
-        }))
+            domains: domains_raw,
+            ips: ips_raw,
+        })))
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -156,31 +161,15 @@ fn parse_entities_from_text(body: &str) -> (Vec<String>, Vec<String>) {
         i1 = i2;
     }
 
-    // Fallback: if we got few domains from a large body, use regex
-    if d1.len() < 20000 && body.len() > 1024 * 1024 {
-        let re_domain =
-            regex::Regex::new(r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\b")
-                .expect("valid regex");
-        for cap in re_domain.captures_iter(body) {
-            let d = cap[0].to_ascii_lowercase();
-            if looks_like_domain(&d) {
-                d1.push(d);
-            }
-        }
-
-        let re_ip =
-            regex::Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").expect("valid regex");
-        for cap in re_ip.captures_iter(body) {
-            let ip = cap[0].to_owned();
-            if ip.parse::<std::net::IpAddr>().is_ok() {
-                i1.push(ip);
-            }
-        }
-    }
-
+    let (d_legacy, i_legacy) = parse_entities_legacy(body);
     if d1.is_empty() && i1.is_empty() {
-        return parse_entities_legacy(body);
+        return (d_legacy, i_legacy);
     }
+    if d_legacy.len() + i_legacy.len() > d1.len() + i1.len() {
+        d1.extend(d_legacy);
+        i1.extend(i_legacy);
+    }
+
     (d1, i1)
 }
 
@@ -251,6 +240,27 @@ fn parse_entities_legacy(body: &str) -> (Vec<String>, Vec<String>) {
     (domains, ips)
 }
 
+fn normalize_cache(mut cache: BlocklistCache) -> BlocklistCache {
+    cache.domains = cache
+        .domains
+        .into_iter()
+        .map(|v| normalize_domain_candidate(&v))
+        .filter(|v| looks_like_domain(v))
+        .collect();
+    cache.domains.sort();
+    cache.domains.dedup();
+
+    cache.ips = cache
+        .ips
+        .into_iter()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| v.parse::<std::net::IpAddr>().is_ok())
+        .collect();
+    cache.ips.sort();
+    cache.ips.dedup();
+    cache
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +306,18 @@ mod tests {
         let (domains, ips) = parse_entities_from_text(body);
         assert_eq!(domains, vec!["example.com"]);
         assert_eq!(ips, vec!["1.1.1.1", "8.8.8.8"]);
+    }
+
+    #[test]
+    fn normalize_cache_sanitizes_domains_and_ips() {
+        let cache = BlocklistCache {
+            source: "x".into(),
+            updated_at_unix: 1,
+            domains: vec!["EXAMPLE.COM".into(), "bad token".into(), "example.com".into()],
+            ips: vec!["1.1.1.1".into(), "not-an-ip".into(), "1.1.1.1".into()],
+        };
+        let normalized = normalize_cache(cache);
+        assert_eq!(normalized.domains, vec!["example.com"]);
+        assert_eq!(normalized.ips, vec!["1.1.1.1"]);
     }
 }

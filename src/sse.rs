@@ -75,6 +75,11 @@ fn upsert_header(headers: &mut Vec<(String, String)>, name: &str, value: String)
     headers.push((name.to_owned(), value));
 }
 
+fn remove_header(headers: &mut Vec<(String, String)>, name: &str) {
+    let name_lc = name.to_ascii_lowercase();
+    headers.retain(|(k, _)| k.to_ascii_lowercase() != name_lc);
+}
+
 struct EventAcc {
     event: Option<String>,
     data: String,
@@ -109,9 +114,8 @@ impl EventAcc {
         // Blank line terminates the event; clear accumulated state unconditionally.
         self.data.clear();
 
-        // Spec: dispatch happens on blank line even if fields are empty, but in practice returning
-        // completely empty events is not useful.
-        if out.event.is_none() && out.id.is_none() && out.retry.is_none() && out.data.is_empty() {
+        // Spec-compliant: dispatch only when event data buffer is non-empty.
+        if out.data.is_empty() {
             None
         } else {
             Some(out)
@@ -127,7 +131,8 @@ async fn run_sse(
     mut stop_rx: oneshot::Receiver<()>,
 ) {
     let mut last_event_id: Option<String> = None;
-    let mut retry = cfg.retry_initial;
+    let mut retry_base = cfg.retry_initial;
+    let mut retry_current = cfg.retry_initial;
 
     loop {
         let mut req = req_template.clone();
@@ -140,6 +145,8 @@ async fn run_sse(
         if cfg.send_last_event_id {
             if let Some(id) = last_event_id.as_deref() {
                 upsert_header(&mut req.headers, "Last-Event-ID", id.to_owned());
+            } else {
+                remove_header(&mut req.headers, "Last-Event-ID");
             }
         }
 
@@ -154,9 +161,9 @@ async fn run_sse(
                     }
                     tokio::select! {
                         _ = &mut stop_rx => return,
-                        _ = tokio::time::sleep(retry) => {}
+                        _ = tokio::time::sleep(retry_current) => {}
                     }
-                    retry = (retry.saturating_mul(2)).min(cfg.retry_max);
+                    retry_current = (retry_current.saturating_mul(2)).min(cfg.retry_max);
                     continue;
                 }
             }
@@ -166,6 +173,7 @@ async fn run_sse(
         let mut reader = tokio::io::BufReader::new(&mut resp.stream);
         let mut acc = EventAcc::new();
         let mut buf: Vec<u8> = Vec::new();
+        let mut stream_had_activity = false;
 
         loop {
             buf.clear();
@@ -180,8 +188,14 @@ async fn run_sse(
                 }
             };
             if n == 0 {
+                if let Some(ev) = acc.take_event() {
+                    if out.send(Ok(ev)).await.is_err() {
+                        return;
+                    }
+                }
                 break; // EOF
             }
+            stream_had_activity = true;
 
             // Trim trailing LF/CRLF.
             while matches!(buf.last(), Some(b'\n' | b'\r')) {
@@ -202,17 +216,6 @@ async fn run_sse(
 
             if line.is_empty() {
                 if let Some(ev) = acc.take_event() {
-                    if let Some(id) = ev.id.as_deref() {
-                        // If `id:` is present with an empty value, it resets the last event id.
-                        last_event_id = if id.is_empty() {
-                            None
-                        } else {
-                            Some(id.to_owned())
-                        };
-                    }
-                    if let Some(r) = ev.retry {
-                        retry = r.max(Duration::from_millis(1)).min(cfg.retry_max);
-                    }
                     if out.send(Ok(ev)).await.is_err() {
                         return;
                     }
@@ -236,11 +239,21 @@ async fn run_sse(
                     acc.data.push_str(value);
                     acc.data.push('\n');
                 }
-                "id" => acc.id = Some(value.to_owned()),
                 "retry" => {
                     if let Ok(ms) = value.trim().parse::<u64>() {
-                        acc.retry = Some(Duration::from_millis(ms));
+                        let retry_value = Duration::from_millis(ms)
+                            .max(Duration::from_millis(1))
+                            .min(cfg.retry_max);
+                        acc.retry = Some(retry_value);
+                        retry_base = retry_value;
+                        retry_current = retry_value;
                     }
+                }
+                "id" => {
+                    let id = value.to_owned();
+                    // Per SSE spec, empty `id:` resets Last-Event-ID even when no event is dispatched.
+                    last_event_id = if id.is_empty() { None } else { Some(id.clone()) };
+                    acc.id = Some(id);
                 }
                 _ => {}
             }
@@ -252,9 +265,13 @@ async fn run_sse(
 
         tokio::select! {
             _ = &mut stop_rx => return,
-            _ = tokio::time::sleep(retry) => {}
+            _ = tokio::time::sleep(retry_current) => {}
         }
-        retry = (retry.saturating_mul(2)).min(cfg.retry_max);
+        if stream_had_activity {
+            retry_current = retry_base;
+        } else {
+            retry_current = (retry_current.saturating_mul(2)).min(cfg.retry_max);
+        }
     }
 }
 
@@ -286,5 +303,41 @@ impl PrimeHttpClient {
             stop_tx: Some(stop_tx),
             _join: join,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{remove_header, EventAcc};
+    use std::time::Duration;
+
+    #[test]
+    fn event_acc_does_not_emit_id_only_event() {
+        let mut acc = EventAcc::new();
+        acc.id = Some("123".to_owned());
+        assert!(acc.take_event().is_none());
+    }
+
+    #[test]
+    fn event_acc_emits_when_data_present() {
+        let mut acc = EventAcc::new();
+        acc.id = Some("123".to_owned());
+        acc.retry = Some(Duration::from_millis(500));
+        acc.data.push_str("hello\n");
+        let ev = acc.take_event().expect("event");
+        assert_eq!(ev.data, "hello");
+        assert_eq!(ev.id.as_deref(), Some("123"));
+        assert_eq!(ev.retry, Some(Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn remove_header_is_case_insensitive() {
+        let mut headers = vec![
+            ("Last-Event-ID".to_owned(), "42".to_owned()),
+            ("Accept".to_owned(), "text/event-stream".to_owned()),
+        ];
+        remove_header(&mut headers, "last-event-id");
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, "Accept");
     }
 }

@@ -199,7 +199,9 @@ fn extract_sha256_from_text(s: &str) -> Option<String> {
 
 fn should_fallback_from_ech(err: &EngineError) -> bool {
     match err {
-        EngineError::Http(e) => e.is_connect() || e.is_timeout(),
+        // Do not fallback on timeouts: hostile middleboxes can force ECH downgrade by
+        // injecting delays/timeouts. Allow fallback only for hard connect-layer failures.
+        EngineError::Http(e) => e.is_connect() && !e.is_timeout(),
         _ => false,
     }
 }
@@ -222,8 +224,6 @@ fn build_reqwest_client(
     // (Reqwest's high-level builder API doesn't expose ALPN, and ECH requires rustls config.)
     builder = builder.use_preconfigured_tls(tls);
     builder = pool.apply(builder);
-    // Keep behavior deterministic across environments/CI: only use proxy when explicitly configured.
-    builder = builder.no_proxy();
     if let Some(proxy_cfg) = &cfg.proxy {
         builder = builder.proxy(proxy_cfg.as_reqwest_proxy()?);
     }

@@ -236,7 +236,9 @@ impl DirectOutbound {
             }
         };
         let _ = tcp.set_nodelay(true);
-        let _ = set_socket_ttl_low(&tcp, self.first_packet_ttl);
+        if should_apply_low_ttl(addr.ip(), self.first_packet_ttl) {
+            let _ = set_socket_ttl_low(&tcp, self.first_packet_ttl);
+        }
         debug!(target: "outbound.direct", destination = %target_label, upstream = %addr, "Direct outbound connected");
         Ok(Box::new(tcp))
     }
@@ -476,6 +478,20 @@ fn is_unspecified_ip(ip: IpAddr) -> bool {
     }
 }
 
+fn should_apply_low_ttl(ip: IpAddr, ttl: u8) -> bool {
+    if ttl == 0 {
+        return false;
+    }
+    if ttl >= 32 {
+        // Non-aggressive TTL values are generally safe for normal routing.
+        return true;
+    }
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local(),
+    }
+}
+
 impl OutboundConnector for DirectOutbound {
     fn connect<'a>(
         &'a self,
@@ -550,5 +566,23 @@ mod tests {
         assert_eq!(deduped[0].to_string(), "1.1.1.1");
         assert_eq!(deduped[1].to_string(), "2001:db8::1");
         assert_eq!(deduped[2].to_string(), "8.8.8.8");
+    }
+
+    #[test]
+    fn low_ttl_is_not_applied_to_public_ip_with_aggressive_value() {
+        let ip: IpAddr = "8.8.8.8".parse().expect("ip");
+        assert!(!should_apply_low_ttl(ip, 3));
+    }
+
+    #[test]
+    fn low_ttl_is_applied_to_private_ip() {
+        let ip: IpAddr = "192.168.1.10".parse().expect("ip");
+        assert!(should_apply_low_ttl(ip, 3));
+    }
+
+    #[test]
+    fn non_aggressive_ttl_is_applied_even_for_public_ip() {
+        let ip: IpAddr = "8.8.8.8".parse().expect("ip");
+        assert!(should_apply_low_ttl(ip, 64));
     }
 }

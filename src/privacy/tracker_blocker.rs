@@ -90,6 +90,8 @@ impl TrackerBlocker {
             })?;
             parse_custom_list(&raw, &mut domains, &mut keywords);
         }
+        keywords.sort();
+        keywords.dedup();
 
         let allowlist = cfg
             .allowlist
@@ -119,16 +121,14 @@ impl TrackerBlocker {
             return None;
         }
 
-        for rule in &self.domains {
-            if host == *rule || host.ends_with(&format!(".{rule}")) {
-                return Some(TrackerBlockMatch {
-                    host,
-                    matched_rule: rule.clone(),
-                });
-            }
+        if let Some(rule) = self.match_domain_rule(&host) {
+            return Some(TrackerBlockMatch {
+                host,
+                matched_rule: rule.to_owned(),
+            });
         }
 
-        let url_lc = url.as_str().to_ascii_lowercase();
+        let url_lc = normalize_url_for_keyword_match(url);
         for keyword in &self.keywords {
             if url_lc.contains(keyword) {
                 return Some(TrackerBlockMatch {
@@ -140,10 +140,33 @@ impl TrackerBlocker {
         None
     }
 
+    fn match_domain_rule<'a>(&'a self, host: &str) -> Option<&'a str> {
+        if let Some(rule) = self.domains.get(host) {
+            return Some(rule.as_str());
+        }
+        let mut pos = 0usize;
+        while let Some(dot) = host[pos..].find('.') {
+            pos += dot + 1;
+            let suffix = &host[pos..];
+            if let Some(rule) = self.domains.get(suffix) {
+                return Some(rule.as_str());
+            }
+        }
+        None
+    }
+
     fn is_allowlisted(&self, host: &str) -> bool {
-        self.allowlist
-            .iter()
-            .any(|d| host == d || host.ends_with(&format!(".{d}")))
+        if self.allowlist.contains(host) {
+            return true;
+        }
+        let mut pos = 0usize;
+        while let Some(dot) = host[pos..].find('.') {
+            pos += dot + 1;
+            if self.allowlist.contains(&host[pos..]) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -168,6 +191,10 @@ fn parse_custom_list(raw: &str, domains: &mut HashSet<String>, keywords: &mut Ve
             || line.starts_with('#')
             || line.starts_with('!')
             || line.starts_with('[')
+            || line.starts_with("@@") // exception rules: do not parse as block entries
+            || line.contains("##") // cosmetic filters
+            || line.contains("#@#")
+            || line.contains("#?#")
         {
             continue;
         }
@@ -230,6 +257,37 @@ fn normalize_domain(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn normalize_url_for_keyword_match(url: &Url) -> String {
+    let raw = url.as_str().to_ascii_lowercase();
+    decode_percent_encoded(&raw)
+}
+
+fn decode_percent_encoded(input: &str) -> String {
+    fn hex(v: u8) -> Option<u8> {
+        match v {
+            b'0'..=b'9' => Some(v - b'0'),
+            b'a'..=b'f' => Some(v - b'a' + 10),
+            b'A'..=b'F' => Some(v - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,5 +325,22 @@ mod tests {
             .expect("enabled");
         let url = Url::parse("https://www.google-analytics.com/collect?v=2").expect("url");
         assert!(blocker.matches(&url).is_none());
+    }
+
+    #[test]
+    fn matches_percent_encoded_keyword() {
+        let cfg = TrackerBlockerConfig {
+            enabled: true,
+            lists: Vec::new(),
+            custom_lists: Vec::new(),
+            mode: TrackerBlockerMode::Block,
+            on_block: TrackerBlockAction::Error,
+            allowlist: Vec::new(),
+        };
+        let blocker = TrackerBlocker::from_config(&cfg)
+            .expect("blocker")
+            .expect("enabled");
+        let url = Url::parse("https://example.com/a%6ealytics.js").expect("url");
+        assert!(blocker.matches(&url).is_some());
     }
 }

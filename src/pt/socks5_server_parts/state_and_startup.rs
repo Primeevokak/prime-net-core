@@ -334,6 +334,25 @@ impl Socks5ServerGuard {
     }
 }
 
+pub(super) fn validate_relay_topology(
+    listen_addr: SocketAddr,
+    relay_opts: &RelayOptions,
+) -> Result<()> {
+    if relay_opts.upstream_socks5 == Some(listen_addr) {
+        return Err(EngineError::Config(format!(
+            "invalid relay topology: upstream_socks5 points to local SOCKS5 listener ({listen_addr}), causing a forwarding loop"
+        )));
+    }
+    if relay_opts.bypass_socks5 == Some(listen_addr)
+        || relay_opts.bypass_socks5_pool.contains(&listen_addr)
+    {
+        return Err(EngineError::Config(format!(
+            "invalid relay topology: bypass_socks5 points to local SOCKS5 listener ({listen_addr}), causing a forwarding loop"
+        )));
+    }
+    Ok(())
+}
+
 pub async fn start_socks5_server(
     bind: &str,
     outbound: Arc<dyn OutboundConnector>,
@@ -342,6 +361,7 @@ pub async fn start_socks5_server(
 ) -> Result<Socks5ServerGuard> {
     let listener = TcpListener::bind(bind).await.map_err(EngineError::Io)?;
     let listen_addr = listener.local_addr().map_err(EngineError::Io)?;
+    validate_relay_topology(listen_addr, &relay_opts)?;
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
 
     let relay_opts = Arc::new(relay_opts);

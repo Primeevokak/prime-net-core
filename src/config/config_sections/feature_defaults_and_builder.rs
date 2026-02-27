@@ -293,7 +293,7 @@ pub struct TrojanPtConfig {
 }
 
 fn default_trojan_alpn() -> Vec<String> {
-    vec!["http/1.1".to_owned()]
+    vec!["h2".to_owned(), "http/1.1".to_owned()]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

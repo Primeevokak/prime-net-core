@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -72,6 +72,9 @@ pub struct Timestamps {
 }
 
 impl ConnectionTracker {
+    const MAX_CONNECTIONS: usize = 4096;
+    const KEEP_CONNECTIONS: usize = 3072;
+
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(1024);
         Self {
@@ -107,6 +110,7 @@ impl ConnectionTracker {
             error: None,
         };
         self.connections.write().insert(id, info.clone());
+        self.prune_if_needed();
         let _ = self.tx.send(info);
     }
 
@@ -121,6 +125,7 @@ impl ConnectionTracker {
             }
             let _ = self.tx.send(conn.clone());
         }
+        self.prune_if_needed();
     }
 
     pub fn update_dns(&self, id: u64, dns: DnsInfo) {
@@ -161,7 +166,57 @@ impl ConnectionTracker {
             conn.timestamps.completed_at = Some(SystemTime::now());
             let _ = self.tx.send(conn.clone());
         }
+        self.prune_if_needed();
     }
+
+    fn prune_if_needed(&self) {
+        let mut guard = self.connections.write();
+        if guard.len() <= Self::MAX_CONNECTIONS {
+            return;
+        }
+
+        let mut terminal_ids: Vec<(u64, u128)> = guard
+            .iter()
+            .filter_map(|(id, conn)| {
+                if matches!(
+                    conn.status,
+                    ConnectionStatus::Completed | ConnectionStatus::Failed
+                ) {
+                    Some((*id, completion_key(conn)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        terminal_ids.sort_unstable_by_key(|(_, key)| *key);
+        for (id, _) in terminal_ids {
+            if guard.len() <= Self::KEEP_CONNECTIONS {
+                break;
+            }
+            guard.remove(&id);
+        }
+
+        if guard.len() > Self::KEEP_CONNECTIONS {
+            let mut all_ids: Vec<u64> = guard.keys().copied().collect();
+            all_ids.sort_unstable();
+            for id in all_ids {
+                if guard.len() <= Self::KEEP_CONNECTIONS {
+                    break;
+                }
+                guard.remove(&id);
+            }
+        }
+    }
+}
+
+fn completion_key(conn: &ConnectionInfo) -> u128 {
+    let ts = conn
+        .timestamps
+        .completed_at
+        .unwrap_or(conn.timestamps.queued_at);
+    ts.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 impl Default for ConnectionTracker {
@@ -174,4 +229,24 @@ pub static GLOBAL_CONNECTION_TRACKER: Lazy<ConnectionTracker> = Lazy::new(Connec
 
 pub fn global_connection_tracker() -> ConnectionTracker {
     GLOBAL_CONNECTION_TRACKER.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prune_keeps_tracker_bounded() {
+        let tracker = ConnectionTracker::new();
+        let total = ConnectionTracker::MAX_CONNECTIONS + 64;
+        for id in 1..=total as u64 {
+            tracker.begin(id, format!("https://example.com/{id}"));
+            tracker.update_status(id, ConnectionStatus::Completed);
+        }
+
+        let guard = tracker.connections.read();
+        assert!(guard.len() <= ConnectionTracker::MAX_CONNECTIONS);
+        assert!(guard.len() < total);
+        assert!(guard.contains_key(&(total as u64)));
+    }
 }

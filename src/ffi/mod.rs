@@ -3,6 +3,7 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use reqwest::Method;
@@ -46,6 +47,13 @@ struct PrimeRequestHandleInner {
     tx: std::sync::mpsc::Sender<Result<ResponseData, EngineError>>,
     status: Arc<AtomicU8>,
     abort: parking_lot::Mutex<Option<AbortHandle>>,
+    abort_rx: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<AbortHandle>>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RequestLifecycle {
+    in_flight: u32,
+    freed: bool,
 }
 
 struct FfiTask {
@@ -64,6 +72,11 @@ enum EngineMsg {
 struct PrimeEngineHandle {
     msg_tx: tokio::sync::mpsc::UnboundedSender<EngineMsg>,
     worker: Option<std::thread::JoinHandle<()>>,
+}
+
+struct PrimeEngineOpaque {
+    magic: u64,
+    handle: PrimeEngineHandle,
 }
 
 impl Drop for PrimeEngineHandle {
@@ -110,13 +123,131 @@ const PRIME_ERR_NULL_PTR: i32 = 1;
 const PRIME_ERR_INVALID_UTF8: i32 = 2;
 const PRIME_ERR_INVALID_REQUEST: i32 = 3;
 const PRIME_ERR_RUNTIME: i32 = 4;
+const PRIME_ENGINE_MAGIC: u64 = 0x5052_494D_455F_454E; // "PRIME_EN"
+static REQUEST_LIFECYCLE: OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<usize, RequestLifecycle>>,
+> = OnceLock::new();
+
+fn request_lifecycle_map(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<usize, RequestLifecycle>> {
+    REQUEST_LIFECYCLE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn register_request_handle(ptr: *mut PrimeRequestHandle) {
+    request_lifecycle_map()
+        .lock()
+        .insert(ptr as usize, RequestLifecycle::default());
+}
+
+fn begin_request_op(ptr: *mut PrimeRequestHandle) -> bool {
+    if ptr.is_null() {
+        return false;
+    }
+    let mut guard = request_lifecycle_map().lock();
+    let Some(state) = guard.get_mut(&(ptr as usize)) else {
+        return false;
+    };
+    if state.freed {
+        return false;
+    }
+    state.in_flight = state.in_flight.saturating_add(1);
+    true
+}
+
+fn end_request_op(ptr: *mut PrimeRequestHandle) -> bool {
+    let mut guard = request_lifecycle_map().lock();
+    let Some(state) = guard.get_mut(&(ptr as usize)) else {
+        return false;
+    };
+    state.in_flight = state.in_flight.saturating_sub(1);
+    if state.freed && state.in_flight == 0 {
+        guard.remove(&(ptr as usize));
+        return true;
+    }
+    false
+}
+
+fn try_hydrate_abort_handle(inner: &PrimeRequestHandleInner) {
+    if inner.abort.lock().is_some() {
+        return;
+    }
+    let mut rx_slot = inner.abort_rx.lock();
+    let Some(rx) = rx_slot.as_ref() else {
+        return;
+    };
+    match rx.try_recv() {
+        Ok(abort) => {
+            *inner.abort.lock() = Some(abort);
+            *rx_slot = None;
+        }
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            *rx_slot = None;
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+    }
+}
+
+fn mark_request_freed(ptr: *mut PrimeRequestHandle) {
+    let mut guard = request_lifecycle_map().lock();
+    if let Some(state) = guard.get_mut(&(ptr as usize)) {
+        state.freed = true;
+    }
+}
+
+struct RequestOpGuard {
+    ptr: *mut PrimeRequestHandle,
+    active: bool,
+}
+
+impl RequestOpGuard {
+    fn acquire(ptr: *mut PrimeRequestHandle) -> Option<Self> {
+        if !begin_request_op(ptr) {
+            return None;
+        }
+        Some(Self { ptr, active: true })
+    }
+
+    fn finish(&mut self) -> bool {
+        if !self.active {
+            return false;
+        }
+        self.active = false;
+        end_request_op(self.ptr)
+    }
+}
+
+impl Drop for RequestOpGuard {
+    fn drop(&mut self) {
+        if self.finish() {
+            // SAFETY: lifecycle map guarantees single final drop point.
+            unsafe {
+                drop(Box::from_raw(self.ptr as *mut PrimeRequestHandleInner));
+            }
+        }
+    }
+}
+
+unsafe fn engine_from_ptr<'a>(engine: *mut PrimeEngine) -> Option<&'a PrimeEngineHandle> {
+    if engine.is_null() {
+        return None;
+    }
+    // SAFETY: caller provides an opaque pointer from FFI boundary.
+    let opaque = unsafe { &*(engine as *mut PrimeEngineOpaque) };
+    if opaque.magic != PRIME_ENGINE_MAGIC {
+        return None;
+    }
+    Some(&opaque.handle)
+}
 
 #[no_mangle]
 pub extern "C" fn prime_engine_new(config_path: *const c_char) -> *mut PrimeEngine {
     ffi_guard("prime_engine_new", ptr::null_mut, || {
         let result = create_engine(config_path);
         match result {
-            Ok(handle) => Box::into_raw(Box::new(handle)) as *mut PrimeEngine,
+            Ok(handle) => Box::into_raw(Box::new(PrimeEngineOpaque {
+                magic: PRIME_ENGINE_MAGIC,
+                handle,
+            })) as *mut PrimeEngine,
             Err(err) => {
                 set_last_error(err);
                 ptr::null_mut()
@@ -136,9 +267,16 @@ pub unsafe extern "C" fn prime_engine_free(engine: *mut PrimeEngine) {
             if engine.is_null() {
                 return;
             }
-            // SAFETY: pointer was created by prime_engine_new and is unique here.
+            let opaque = engine as *mut PrimeEngineOpaque;
             unsafe {
-                let _ = Box::from_raw(engine as *mut PrimeEngineHandle);
+                if (*opaque).magic != PRIME_ENGINE_MAGIC {
+                    set_last_error(EngineError::InvalidInput(
+                        "invalid PrimeEngine handle pointer".to_owned(),
+                    ));
+                    return;
+                }
+                (*opaque).magic = 0;
+                let _ = Box::from_raw(opaque);
             }
         },
     );
@@ -188,7 +326,9 @@ pub unsafe extern "C" fn prime_engine_fetch(
                 None
             };
 
-            let eng = unsafe { &*(engine as *mut PrimeEngineHandle) };
+            let Some(eng) = (unsafe { engine_from_ptr(engine) }) else {
+                return pack_error(PRIME_ERR_INVALID_REQUEST, "invalid engine handle pointer");
+            };
             let (tx, rx) = std::sync::mpsc::channel();
             let (abort_tx, _abort_rx) = std::sync::mpsc::channel::<AbortHandle>();
             let status = Arc::new(AtomicU8::new(PrimeRequestStatus::PENDING as u8));
@@ -253,8 +393,13 @@ pub unsafe extern "C" fn prime_engine_fetch_async(
             None
         };
 
-        // SAFETY: validated non-null pointer created by prime_engine_new.
-        let eng = unsafe { &*(engine as *mut PrimeEngineHandle) };
+        // SAFETY: pointer validation includes magic check.
+        let Some(eng) = (unsafe { engine_from_ptr(engine) }) else {
+            set_last_error(EngineError::InvalidInput(
+                "invalid engine handle pointer".to_owned(),
+            ));
+            return ptr::null_mut();
+        };
 
         let (tx, rx) = std::sync::mpsc::channel();
         let (abort_tx, abort_rx) = std::sync::mpsc::channel::<AbortHandle>();
@@ -274,23 +419,32 @@ pub unsafe extern "C" fn prime_engine_fetch_async(
         }
 
         let abort = match abort_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(v) => v,
+            Ok(v) => Some(v),
             Err(_) => {
+                // Do not drop the request on this edge case: return a live handle so caller
+                // can still wait for completion and avoid orphaned background work.
                 set_last_error(EngineError::Internal(
-                    "engine did not acknowledge async request (abort handle missing)".to_owned(),
+                    "engine did not acknowledge async request in time; continuing without abort handle"
+                        .to_owned(),
                 ));
-                // We don't have the handle yet, but the task is likely already running.
-                // This is a rare edge case, but we should log it.
-                return ptr::null_mut();
+                None
             }
         };
+        let abort_rx = if abort.is_some() {
+            None
+        } else {
+            Some(abort_rx)
+        };
 
-        Box::into_raw(Box::new(PrimeRequestHandleInner {
+        let ptr = Box::into_raw(Box::new(PrimeRequestHandleInner {
             rx: parking_lot::Mutex::new(rx),
             tx,
             status,
-            abort: parking_lot::Mutex::new(Some(abort)),
-        })) as *mut PrimeRequestHandle
+            abort: parking_lot::Mutex::new(abort),
+            abort_rx: parking_lot::Mutex::new(abort_rx),
+        })) as *mut PrimeRequestHandle;
+        register_request_handle(ptr);
+        ptr
     })
 }
 
@@ -314,6 +468,12 @@ pub unsafe extern "C" fn prime_request_wait(
             if handle.is_null() {
                 return pack_error(PRIME_ERR_NULL_PTR, "request handle pointer is null");
             }
+            let Some(_guard) = RequestOpGuard::acquire(handle) else {
+                return pack_error(
+                    PRIME_ERR_INVALID_REQUEST,
+                    "request handle is freed or invalid",
+                );
+            };
             // SAFETY: pointer was allocated by prime_engine_fetch_async.
             let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
 
@@ -383,6 +543,9 @@ pub unsafe extern "C" fn prime_request_cancel(handle: *mut PrimeRequestHandle) -
             if handle.is_null() {
                 return PRIME_ERR_NULL_PTR;
             }
+            let Some(_guard) = RequestOpGuard::acquire(handle) else {
+                return PRIME_ERR_INVALID_REQUEST;
+            };
             // SAFETY: pointer was allocated by prime_engine_fetch_async.
             let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
 
@@ -398,6 +561,7 @@ pub unsafe extern "C" fn prime_request_cancel(handle: *mut PrimeRequestHandle) -
             inner
                 .status
                 .store(PrimeRequestStatus::CANCELLED as u8, Ordering::SeqCst);
+            try_hydrate_abort_handle(inner);
 
             if let Some(abort) = inner.abort.lock().as_ref() {
                 abort.abort();
@@ -426,6 +590,9 @@ pub unsafe extern "C" fn prime_request_status(
             if handle.is_null() {
                 return PrimeRequestStatus::FAILED;
             }
+            let Some(_guard) = RequestOpGuard::acquire(handle) else {
+                return PrimeRequestStatus::FAILED;
+            };
             // SAFETY: pointer was allocated by prime_engine_fetch_async.
             let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
             match inner.status.load(Ordering::SeqCst) {
@@ -450,10 +617,33 @@ pub unsafe extern "C" fn prime_request_free(handle: *mut PrimeRequestHandle) {
             if handle.is_null() {
                 return;
             }
+            let Some(mut guard) = RequestOpGuard::acquire(handle) else {
+                return;
+            };
             // Best-effort: cancel underlying task to avoid background network activity after handle free.
-            let _ = unsafe { prime_request_cancel(handle) };
-            unsafe {
-                drop(Box::from_raw(handle as *mut PrimeRequestHandleInner));
+            let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
+            let cur = inner.status.load(Ordering::SeqCst);
+            if cur != PrimeRequestStatus::COMPLETED as u8
+                && cur != PrimeRequestStatus::FAILED as u8
+                && cur != PrimeRequestStatus::CANCELLED as u8
+            {
+                inner
+                    .status
+                    .store(PrimeRequestStatus::CANCELLED as u8, Ordering::SeqCst);
+                try_hydrate_abort_handle(inner);
+                if let Some(abort) = inner.abort.lock().as_ref() {
+                    abort.abort();
+                }
+                let _ = inner
+                    .tx
+                    .send(Err(EngineError::Internal("cancelled".to_owned())));
+            }
+            mark_request_freed(handle);
+            if guard.finish() {
+                // SAFETY: lifecycle map guarantees single final drop point.
+                unsafe {
+                    drop(Box::from_raw(handle as *mut PrimeRequestHandleInner));
+                }
             }
         },
     );
@@ -710,7 +900,18 @@ where
 }
 
 fn to_cstring(value: &str) -> Option<CString> {
-    CString::new(value.replace('\0', " ")).ok()
+    if !value.as_bytes().contains(&0) {
+        return CString::new(value).ok();
+    }
+    let mut sanitized = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch == '\0' {
+            sanitized.push(' ');
+        } else {
+            sanitized.push(ch);
+        }
+    }
+    CString::new(sanitized).ok()
 }
 
 fn error_code_from(error: &EngineError) -> i32 {
@@ -719,5 +920,43 @@ fn error_code_from(error: &EngineError) -> i32 {
         EngineError::Utf8(_) | EngineError::Ffi(_) => PRIME_ERR_INVALID_UTF8,
         EngineError::InvalidInput(_) | EngineError::Config(_) => PRIME_ERR_INVALID_REQUEST,
         _ => PRIME_ERR_RUNTIME,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_handle() -> *mut PrimeRequestHandle {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ptr = Box::into_raw(Box::new(PrimeRequestHandleInner {
+            rx: parking_lot::Mutex::new(rx),
+            tx,
+            status: Arc::new(AtomicU8::new(PrimeRequestStatus::PENDING as u8)),
+            abort: parking_lot::Mutex::new(None),
+            abort_rx: parking_lot::Mutex::new(None),
+        })) as *mut PrimeRequestHandle;
+        register_request_handle(ptr);
+        ptr
+    }
+
+    #[test]
+    fn request_lifecycle_prevents_new_ops_after_free_mark() {
+        let ptr = make_handle();
+        assert!(begin_request_op(ptr));
+        mark_request_freed(ptr);
+        assert!(!begin_request_op(ptr));
+        // First end: in_flight goes to zero and object becomes droppable.
+        assert!(end_request_op(ptr));
+        // SAFETY: lifecycle reached terminal state, this is final drop.
+        unsafe {
+            drop(Box::from_raw(ptr as *mut PrimeRequestHandleInner));
+        }
+    }
+
+    #[test]
+    fn to_cstring_sanitizes_nul_bytes() {
+        let s = to_cstring("a\0b").expect("cstring");
+        assert_eq!(s.to_str().expect("utf8"), "a b");
     }
 }

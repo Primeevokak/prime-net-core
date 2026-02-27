@@ -1,18 +1,14 @@
-use std::collections::{HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration};
 use std::fs;
 use std::sync::{Mutex, OnceLock};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 use prime_net_engine_core::error::{EngineError, Result};
-use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tracing::{info, warn};
 
-static RELEASE_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
 static RELEASE_ASSET_SHA256_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
 const PACKET_BYPASS_REPO: &str = "hufrea/byedpi";
 const PACKET_BYPASS_STABLE_TAG: &str = "v0.17.3";
@@ -34,6 +30,13 @@ impl Drop for PacketBypassGuard {
     fn drop(&mut self) {
         for mut child in self.children.drain(..) {
             let _ = child.start_kill();
+            for _ in 0..20 {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                    Err(_) => break,
+                }
+            }
         }
         for task in self.log_tasks.drain(..) {
             task.abort();
@@ -67,7 +70,7 @@ pub async fn maybe_start_packet_bypass(
     let mut last_err: Option<EngineError> = None;
 
     for profile in profiles {
-        match start_packet_bypass_process(&bin, &profile).await {
+        match start_packet_bypass_process_with_port_retry(&bin, &profile).await {
             Ok((child, mut tasks, socks5_port)) => {
                 children.push(child);
                 log_tasks.append(&mut tasks);
@@ -101,19 +104,7 @@ pub fn candidate_binary_names() -> Vec<String> {
 }
 
 pub async fn build_mirror_urls(_name: &str) -> Vec<String> {
-    let tag = if let Ok(v) = std::env::var("PRIME_PACKET_BYPASS_TAG") {
-        let pinned = v.trim().to_owned();
-        if pinned.is_empty() {
-            PACKET_BYPASS_STABLE_TAG.to_owned()
-        } else {
-            pinned
-        }
-    } else {
-        match get_latest_release_tag(PACKET_BYPASS_REPO).await {
-            Ok(Some(t)) => t,
-            _ => PACKET_BYPASS_STABLE_TAG.to_owned(),
-        }
-    };
+    let tag = resolve_packet_bypass_tag().await;
     let version = release_asset_version(&tag);
     let compact = version.replace('.', "");
     let mut assets = Vec::new();
@@ -134,6 +125,32 @@ pub async fn build_mirror_urls(_name: &str) -> Vec<String> {
         .collect()
 }
 
+async fn resolve_packet_bypass_tag() -> String {
+    if let Ok(v) = std::env::var("PRIME_PACKET_BYPASS_TAG") {
+        let pinned = v.trim();
+        if !pinned.is_empty() {
+            return pinned.to_owned();
+        }
+    }
+    // Strict trust mode: pin to stable tag by default.
+    // Explicit custom pin is still allowed via PRIME_PACKET_BYPASS_TAG.
+    if env_flag_enabled("PRIME_PACKET_BYPASS_USE_LATEST") {
+        warn!(
+            target: "packet_bypass",
+            env = "PRIME_PACKET_BYPASS_USE_LATEST",
+            stable = PACKET_BYPASS_STABLE_TAG,
+            "ignoring latest-tag auto-discovery in strict trust mode; use PRIME_PACKET_BYPASS_TAG to pin an explicit tag"
+        );
+    }
+    PACKET_BYPASS_STABLE_TAG.to_owned()
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 fn release_asset_version(tag: &str) -> String {
     let trimmed = tag.trim().trim_start_matches(['v', 'V']);
     if trimmed.is_empty() {
@@ -151,22 +168,6 @@ fn release_asset_version(tag: &str) -> String {
         return parts.join(".");
     }
     trimmed.to_owned()
-}
-
-async fn get_latest_release_tag(repo: &str) -> Result<Option<String>> {
-    {
-        let cache = RELEASE_CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-        if let Some(tag) = cache.get(repo) { return Ok(tag.clone()); }
-    }
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let client = reqwest::Client::builder().user_agent("prime-net-engine").build().map_err(|e| EngineError::Config(e.to_string()))?;
-    let resp = client.get(url).send().await.map_err(|e| EngineError::Config(e.to_string()))?;
-    if !resp.status().is_success() { return Ok(None); }
-    let json: Value = resp.json().await.map_err(|e| EngineError::Config(e.to_string()))?;
-    let tag = json["tag_name"].as_str().map(|s| s.to_owned());
-    let mut cache = RELEASE_CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-    cache.insert(repo.to_owned(), tag.clone());
-    Ok(tag)
 }
 
 pub fn release_asset_sha256_hex(url: &str) -> Option<String> {
@@ -306,7 +307,11 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
 async fn start_packet_bypass_process(bin: &Path, profile: &PacketBypassProfile) -> Result<(Child, Vec<tokio::task::JoinHandle<()>>, Option<u16>)> {
     let socks5_port = parse_port_arg(&profile.args);
     let mut cmd = Command::new(bin);
-    cmd.args(&profile.args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).stdin(std::process::Stdio::null());
+    cmd.args(&profile.args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
     let mut child = cmd.spawn().map_err(EngineError::Io)?;
     let mut log_tasks = Vec::new();
     if let Some(stdout) = child.stdout.take() {
@@ -326,6 +331,27 @@ async fn start_packet_bypass_process(bin: &Path, profile: &PacketBypassProfile) 
     tokio::time::sleep(Duration::from_millis(1000)).await;
     if let Some(status) = child.try_wait().map_err(EngineError::Io)? { return Err(EngineError::Config(format!("profile {} exited with {}", profile.name, status))); }
     Ok((child, log_tasks, socks5_port))
+}
+
+async fn start_packet_bypass_process_with_port_retry(
+    bin: &Path,
+    profile: &PacketBypassProfile,
+) -> Result<(Child, Vec<tokio::task::JoinHandle<()>>, Option<u16>)> {
+    let mut candidate = profile.clone();
+    let has_port = parse_port_arg(&candidate.args).is_some();
+    let mut last_err: Option<EngineError> = None;
+    for attempt in 0..3 {
+        if attempt > 0 && has_port {
+            set_port_arg(&mut candidate.args, find_free_port());
+        }
+        match start_packet_bypass_process(bin, &candidate).await {
+            Ok(v) => return Ok(v),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        EngineError::Config("packet bypass process failed to start".to_owned())
+    }))
 }
 
 fn bootstrap_install_dir() -> Result<PathBuf> {
@@ -365,5 +391,22 @@ mod tests {
         assert_eq!(parsed[1].name, "env-2");
         assert!(parsed[0].args.iter().any(|a| a == "--fake"));
         assert!(parsed[1].args.iter().any(|a| a == "--split"));
+    }
+
+    #[tokio::test]
+    async fn resolve_packet_bypass_tag_uses_stable_by_default() {
+        std::env::remove_var("PRIME_PACKET_BYPASS_TAG");
+        std::env::remove_var("PRIME_PACKET_BYPASS_USE_LATEST");
+        let tag = resolve_packet_bypass_tag().await;
+        assert_eq!(tag, PACKET_BYPASS_STABLE_TAG);
+    }
+
+    #[tokio::test]
+    async fn resolve_packet_bypass_tag_ignores_use_latest_in_strict_mode() {
+        std::env::remove_var("PRIME_PACKET_BYPASS_TAG");
+        std::env::set_var("PRIME_PACKET_BYPASS_USE_LATEST", "1");
+        let tag = resolve_packet_bypass_tag().await;
+        assert_eq!(tag, PACKET_BYPASS_STABLE_TAG);
+        std::env::remove_var("PRIME_PACKET_BYPASS_USE_LATEST");
     }
 }

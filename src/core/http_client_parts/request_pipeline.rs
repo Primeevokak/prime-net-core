@@ -151,7 +151,8 @@ impl PrimeHttpClient {
             return false;
         };
         let url = format!("https://{front_domain}/");
-        let req = self.client_plain.head(url).header(HOST, host_header);
+        let (client, _) = self.select_client_for_host(Some(real_host)).await;
+        let req = client.head(url).header(HOST, host_header);
 
         let timeout = Duration::from_secs(
             self.config
@@ -196,12 +197,6 @@ impl PrimeHttpClient {
 
         let parsed = Url::parse(&request.url)?;
         let host = parsed.host_str().map(|v| v.to_ascii_lowercase());
-
-        // Explicit DNS resolve via configured chain (best-effort): this avoids leaking to system DNS
-        // when DoH is available, and provides a controlled fallback order.
-        if let Some(h) = host.as_deref() {
-            let _ = self.resolver_chain.resolve(h).await;
-        }
 
         let evasion = self.effective_evasion_strategy();
         match evasion {

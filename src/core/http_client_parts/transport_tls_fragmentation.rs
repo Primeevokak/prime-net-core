@@ -1,4 +1,6 @@
 impl PrimeHttpClient {
+    const ECH_REAL_CACHE_MAX_ENTRIES: usize = 128;
+
     async fn select_client_for_host(&self, host: Option<&str>) -> (reqwest::Client, bool) {
         let Some(mode) = self.config.anticensorship.effective_ech_mode() else {
             return (self.client_plain.clone(), false);
@@ -80,9 +82,13 @@ impl PrimeHttpClient {
             Err(_) => return None,
         };
 
-        self.client_ech_real_cache
-            .lock()
-            .insert(host, client.clone());
+        let mut cache = self.client_ech_real_cache.lock();
+        if cache.len() >= Self::ECH_REAL_CACHE_MAX_ENTRIES {
+            if let Some(old_key) = cache.keys().next().cloned() {
+                cache.remove(&old_key);
+            }
+        }
+        cache.insert(host, client.clone());
         Some(client)
     }
 
@@ -267,7 +273,7 @@ impl PrimeHttpClient {
         let tcp = if let Some(proxy) = &self.config.proxy {
             match proxy.kind {
                 crate::config::ProxyKind::Socks5 => {
-                    Self::connect_via_socks5(&proxy.address, &host, port).await?
+                    self.connect_via_socks5(&proxy.address, &host, port).await?
                 }
                 _ => {
                     return Err(EngineError::Config(
@@ -388,82 +394,130 @@ impl PrimeHttpClient {
         }
     }
 
-    async fn connect_via_socks5(proxy_addr: &str, host: &str, port: u16) -> Result<TcpStream> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    fn normalize_proxy_host_port(
+        s: &str,
+    ) -> Result<(String, u16, Option<String>, Option<String>)> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(EngineError::Config("proxy.address is empty".to_owned()));
+        }
 
-        fn normalize_proxy_host_port(
-            s: &str,
-        ) -> Result<(String, u16, Option<String>, Option<String>)> {
-            let s = s.trim();
-            if s.is_empty() {
-                return Err(EngineError::Config("proxy.address is empty".to_owned()));
-            }
+        if s.contains("://") {
+            let url = Url::parse(s)?;
+            let user = if !url.username().is_empty() {
+                Some(url.username().to_owned())
+            } else {
+                None
+            };
+            let pass = url.password().map(|v| v.to_owned());
+            let host = url
+                .host_str()
+                .ok_or_else(|| EngineError::Config("proxy.address URL missing host".to_owned()))?;
+            let port = url
+                .port_or_known_default()
+                .ok_or_else(|| EngineError::Config("proxy.address URL missing port".to_owned()))?;
+            return Ok((host.to_owned(), port, user, pass));
+        }
 
-            if s.contains("://") {
-                let url = Url::parse(s)?;
-                let user = if !url.username().is_empty() {
-                    Some(url.username().to_owned())
-                } else {
-                    None
-                };
-                let pass = url.password().map(|v| v.to_owned());
-                let host = url.host_str().ok_or_else(|| {
-                    EngineError::Config("proxy.address URL missing host".to_owned())
-                })?;
-                let port = url.port_or_known_default().ok_or_else(|| {
-                    EngineError::Config("proxy.address URL missing port".to_owned())
-                })?;
-                return Ok((host.to_owned(), port, user, pass));
-            }
-
-            if let Some((h, p)) = s.rsplit_once(':') {
-                let mut host = h.trim().to_owned();
-                if host.starts_with('[') {
-                    if !host.ends_with(']') {
-                        return Err(EngineError::Config(
-                            "proxy.address IPv6 must be in the form '[::1]:port'".to_owned(),
-                        ));
-                    }
-                    host = host[1..host.len() - 1].to_owned();
-                } else if host.contains(':') {
-                    // Likely an IPv6 literal without brackets.
+        if let Some((h, p)) = s.rsplit_once(':') {
+            let mut host = h.trim().to_owned();
+            if host.starts_with('[') {
+                if !host.ends_with(']') {
                     return Err(EngineError::Config(
                         "proxy.address IPv6 must be in the form '[::1]:port'".to_owned(),
                     ));
                 }
-                if host.is_empty() {
-                    return Err(EngineError::Config("proxy.address missing host".to_owned()));
-                }
-
-                // Support "user:pass@host:port" without a URL scheme (common in config files).
-                let (user, pass, host) = if let Some((ui, h2)) = host.rsplit_once('@') {
-                    let ui = ui.trim();
-                    let h2 = h2.trim();
-                    if ui.is_empty() || h2.is_empty() {
-                        return Err(EngineError::Config(
-                            "proxy.address has invalid credentials syntax".to_owned(),
-                        ));
-                    }
-                    let (u, p) = ui.split_once(':').unwrap_or((ui, ""));
-                    (Some(u.to_owned()), Some(p.to_owned()), h2.to_owned())
-                } else {
-                    (None, None, host)
-                };
-
-                let p = p.parse::<u16>().map_err(|_| {
-                    EngineError::Config("proxy.address has invalid port".to_owned())
-                })?;
-                return Ok((host, p, user, pass));
+                host = host[1..host.len() - 1].to_owned();
+            } else if host.contains(':') {
+                return Err(EngineError::Config(
+                    "proxy.address IPv6 must be in the form '[::1]:port'".to_owned(),
+                ));
+            }
+            if host.is_empty() {
+                return Err(EngineError::Config("proxy.address missing host".to_owned()));
             }
 
-            Err(EngineError::Config(
-                "proxy.address must be 'host:port' (or a URL)".to_owned(),
-            ))
+            let (user, pass, host) = if let Some((ui, h2)) = host.rsplit_once('@') {
+                let ui = ui.trim();
+                let h2 = h2.trim();
+                if ui.is_empty() || h2.is_empty() {
+                    return Err(EngineError::Config(
+                        "proxy.address has invalid credentials syntax".to_owned(),
+                    ));
+                }
+                let (u, p) = ui.split_once(':').unwrap_or((ui, ""));
+                (Some(u.to_owned()), Some(p.to_owned()), h2.to_owned())
+            } else {
+                (None, None, host)
+            };
+
+            let p = p
+                .parse::<u16>()
+                .map_err(|_| EngineError::Config("proxy.address has invalid port".to_owned()))?;
+            return Ok((host, p, user, pass));
         }
 
+        Err(EngineError::Config(
+            "proxy.address must be 'host:port' (or a URL)".to_owned(),
+        ))
+    }
+
+    fn is_loopback_proxy_host(host: &str) -> bool {
+        if host.eq_ignore_ascii_case("localhost") {
+            return true;
+        }
+        host.parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+    }
+
+    async fn connect_via_socks5(&self, proxy_addr: &str, host: &str, port: u16) -> Result<TcpStream> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let (proxy_host, proxy_port, proxy_user, proxy_pass) =
-            normalize_proxy_host_port(proxy_addr)?;
-        let mut tcp = TcpStream::connect((proxy_host.as_str(), proxy_port)).await?;
+            Self::normalize_proxy_host_port(proxy_addr)?;
+        if !Self::is_loopback_proxy_host(&proxy_host) {
+            return Err(EngineError::Config(
+                "fragment/desync path requires a local SOCKS5 proxy (loopback); remote SOCKS5 negates first-hop DPI evasion"
+                    .to_owned(),
+            ));
+        }
+
+        let proxy_targets: Vec<std::net::SocketAddr> =
+            if let Ok(ip) = proxy_host.parse::<std::net::IpAddr>() {
+                vec![std::net::SocketAddr::new(ip, proxy_port)]
+            } else {
+                let ips = self.resolver_chain.resolve(&proxy_host).await?;
+                ips.into_iter()
+                    .map(|ip| std::net::SocketAddr::new(ip, proxy_port))
+                    .collect()
+            };
+        let mut last_connect_err: Option<std::io::Error> = None;
+        let mut tcp_opt = None;
+        for addr in proxy_targets {
+            match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => {
+                    tcp_opt = Some(stream);
+                    break;
+                }
+                Ok(Err(e)) => last_connect_err = Some(e),
+                Err(_) => {
+                    last_connect_err = Some(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "SOCKS5 upstream connect timeout",
+                    ));
+                }
+            }
+        }
+        let mut tcp = if let Some(stream) = tcp_opt {
+            stream
+        } else {
+            return Err(last_connect_err
+                .map(EngineError::from)
+                .unwrap_or_else(|| {
+                    EngineError::Internal("failed to resolve/connect SOCKS5 proxy".to_owned())
+                }));
+        };
         let _ = tcp.set_nodelay(true);
 
         let has_creds = proxy_user.is_some();
@@ -631,13 +685,6 @@ impl PrimeHttpClient {
         let resp = self.fragmented_send(parsed, &request, fragment_cfg).await?;
 
         let status_code = resp.status().as_u16();
-        if !(200..400).contains(&status_code) {
-            return Err(EngineError::Internal(format!(
-                "http error status {status_code} (url='{}')",
-                request.url
-            )));
-        }
-
         let headers = collect_headers(resp.headers());
         let total_opt = resp
             .headers()

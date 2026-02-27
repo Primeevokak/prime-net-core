@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 #[cfg(feature = "hickory-dns")]
 use std::net::SocketAddr;
 #[cfg(feature = "hickory-dns")]
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 #[cfg(feature = "hickory-dns")]
 use hickory_resolver::config::{
@@ -103,7 +103,7 @@ pub struct DnsConfig {
     /// Optional bootstrap IPs used to connect to DoH/DoT/DoQ upstream hostnames without using
     /// the system resolver.
     ///
-    /// If empty, resolving upstream hostnames will fall back to system DNS (privacy leak).
+    /// For encrypted upstreams (DoH/DoT/DoQ), empty bootstrap IPs fail closed to avoid DNS leaks.
     #[serde(default)]
     pub bootstrap_ips: Vec<IpAddr>,
 }
@@ -193,6 +193,12 @@ struct ResolverCacheKey {
 #[cfg(feature = "hickory-dns")]
 static RESOLVER_CACHE: OnceLock<Mutex<std::collections::HashMap<ResolverCacheKey, TokioResolver>>> =
     OnceLock::new();
+#[cfg(feature = "hickory-dns")]
+static RESOLVER_BUILD_GUARDS: OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<ResolverCacheKey, Arc<tokio::sync::Mutex<()>>>>,
+> = OnceLock::new();
+#[cfg(feature = "hickory-dns")]
+const RESOLVER_CACHE_MAX_ENTRIES: usize = 64;
 
 impl UniversalDnsResolver {
     /// Resolve A/AAAA records for `domain` and return the results along with DNSSEC validation
@@ -433,8 +439,47 @@ impl UniversalDnsResolver {
             }
         }
 
-        let resolver = self.build_resolver(kind).await?;
-        cache.lock().insert(key, resolver.clone());
+        let build_guard = {
+            let guards = RESOLVER_BUILD_GUARDS
+                .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+            let mut map = guards.lock();
+            map.entry(key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _build_lock = build_guard.lock().await;
+
+        {
+            let guard = cache.lock();
+            if let Some(v) = guard.get(&key).cloned() {
+                let guards = RESOLVER_BUILD_GUARDS
+                    .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+                guards.lock().remove(&key);
+                return Ok(v);
+            }
+        }
+
+        let resolver = match self.build_resolver(kind).await {
+            Ok(v) => v,
+            Err(e) => {
+                let guards = RESOLVER_BUILD_GUARDS
+                    .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+                guards.lock().remove(&key);
+                return Err(e);
+            }
+        };
+        {
+            let mut guard = cache.lock();
+            if guard.len() >= RESOLVER_CACHE_MAX_ENTRIES {
+                if let Some(old_key) = guard.keys().next().cloned() {
+                    guard.remove(&old_key);
+                }
+            }
+            guard.insert(key.clone(), resolver.clone());
+        }
+        let guards = RESOLVER_BUILD_GUARDS
+            .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+        guards.lock().remove(&key);
         Ok(resolver)
     }
 
@@ -453,7 +498,8 @@ impl UniversalDnsResolver {
             }
             DnsResolverType::DoH(provider) => {
                 let (host, endpoint) = doh_host_and_path(provider)?;
-                let addrs = resolve_socket_addrs(&host, 443, &self.config.bootstrap_ips).await?;
+                let addrs =
+                    resolve_socket_addrs(&host, 443, &self.config.bootstrap_ips, false).await?;
                 let mut group = NameServerConfigGroup::new();
                 for sa in addrs {
                     let mut ns = NameServerConfig::new(sa, Protocol::Https);
@@ -478,7 +524,8 @@ impl UniversalDnsResolver {
             }
             DnsResolverType::DoT(server) => {
                 let (host, port) = split_host_port(server.server(), 853)?;
-                let addrs = resolve_socket_addrs(&host, port, &self.config.bootstrap_ips).await?;
+                let addrs =
+                    resolve_socket_addrs(&host, port, &self.config.bootstrap_ips, false).await?;
                 let sni = server.sni().map(str::trim).filter(|s| !s.is_empty());
                 if let Some(sni) = sni {
                     if is_ip_literal(sni) {
@@ -518,7 +565,8 @@ impl UniversalDnsResolver {
             }
             DnsResolverType::DoQ(server) => {
                 let (host, port) = split_host_port(server.server(), 784)?;
-                let addrs = resolve_socket_addrs(&host, port, &self.config.bootstrap_ips).await?;
+                let addrs =
+                    resolve_socket_addrs(&host, port, &self.config.bootstrap_ips, false).await?;
                 let sni = server.sni().map(str::trim).filter(|s| !s.is_empty());
                 if let Some(sni) = sni {
                     if is_ip_literal(sni) {
@@ -558,7 +606,8 @@ impl UniversalDnsResolver {
             }
             DnsResolverType::CustomUdp(server) => {
                 let (host, port) = split_host_port(server, 53)?;
-                let addrs = resolve_socket_addrs(&host, port, &self.config.bootstrap_ips).await?;
+                let addrs =
+                    resolve_socket_addrs(&host, port, &self.config.bootstrap_ips, true).await?;
                 let mut group = NameServerConfigGroup::new();
                 for sa in addrs {
                     group.push(NameServerConfig::new(sa, Protocol::Udp));
@@ -579,7 +628,8 @@ impl UniversalDnsResolver {
             }
             DnsResolverType::CustomTcp(server) => {
                 let (host, port) = split_host_port(server, 53)?;
-                let addrs = resolve_socket_addrs(&host, port, &self.config.bootstrap_ips).await?;
+                let addrs =
+                    resolve_socket_addrs(&host, port, &self.config.bootstrap_ips, true).await?;
                 let mut group = NameServerConfigGroup::new();
                 for sa in addrs {
                     group.push(NameServerConfig::new(sa, Protocol::Tcp));

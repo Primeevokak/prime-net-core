@@ -94,7 +94,6 @@ pub(crate) struct App {
     user_mode: UserMode,
     core_process: Option<Child>,
     core_event_rx: Option<mpsc::Receiver<CoreUiEvent>>,
-    allow_unverified_packet_bypass_next_start: bool,
     proxy_managed_by_tui: bool,
     core_start_pending: Option<(String, Instant)>,
 }
@@ -157,7 +156,6 @@ impl App {
             user_mode: UserMode::Simple,
             core_process: None,
             core_event_rx: None,
-            allow_unverified_packet_bypass_next_start: false,
             proxy_managed_by_tui: false,
             core_start_pending: None,
         }
@@ -432,7 +430,7 @@ fn render(frame: &mut Frame, app: &mut App) {
 Источник: {source}\n\n\
 Что можно сделать:\n\
   [r]/[Enter] Повторить безопасный запуск (рекомендуется)\n\
-  [u] Запустить без проверки SHA256 (небезопасно)\n\
+  [u] Небезопасный режим отключён (strict trust mode)\n\
   [n]/[Esc] Оставить direct-режим\n\n\
 Режим без проверки включается только вручную и только на один запуск."
         );
@@ -714,8 +712,10 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                 } else {
                     app.packet_bypass_unsafe_confirm_prompt = None;
                     app.packet_bypass_bootstrap_prompt = None;
-                    restart_core_for_packet_bypass_prompt(app, true)?;
-                    app.status_line = "Запуск риск-режима активирован: проверка SHA256 временно отключена на один запуск".to_owned();
+                    restart_core_for_packet_bypass_prompt(app, false)?;
+                    app.status_line =
+                        "Небезопасный режим отключен: выполнен обычный безопасный запуск"
+                            .to_owned();
                 }
             }
             _ => {}
@@ -730,16 +730,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                 app.status_line = "Повтор безопасного запуска packet bypass".to_owned();
             }
             KeyCode::Char('u') | KeyCode::Char('U') => {
-                let source_url = app
-                    .packet_bypass_bootstrap_prompt
-                    .as_ref()
-                    .and_then(|p| p.source_url.clone());
-                app.packet_bypass_unsafe_confirm_prompt = Some(PacketBypassUnsafeConfirmPrompt {
-                    source_url,
-                    started_at: Instant::now(),
-                });
-                app.status_line =
-                    "Риск-режим требует отдельного подтверждения через 10 секунд".to_owned();
+                app.status_line = "Небезопасный запуск отключен: работает строгий trust mode"
+                    .to_owned();
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 app.packet_bypass_bootstrap_prompt = None;

@@ -154,7 +154,6 @@ fn activate_core(app: &mut App) -> Result<()> {
         "prime-net-engine"
     });
 
-    let allow_unverified = std::mem::take(&mut app.allow_unverified_packet_bypass_next_start);
     let mut command = Command::new(&bin);
     command
         .arg("--config")
@@ -169,9 +168,6 @@ fn activate_core(app: &mut App) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    if allow_unverified {
-        command.env("PRIME_PACKET_BYPASS_ALLOW_UNVERIFIED", "1");
-    }
     let child = command.spawn().map_err(|e| {
         EngineError::Internal(format!(
             "не удалось запустить ядро ({}) : {e}",
@@ -186,11 +182,7 @@ fn activate_core(app: &mut App) -> Result<()> {
     }
     app.core_event_rx = Some(event_rx);
     app.core_start_pending = Some((endpoint.clone(), Instant::now()));
-    app.status_line = if allow_unverified {
-        format!("Запуск ядра для {endpoint} (режим без проверки SHA256, только на один запуск)...")
-    } else {
-        format!("Запуск ядра для {endpoint}...")
-    };
+    app.status_line = format!("Запуск ядра для {endpoint}...");
     Ok(())
 }
 
@@ -200,7 +192,6 @@ fn deactivate_core(app: &mut App) -> Result<()> {
         let _ = child.wait();
     }
     app.core_event_rx = None;
-    app.allow_unverified_packet_bypass_next_start = false;
     app.core_start_pending = None;
     system_proxy_manager().disable()?;
     app.proxy_managed_by_tui = false;
@@ -212,7 +203,10 @@ fn restart_core_for_packet_bypass_prompt(app: &mut App, allow_unverified: bool) 
     if app.core_process.is_some() {
         deactivate_core(app)?;
     }
-    app.allow_unverified_packet_bypass_next_start = allow_unverified;
+    if allow_unverified {
+        app.status_line =
+            "Небезопасный запуск packet bypass отклонен: включен строгий trust mode".to_owned();
+    }
     activate_core(app)
 }
 
@@ -369,6 +363,7 @@ fn is_packet_bypass_missing_sidecar_issue(target: &str, message: &str) -> bool {
         return false;
     }
     message.contains("packet bypass integrity check failed: no sha256 sidecar")
+        || message.contains("packet bypass integrity check failed")
 }
 
 fn extract_sidecar_source_url(message: &str) -> Option<String> {

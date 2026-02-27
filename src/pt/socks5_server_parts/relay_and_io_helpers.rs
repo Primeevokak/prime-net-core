@@ -126,18 +126,36 @@ pub fn find_http_header_end(buf: &[u8]) -> Option<usize> {
 }
 
 pub fn split_host_port_for_connect(s: &str) -> Option<(String, u16)> {
-    if let Some(pos) = s.rfind(':') {
-        let host = &s[..pos];
-        let port_str = &s[pos + 1..];
-        if let Ok(port) = port_str.parse::<u16>() {
-            let host_clean = host.trim_start_matches('[').trim_end_matches(']');
-            if host_clean.is_empty() {
-                return None;
-            }
-            return Some((host_clean.to_owned(), port));
-        }
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
     }
-    None
+
+    if let Some(rest) = s.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        let port = tail.strip_prefix(':')?.parse::<u16>().ok()?;
+        if host.is_empty() {
+            return None;
+        }
+        return Some((host.to_owned(), port));
+    }
+
+    let (host, port_str) = s.rsplit_once(':')?;
+    let port = port_str.parse::<u16>().ok()?;
+    if host.is_empty() {
+        return None;
+    }
+
+    // Best-effort support for unbracketed IPv6 literals in legacy configs/log-derived
+    // keys: "2001:db8::1:443" -> ("2001:db8::1", 443).
+    if host.contains(':') {
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            return Some((host.to_owned(), port));
+        }
+        return None;
+    }
+
+    Some((host.to_owned(), port))
 }
 
 pub fn split_host_port_with_default(s: &str, default_port: u16) -> Option<(String, u16)> {
@@ -236,12 +254,45 @@ pub fn parse_http_forward_target(uri: &str, headers: &str) -> Option<HttpForward
     None
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct HttpRequestLine<'a> {
+    pub method: &'a str,
+    pub target: &'a str,
+    pub version: &'a str,
+}
+
+pub fn parse_http_request_line(line: &str) -> Option<HttpRequestLine<'_>> {
+    let line = line.trim_matches(|c| c == '\r' || c == '\n');
+    let mut parts = line.split_ascii_whitespace();
+    let method = parts.next()?;
+    let target = parts.next()?;
+    let version = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if method.is_empty()
+        || target.is_empty()
+        || !method.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-')
+        || !version.starts_with("HTTP/")
+        || target.as_bytes().contains(&0)
+    {
+        return None;
+    }
+    Some(HttpRequestLine {
+        method,
+        target,
+        version,
+    })
+}
+
 pub fn rewrite_http_forward_head(headers: &str, target: &HttpForwardTarget) -> String {
     let mut lines: Vec<String> = Vec::new();
     let first_line = headers.lines().next().unwrap_or("");
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-    if parts.len() >= 3 {
-        lines.push(format!("{} {} {}", parts[0], target.request_uri, parts[2]));
+    if let Some(parsed) = parse_http_request_line(first_line) {
+        lines.push(format!(
+            "{} {} {}",
+            parsed.method, target.request_uri, parsed.version
+        ));
     } else {
         lines.push(first_line.to_owned());
     }

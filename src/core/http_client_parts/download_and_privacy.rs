@@ -9,13 +9,6 @@ impl PrimeHttpClient {
 
         let resp = self.fragmented_send(parsed, &request, fragment_cfg).await?;
         let status = resp.status();
-        let status_u16 = status.as_u16();
-        if !(200..400).contains(&status_u16) {
-            return Err(EngineError::Internal(format!(
-                "http error status {status_u16} (url='{}')",
-                request.url
-            )));
-        }
 
         let headers = resp.headers().clone();
         let body_stream = resp
@@ -63,9 +56,6 @@ impl PrimeHttpClient {
 
         let parsed = Url::parse(&request.url)?;
         let host = parsed.host_str().map(|v| v.to_ascii_lowercase());
-        if let Some(h) = host.as_deref() {
-            let _ = self.resolver_chain.resolve(h).await;
-        }
 
         let path = path.as_ref().to_path_buf();
         let request_for_fragment = request.clone();

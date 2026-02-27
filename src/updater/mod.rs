@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 
 use crate::config::UpdateChannel;
@@ -151,9 +152,7 @@ impl AutoUpdater {
     }
 
     fn api_base(&self) -> String {
-        std::env::var("GITHUB_API_URL")
-            .map(|v| v.trim_end_matches('/').to_owned())
-            .unwrap_or_else(|_| "https://api.github.com".to_owned())
+        "https://api.github.com".to_owned()
     }
 
     fn release_web_url(&self, tag: &str) -> String {
@@ -161,7 +160,11 @@ impl AutoUpdater {
     }
 
     async fn fetch_release(&self, url: &str) -> Result<ReleaseInfo> {
-        let client = reqwest::Client::new();
+        validate_update_api_url(url)?;
+        let client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .build()
+            .map_err(|e| EngineError::Internal(format!("failed to build updater client: {e}")))?;
         let resp = client
             .get(url)
             .header("User-Agent", "prime-net-engine-updater")
@@ -179,7 +182,11 @@ impl AutoUpdater {
     }
 
     async fn fetch_releases(&self, url: &str) -> Result<Vec<ReleaseInfo>> {
-        let client = reqwest::Client::new();
+        validate_update_api_url(url)?;
+        let client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .build()
+            .map_err(|e| EngineError::Internal(format!("failed to build updater client: {e}")))?;
         let resp = client
             .get(url)
             .header("User-Agent", "prime-net-engine-updater")
@@ -213,8 +220,10 @@ impl AutoUpdater {
         let binary_url = self
             .find_binary_asset(release)
             .ok_or_else(|| EngineError::Internal("no suitable binary asset found".to_owned()))?;
+        validate_update_download_url(&binary_url)?;
         let binary = self.download_file(&binary_url).await?;
         let sig_url = format!("{binary_url}.sig");
+        validate_update_download_url(&sig_url)?;
         let signature = self.download_file(&sig_url).await.map_err(|e| {
             EngineError::Internal(format!(
                 "update signature not found or failed to download ('{sig_url}'): {e}"
@@ -263,7 +272,11 @@ impl AutoUpdater {
     }
 
     async fn download_file(&self, url: &str) -> Result<Vec<u8>> {
-        let client = reqwest::Client::new();
+        validate_update_download_url(url)?;
+        let client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .build()
+            .map_err(|e| EngineError::Internal(format!("failed to build updater client: {e}")))?;
         let response = client.get(url).send().await?;
         if !response.status().is_success() {
             return Err(EngineError::Internal(format!(
@@ -296,5 +309,71 @@ impl AutoUpdater {
         }
 
         Ok(temp_path)
+    }
+}
+
+fn validate_update_api_url(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| EngineError::Internal(format!("invalid updater API URL '{url}': {e}")))?;
+    if parsed.scheme() != "https" {
+        return Err(EngineError::Internal(format!(
+            "updater API URL must use https: '{url}'"
+        )));
+    }
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    if host != "api.github.com" {
+        return Err(EngineError::Internal(format!(
+            "updater API host is not allowed: '{host}'"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_update_download_url(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| EngineError::Internal(format!("invalid updater download URL '{url}': {e}")))?;
+    if parsed.scheme() != "https" {
+        return Err(EngineError::Internal(format!(
+            "updater download URL must use https: '{url}'"
+        )));
+    }
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    let allowed = host == "github.com"
+        || host == "objects.githubusercontent.com"
+        || host == "github-releases.githubusercontent.com"
+        || host.ends_with(".githubusercontent.com");
+    if !allowed {
+        return Err(EngineError::Internal(format!(
+            "updater download host is not allowed: '{host}'"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_update_api_url, validate_update_download_url};
+
+    #[test]
+    fn updater_api_url_must_be_https_and_github_api() {
+        assert!(validate_update_api_url("https://api.github.com/repos/o/r/releases").is_ok());
+        assert!(validate_update_api_url("http://api.github.com/repos/o/r/releases").is_err());
+        assert!(validate_update_api_url("https://evil.example/repos/o/r/releases").is_err());
+    }
+
+    #[test]
+    fn updater_download_url_allows_only_github_hosts() {
+        assert!(validate_update_download_url(
+            "https://github.com/openai/example/releases/download/v1/bin"
+        )
+        .is_ok());
+        assert!(validate_update_download_url(
+            "https://objects.githubusercontent.com/asset"
+        )
+        .is_ok());
+        assert!(validate_update_download_url(
+            "https://downloads.evil.example/asset"
+        )
+        .is_err());
     }
 }

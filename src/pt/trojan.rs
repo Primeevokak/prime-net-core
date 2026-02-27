@@ -1,9 +1,11 @@
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use sha2::{Digest, Sha224};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tracing::{info, warn};
 
 use crate::anticensorship::ResolverChain;
@@ -19,6 +21,10 @@ pub struct TrojanOutbound {
 }
 
 impl TrojanOutbound {
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(12);
+    const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
     pub fn new(resolver: Arc<ResolverChain>, cfg: TrojanPtConfig) -> Self {
         Self { resolver, cfg }
     }
@@ -30,24 +36,49 @@ impl TrojanOutbound {
         };
         let (server_host, server_port) = split_host_port(&self.cfg.server)?;
 
-        let server_addr = if let Ok(ip) = server_host.parse::<std::net::IpAddr>() {
-            std::net::SocketAddr::new(ip, server_port)
+        let server_addrs: Vec<std::net::SocketAddr> = if let Ok(ip) =
+            server_host.parse::<std::net::IpAddr>()
+        {
+            vec![std::net::SocketAddr::new(ip, server_port)]
         } else {
             let ips = self.resolver.resolve(&server_host).await?;
-            let ip = *ips.first().ok_or_else(|| {
-                EngineError::Internal(format!(
+            if ips.is_empty() {
+                return Err(EngineError::Internal(format!(
                     "dns resolver returned no IPs for '{}'",
                     server_host
-                ))
-            })?;
-            info!(target: "outbound.trojan", server_host = %server_host, resolved_ip = %ip, server_port, "Trojan server resolved");
-            std::net::SocketAddr::new(ip, server_port)
+                )));
+            }
+            let out: Vec<std::net::SocketAddr> = ips
+                .into_iter()
+                .map(|ip| std::net::SocketAddr::new(ip, server_port))
+                .collect();
+            info!(target: "outbound.trojan", server_host = %server_host, resolved_count = out.len(), server_port, "Trojan server resolved");
+            out
         };
 
-        info!(target: "outbound.trojan", server = %server_addr, destination = %target_label, "Trojan outbound TCP connect");
-        let tcp = TcpStream::connect(server_addr).await.map_err(|e| {
-            warn!(target: "outbound.trojan", server = %server_addr, destination = %target_label, error = %e, "Trojan outbound TCP connect failed");
-            e
+        let mut last_err: Option<EngineError> = None;
+        let mut tcp_opt = None;
+        for server_addr in server_addrs {
+            info!(target: "outbound.trojan", server = %server_addr, destination = %target_label, "Trojan outbound TCP connect");
+            match timeout(Self::CONNECT_TIMEOUT, TcpStream::connect(server_addr)).await {
+                Ok(Ok(tcp)) => {
+                    tcp_opt = Some((server_addr, tcp));
+                    break;
+                }
+                Ok(Err(e)) => {
+                    warn!(target: "outbound.trojan", server = %server_addr, destination = %target_label, error = %e, "Trojan outbound TCP connect failed");
+                    last_err = Some(EngineError::from(e));
+                }
+                Err(_) => {
+                    warn!(target: "outbound.trojan", server = %server_addr, destination = %target_label, timeout_ms = Self::CONNECT_TIMEOUT.as_millis(), "Trojan outbound TCP connect timeout");
+                    last_err = Some(EngineError::Internal("trojan connect timeout".to_owned()));
+                }
+            }
+        }
+        let (server_addr, tcp) = tcp_opt.ok_or_else(|| {
+            last_err.unwrap_or_else(|| {
+                EngineError::Internal("trojan connect failed for all resolved IPs".to_owned())
+            })
         })?;
         let _ = tcp.set_nodelay(true);
 
@@ -63,7 +94,10 @@ impl TrojanOutbound {
                 .map_err(|_| EngineError::InvalidInput(format!("invalid SNI '{sni}'")))?
         };
 
-        let mut tls = connector.connect(server_name, tcp).await.map_err(|e| {
+        let mut tls = timeout(Self::HANDSHAKE_TIMEOUT, connector.connect(server_name, tcp))
+            .await
+            .map_err(|_| EngineError::Internal("trojan TLS handshake timeout".to_owned()))?
+            .map_err(|e| {
             warn!(target: "outbound.trojan", server = %server_addr, destination = %target_label, error = %e, "Trojan TLS handshake failed");
             e
         })?;
@@ -71,13 +105,23 @@ impl TrojanOutbound {
 
         // Trojan header: SHA224(password) hex + CRLF + SOCKS5 request + CRLF
         let pass = sha224_hex(self.cfg.password.as_bytes());
-        tls.write_all(pass.as_bytes()).await?;
-        tls.write_all(b"\r\n").await?;
+        timeout(Self::IO_TIMEOUT, tls.write_all(pass.as_bytes()))
+            .await
+            .map_err(|_| EngineError::Internal("trojan write timeout".to_owned()))??;
+        timeout(Self::IO_TIMEOUT, tls.write_all(b"\r\n"))
+            .await
+            .map_err(|_| EngineError::Internal("trojan write timeout".to_owned()))??;
 
         let req = build_trojan_connect_request(target)?;
-        tls.write_all(&req).await?;
-        tls.write_all(b"\r\n").await?;
-        tls.flush().await?;
+        timeout(Self::IO_TIMEOUT, tls.write_all(&req))
+            .await
+            .map_err(|_| EngineError::Internal("trojan write timeout".to_owned()))??;
+        timeout(Self::IO_TIMEOUT, tls.write_all(b"\r\n"))
+            .await
+            .map_err(|_| EngineError::Internal("trojan write timeout".to_owned()))??;
+        timeout(Self::IO_TIMEOUT, tls.flush())
+            .await
+            .map_err(|_| EngineError::Internal("trojan flush timeout".to_owned()))??;
 
         info!(target: "outbound.trojan", server = %server_addr, destination = %target_label, "Trojan CONNECT request sent");
         Ok(Box::new(tls))
@@ -217,6 +261,7 @@ fn build_trojan_rustls_client_config(cfg: &TrojanPtConfig) -> Result<rustls::Cli
         }
     }
     if alpn.is_empty() {
+        alpn.push(b"h2".to_vec());
         alpn.push(b"http/1.1".to_vec());
     }
     tls.alpn_protocols = alpn;

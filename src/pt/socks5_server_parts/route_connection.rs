@@ -103,6 +103,27 @@ pub fn route_race_launch_candidates(
         .collect()
 }
 
+fn reap_route_race_losers(
+    mut losers: JoinSet<(RouteCandidate, Result<BoxStream>)>,
+    conn_id: u64,
+    target_label: String,
+) {
+    tokio::spawn(async move {
+        while let Some(joined) = losers.join_next().await {
+            if let Ok((candidate, Ok(stream))) = joined {
+                drop(stream);
+                debug!(
+                    target: "socks5",
+                    conn_id,
+                    destination = %target_label,
+                    route = candidate.route_label(),
+                    "closed losing raced route connection"
+                );
+            }
+        }
+    });
+}
+
 pub async fn connect_via_best_route(
     conn_id: u64,
     target: &TargetEndpoint,
@@ -218,6 +239,7 @@ pub async fn connect_via_best_route(
         match connect_res {
             Ok(stream) => {
                 winners.abort_all();
+                reap_route_race_losers(winners, conn_id, target_label.to_owned());
                 record_route_connected(target_label, &candidate);
                 record_route_selected(&candidate, true);
                 return Ok(ConnectedRoute {
