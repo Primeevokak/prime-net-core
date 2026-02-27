@@ -309,6 +309,31 @@ pub(super) async fn handle_http_proxy(
                     );
                 }
                 Err(e) if is_expected_disconnect(&e) => {
+                    let lifetime_ms = bypass_tunnel_started.elapsed().as_millis() as u64;
+                    let mut outcome_error_class = "client-disconnect";
+                    if !noisy_tls_destination
+                        && should_penalize_disconnect_as_soft_zero_reply(
+                            &connected.route_key,
+                            &connected.candidate,
+                            lifetime_ms,
+                        )
+                    {
+                        record_route_failure(
+                            &connected.route_key,
+                            &connected.candidate,
+                            "zero-reply-soft",
+                        );
+                        warn!(
+                            target: "socks5.route",
+                            conn_id,
+                            route_key = %connected.route_key,
+                            route = connected.candidate.route_label(),
+                            destination = %destination,
+                            session_lifetime_ms = lifetime_ms,
+                            "adaptive route reclassified expected disconnect as soft zero-reply"
+                        );
+                        outcome_error_class = "zero-reply-soft";
+                    }
                     complete_route_outcome_event(
                         connected.decision_id,
                         &connected.route_key,
@@ -316,8 +341,8 @@ pub(super) async fn handle_http_proxy(
                         true,
                         false,
                         0,
-                        bypass_tunnel_started.elapsed().as_millis() as u64,
-                        "client-disconnect",
+                        lifetime_ms,
+                        outcome_error_class,
                     );
                     let _ = e;
                 }

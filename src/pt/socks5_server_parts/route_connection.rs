@@ -85,14 +85,21 @@ pub fn route_race_launch_candidates(
 ) -> Vec<RouteCandidate> {
     let bucket = host_service_bucket(destination);
     if matches!(bucket.as_str(), "meta-group:youtube" | "meta-group:discord") {
-        let mut out = Vec::with_capacity(2);
-        if let Some(bypass) = ordered.iter().find(|c| c.kind == RouteKind::Bypass) {
+        let mut out = Vec::with_capacity(3);
+        for bypass in ordered
+            .iter()
+            .filter(|c| c.kind == RouteKind::Bypass)
+            .take(2)
+        {
             out.push(bypass.clone());
         }
         if let Some(direct) = ordered.iter().find(|c| c.kind == RouteKind::Direct) {
             out.push(direct.clone());
         }
         if !out.is_empty() {
+            if out.len() > ROUTE_RACE_MAX_CANDIDATES {
+                out.truncate(ROUTE_RACE_MAX_CANDIDATES);
+            }
             return out;
         }
     }
@@ -403,6 +410,7 @@ pub async fn handle_client(
                 );
                 return Err(e.into());
             }
+            let relay_started = Instant::now();
             match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options).await {
                 Ok((_c2u, u2c)) => {
                     complete_route_outcome_event(
@@ -412,11 +420,25 @@ pub async fn handle_client(
                         true,
                         u2c > 0,
                         u2c,
-                        0,
+                        relay_started.elapsed().as_millis() as u64,
                         "ok",
                     );
                 }
                 Err(e) if is_expected_disconnect(&e) => {
+                    let lifetime_ms = relay_started.elapsed().as_millis() as u64;
+                    let mut error_class = "client-disconnect";
+                    if should_penalize_disconnect_as_soft_zero_reply(
+                        &connected.route_key,
+                        &connected.candidate,
+                        lifetime_ms,
+                    ) {
+                        record_route_failure(
+                            &connected.route_key,
+                            &connected.candidate,
+                            "zero-reply-soft",
+                        );
+                        error_class = "zero-reply-soft";
+                    }
                     complete_route_outcome_event(
                         connected.decision_id,
                         &connected.route_key,
@@ -424,8 +446,8 @@ pub async fn handle_client(
                         true,
                         false,
                         0,
-                        0,
-                        "client-disconnect",
+                        lifetime_ms,
+                        error_class,
                     );
                 }
                 Err(e) => {
@@ -436,7 +458,7 @@ pub async fn handle_client(
                         true,
                         false,
                         0,
-                        0,
+                        relay_started.elapsed().as_millis() as u64,
                         "relay-io",
                     );
                     debug!(

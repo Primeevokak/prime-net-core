@@ -514,6 +514,36 @@ mod tests {
     }
 
     #[test]
+    fn route_connected_does_not_pin_adaptive_direct_winner() {
+        let route_key = "route-connected-no-pin-direct.example:443|any";
+        clear_route_state_for_test(route_key);
+        let candidate = RouteCandidate::direct("adaptive");
+        record_route_connected(route_key, &candidate);
+        assert!(route_winner_for_key(route_key).is_none());
+        clear_route_state_for_test(route_key);
+    }
+
+    #[test]
+    fn youtube_race_not_suppressed_by_adaptive_direct_connect_only() {
+        let route_key = "www.youtube.com:443|any";
+        clear_route_state_for_test(route_key);
+        let direct = RouteCandidate::direct("adaptive");
+        let bypass = RouteCandidate::bypass(
+            "adaptive-race",
+            "127.0.0.1:19080".parse().expect("addr"),
+            0,
+            1,
+        );
+        let candidates = vec![direct.clone(), bypass];
+
+        record_route_connected(route_key, &direct);
+        let (race, reason) = route_race_decision(443, route_key, &candidates);
+        assert!(race);
+        assert_eq!(reason, RouteRaceReason::NoWinner);
+        clear_route_state_for_test(route_key);
+    }
+
+    #[test]
     fn adaptive_route_candidates_include_bypass_for_public_tls_domain() {
         let relay_opts = RelayOptions {
             bypass_socks5_pool: vec![
@@ -793,6 +823,45 @@ mod tests {
     }
 
     #[test]
+    fn long_disconnect_penalty_applies_only_for_bypass_youtube_or_discord() {
+        let bypass_youtube = RouteCandidate::bypass(
+            "adaptive-race",
+            "127.0.0.1:19080".parse().expect("addr"),
+            0,
+            2,
+        );
+        assert!(should_penalize_disconnect_as_soft_zero_reply(
+            "www.youtube.com:443|any",
+            &bypass_youtube,
+            3_000
+        ));
+        assert!(!should_penalize_disconnect_as_soft_zero_reply(
+            "www.youtube.com:443|any",
+            &bypass_youtube,
+            2_999
+        ));
+
+        let bypass_default = RouteCandidate::bypass(
+            "adaptive-race",
+            "127.0.0.1:19080".parse().expect("addr"),
+            0,
+            2,
+        );
+        assert!(!should_penalize_disconnect_as_soft_zero_reply(
+            "api.github.com:443|any",
+            &bypass_default,
+            20_000
+        ));
+
+        let direct_youtube = RouteCandidate::direct("adaptive");
+        assert!(!should_penalize_disconnect_as_soft_zero_reply(
+            "www.youtube.com:443|any",
+            &direct_youtube,
+            20_000
+        ));
+    }
+
+    #[test]
     fn route_soft_zero_reply_immediately_sets_weak_cooldown() {
         let route_key = "adaptive-route-soft-zero:443";
         clear_route_state_for_test(route_key);
@@ -1002,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn route_race_launch_for_youtube_uses_direct_and_best_bypass_only() {
+    fn route_race_launch_for_youtube_uses_direct_and_two_best_bypass_profiles() {
         let direct = RouteCandidate::direct("adaptive");
         let bypass_1 = RouteCandidate::bypass(
             "adaptive-race",
@@ -1025,9 +1094,10 @@ mod tests {
         let ordered = vec![direct.clone(), bypass_1.clone(), bypass_2, bypass_3];
 
         let launch = route_race_launch_candidates(&ordered, "www.youtube.com:443|any");
-        assert_eq!(launch.len(), 2);
+        assert_eq!(launch.len(), 3);
         assert_eq!(launch[0].route_id(), bypass_1.route_id());
-        assert_eq!(launch[1].route_id(), direct.route_id());
+        assert_eq!(launch[1].route_id(), "bypass:2");
+        assert_eq!(launch[2].route_id(), direct.route_id());
     }
 
     #[test]

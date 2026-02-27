@@ -415,6 +415,25 @@ pub fn should_mark_bypass_zero_reply_soft(port: u16, c2u: u64, u2c: u64, lifetim
     port == 443 && u2c == 0 && c2u >= 256 && lifetime >= 2000
 }
 
+const SOFT_ZERO_REPLY_DISCONNECT_MIN_LIFETIME_MS: u64 = 3_000;
+
+pub fn should_penalize_disconnect_as_soft_zero_reply(
+    route_key: &str,
+    candidate: &RouteCandidate,
+    lifetime_ms: u64,
+) -> bool {
+    if candidate.kind != RouteKind::Bypass {
+        return false;
+    }
+    if lifetime_ms < SOFT_ZERO_REPLY_DISCONNECT_MIN_LIFETIME_MS {
+        return false;
+    }
+    matches!(
+        host_service_bucket(route_destination_key(route_key)).as_str(),
+        "meta-group:youtube" | "meta-group:discord"
+    )
+}
+
 pub fn record_bypass_profile_success(destination: &str, idx: u8) {
     let key = bypass_profile_key(destination);
     let service_key = bypass_profile_legacy_service_key(destination);

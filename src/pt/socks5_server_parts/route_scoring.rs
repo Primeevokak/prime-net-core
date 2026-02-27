@@ -671,9 +671,13 @@ pub(super) fn destination_bypass_profile_idx_known(destination: &str, total: u8)
 }
 
 pub(super) fn record_route_connected(route_key: &str, candidate: &RouteCandidate) {
-    // Do not pre-pin adaptive bypass winners: TCP connect can succeed while
+    // Do not pre-pin adaptive winners: TCP connect can succeed while
     // TLS still gets blocked, which causes temporary route stickiness.
-    if candidate.kind == RouteKind::Bypass && candidate.source == "adaptive-race" {
+    // This is especially harmful for YouTube/Discord where a transient direct
+    // TCP connect would suppress route racing for a short window.
+    if candidate.source == "adaptive-race"
+        || (candidate.kind == RouteKind::Direct && candidate.source == "adaptive")
+    {
         return;
     }
     let now = now_unix_secs();
