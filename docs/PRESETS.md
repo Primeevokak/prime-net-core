@@ -1,6 +1,6 @@
 ﻿# PRESETS
 
-Пресеты применяются флагом `--preset <name>`.
+Пресеты применяются через `--preset <name>`.
 
 Поддерживаемые значения:
 
@@ -9,12 +9,12 @@
 - `max-compatibility`
 - `aggressive-evasion`
 
-## Как применяются
+## Режим конфликтов
 
-В CLI применяется такая логика:
+Если передан `--config`, preset применяется в `strict_conflicts` режиме:
 
-- если передан `--config`, пресет работает в `strict_conflicts` режиме;
-- если некоторые поля уже вручную заданы значениями, конфликтующими и с дефолтом, и с пресетом, команда вернёт ошибку конфликта.
+- если поле уже вручную выставлено в значение, конфликтующее и с дефолтом, и с preset-значением, команда завершится ошибкой конфликта;
+- без `--config` пресет применяется свободно поверх `EngineConfig::default()`.
 
 ## Что меняет каждый пресет
 
@@ -30,6 +30,7 @@
 - `privacy.tracker_blocker.enabled = true`
 - `privacy.referer.enabled = true`
 - `privacy.referer.mode = strip`
+- `privacy.referer.strip_from_search_engines = true`
 - `privacy.signals.send_dnt = true`
 - `privacy.signals.send_gpc = true`
 
@@ -38,6 +39,7 @@
 - `privacy.tracker_blocker.enabled = false`
 - `privacy.referer.enabled = true`
 - `privacy.referer.mode = origin_only`
+- `privacy.referer.strip_from_search_engines = true`
 - `privacy.signals.send_dnt = false`
 - `privacy.signals.send_gpc = true`
 
@@ -57,12 +59,14 @@
 - `anticensorship.dns_fallback_chain = [doh, dot, doq]`
 - `anticensorship.ech_mode = auto`
 - `evasion.strategy = auto`
-- если `client_hello_split_offsets` пустой, ставится `[1, 5, 40, 64]`
+- если `client_hello_split_offsets` пустой -> `[1, 5, 40, 64]`
 - `evasion.split_at_sni = true`
 - `evasion.fragment_sleep_ms = 0`
 - `evasion.fragment_budget_bytes = 32768`
 - `evasion.prime_mode = true`
 - `evasion.traffic_shaping_enabled = true`
-- на Windows дополнительно `first_packet_ttl = 5`
+- на Windows дополнительно `evasion.first_packet_ttl = 5`
 
-Примечание: пресеты не создают автоматически `domain_fronting_rules`.
+## Важное
+
+Preset не создаёт автоматически `domain_fronting_rules` и не подменяет PT-секцию.

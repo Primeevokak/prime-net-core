@@ -8,7 +8,7 @@ default = ["hickory-dns", "websocket", "observability"]
 hickory-dns = ["dep:hickory-resolver"]
 websocket = []
 observability = []
-signature-verification = ["dep:gpgme"]
+signature-verification = ["dep:gpgme", "dep:tempfile"]
 require-signatures = ["signature-verification"]
 
 [lib]
@@ -60,6 +60,7 @@ serde_yaml = "0.9"
 sha2 = "0.10.9"
 socket2 = "0.5.7"
 gpgme = { version = "0.11", optional = true }
+tempfile = { version = "3.8", optional = true }
 shadowsocks = { version = "1.24.0", default-features = false, features = ["aead-cipher", "aead-cipher-2022", "stream-cipher"] }
 thiserror = "2.0.18"
 tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util", "io-std", "fs", "process", "signal"] }

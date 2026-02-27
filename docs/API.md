@@ -2,33 +2,34 @@
 
 ## Cargo features
 
-Дефолтно включены:
+По умолчанию включены:
 
 - `hickory-dns`
 - `websocket`
 - `observability`
 
-Дополнительные:
+Дополнительно:
 
-- `signature-verification` (подписи обновлений через `gpgme`)
+- `signature-verification` (проверка подписей обновлений через `gpgme`)
 - `require-signatures` (зависит от `signature-verification`)
 
-## Публичные Rust экспорты
+Примечание: для `signature-verification` в среде сборки должны быть доступны системные зависимости `gpgme/gpg-error` (обычно через `pkg-config`).
 
-Из `src/lib.rs` реэкспортируются:
+## Публичные реэкспорты (`src/lib.rs`)
 
-- конфиг/ошибки: `EngineConfig`, `TransportConfig`, `EngineError`, `Result`
-- ядро: `PrimeEngine`, `PrimeHttpClient`, `RequestData`, `ResponseData`, `ResponseStream`, `DownloadOutcome`
-- observability: `init_observability`, `ObservabilityConfig`, `ObservabilityGuard`
+- Конфиг и ошибки: `EngineConfig`, `TransportConfig`, `EngineError`, `Result`
+- Ядро: `PrimeEngine`, `PrimeHttpClient`, `RequestData`, `ResponseData`, `ResponseStream`, `DownloadOutcome`
+- Observability: `init_observability`, `ObservabilityConfig`, `ObservabilityGuard`
 - TLS: `TlsConfig`, `TlsVersion`, `Ja3Fingerprint`
 - SSE: `SseConfig`, `SseEvent`, `SseStream`
 - UDP tunnel: `UdpOverTcpTunnel`, `UdpOverTcpConfig`, `UdpDatagram`, `UdpTargetAddr`
 - WebSocket: `WebSocketClient`, `WsConfig`, `WsMessage`
 
-## Ключевые методы
+## Ключевые Rust методы
 
 - `PrimeEngine::new(config).await -> Result<PrimeEngine>`
 - `PrimeEngine::client(&self) -> Arc<PrimeHttpClient>`
+- `PrimeEngine::pt_socks5_addr(&self) -> Option<SocketAddr>`
 - `PrimeHttpClient::new(config) -> Result<PrimeHttpClient>`
 - `PrimeHttpClient::fetch(request, progress).await -> Result<ResponseData>`
 - `PrimeHttpClient::fetch_stream(request).await -> Result<ResponseStream>`
@@ -68,24 +69,25 @@
 - `PRIME_REQUEST_STATUS_CANCELLED`
 - `PRIME_REQUEST_STATUS_FAILED`
 
-### Ошибки FFI
+### FFI error codes
 
-Коды в `PrimeResponse.error_code`:
+`PrimeResponse.error_code`:
 
-- `PRIME_OK` (0)
-- `PRIME_ERR_NULL_PTR` (1)
-- `PRIME_ERR_INVALID_UTF8` (2)
-- `PRIME_ERR_INVALID_REQUEST` (3)
-- `PRIME_ERR_RUNTIME` (4)
+- `PRIME_OK` (`0`)
+- `PRIME_ERR_NULL_PTR` (`1`)
+- `PRIME_ERR_INVALID_UTF8` (`2`)
+- `PRIME_ERR_INVALID_REQUEST` (`3`)
+- `PRIME_ERR_RUNTIME` (`4`)
 
-### Ownership
+### Ownership / memory
 
 - `PrimeResponse*` освобождается только через `prime_response_free`.
-- `prime_request_wait` при успехе освобождает handle.
-- при timeout `prime_request_wait` возвращает ошибку `"timeout"`, handle остаётся валиден.
+- `PrimeRequestHandle*` освобождается через `prime_request_free`.
+- `prime_request_wait` не освобождает handle автоматически: после завершения запроса handle остается валиден до `prime_request_free`.
+- При timeout (`"timeout"`) handle остается валиден, можно ждать повторно.
 
 ## Модель выполнения FFI
 
-- при `prime_engine_new` запускается отдельный runtime-thread (`tokio` multi-thread);
-- запросы идут через очередь в runtime;
-- для async запросов поддерживаются cancel/status/wait.
+- `prime_engine_new` поднимает отдельный runtime-thread (`tokio`).
+- Запросы передаются в runtime через очередь.
+- `cancel/status/wait` работают поверх того же async runtime.

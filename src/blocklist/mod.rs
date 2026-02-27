@@ -39,10 +39,12 @@ impl BlocklistCache {
             .get("updated_at_unix")
             .and_then(Value::as_u64)
             .or_else(|| {
-                value
-                    .get("updated_at")
-                    .and_then(Value::as_u64)
-                    .or_else(|| value.get("updated_at").and_then(Value::as_i64).map(|v| v.max(0) as u64))
+                value.get("updated_at").and_then(Value::as_u64).or_else(|| {
+                    value
+                        .get("updated_at")
+                        .and_then(Value::as_i64)
+                        .map(|v| v.max(0) as u64)
+                })
             })
             .or_else(|| {
                 value.get("updated_at").and_then(Value::as_str).map(|s| {
@@ -313,7 +315,11 @@ mod tests {
         let cache = BlocklistCache {
             source: "x".into(),
             updated_at_unix: 1,
-            domains: vec!["EXAMPLE.COM".into(), "bad token".into(), "example.com".into()],
+            domains: vec![
+                "EXAMPLE.COM".into(),
+                "bad token".into(),
+                "example.com".into(),
+            ],
             ips: vec!["1.1.1.1".into(), "not-an-ip".into(), "1.1.1.1".into()],
         };
         let normalized = normalize_cache(cache);

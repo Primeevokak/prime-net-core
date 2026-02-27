@@ -91,10 +91,12 @@ impl ResolverChain {
             .chain
             .iter()
             .any(|k| matches!(k, DnsResolverKind::System));
-        let has_encrypted = self
-            .chain
-            .iter()
-            .any(|k| matches!(k, DnsResolverKind::Doh | DnsResolverKind::Dot | DnsResolverKind::Doq));
+        let has_encrypted = self.chain.iter().any(|k| {
+            matches!(
+                k,
+                DnsResolverKind::Doh | DnsResolverKind::Dot | DnsResolverKind::Doq
+            )
+        });
         has_system && has_encrypted
     }
 
@@ -782,8 +784,7 @@ mod tests {
     #[test]
     fn parallel_race_is_disabled_when_system_and_encrypted_mix() {
         let mut cfg = EngineConfig::default();
-        cfg.anticensorship.dns_fallback_chain =
-            vec![DnsResolverKind::Doh, DnsResolverKind::System];
+        cfg.anticensorship.dns_fallback_chain = vec![DnsResolverKind::Doh, DnsResolverKind::System];
         let chain = ResolverChain::from_config(&cfg.anticensorship).expect("build chain");
         assert!(chain.parallel_race_leaks_dns());
     }
@@ -808,7 +809,10 @@ mod tests {
         cfg.anticensorship.dns_fallback_chain = vec![DnsResolverKind::Doh];
         let chain = ResolverChain::from_config(&cfg.anticensorship).expect("build chain");
 
-        let err = chain.resolve("example.com").await.expect_err("must fail closed");
+        let err = chain
+            .resolve("example.com")
+            .await
+            .expect_err("must fail closed");
         assert!(err.to_string().contains("requires bootstrap_ips"));
     }
 

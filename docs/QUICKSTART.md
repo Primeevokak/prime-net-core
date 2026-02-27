@@ -11,53 +11,42 @@ cargo build --release --bin prime-net-engine --bin prime-tui
 - `target/release/prime-net-engine`
 - `target/release/prime-tui`
 
-## 2. Создать конфиг
+## 2. Создание конфига
 
-Вариант A (рекомендуется):
+Интерактивно (рекомендуется):
 
 ```bash
 prime-net-engine wizard --out prime-net-engine.toml
 ```
 
-Вариант B (шаблон):
+## 3. Проверка конфига
 
-```bash
-cp config.example.toml prime-net-engine.toml
-```
-
-## 3. Проверить конфиг
-
-Онлайн-проверка (валидация + DoH/fronting probes):
+Онлайн-валидация + probes:
 
 ```bash
 prime-net-engine --config prime-net-engine.toml --config-check
 ```
 
-Только локальная валидация (без сети):
+Офлайн (без сети):
 
 ```bash
 prime-net-engine --config prime-net-engine.toml --config-check --offline
 ```
 
-## 4. Запустить локальный SOCKS5
+## 4. Запуск локального SOCKS5
 
 ```bash
 prime-net-engine --config prime-net-engine.toml socks --bind 127.0.0.1:1080
 ```
 
-## 5. Включить системный прокси
+## 5. Подключение системного прокси
 
 ```bash
 prime-net-engine --config prime-net-engine.toml proxy enable --mode all
-```
-
-Проверка статуса:
-
-```bash
 prime-net-engine --config prime-net-engine.toml proxy status
 ```
 
-## 6. Проверить связность
+## 6. Тест связности
 
 ```bash
 prime-net-engine --config prime-net-engine.toml test --url https://example.com
@@ -69,17 +58,10 @@ prime-net-engine --config prime-net-engine.toml test --url https://example.com
 prime-net-engine --config prime-net-engine.toml tui
 ```
 
-Горячие клавиши:
+## 8. Минимальный preflight перед коммитом
 
-- `q` - выход
-- `Tab` - следующая вкладка
-- `m` - режим интерфейса (`simple`/`advanced`)
-- `?` - контекстная справка
-
-## 8. Базовый сервисный цикл
-
-- Обновить blocklist: `prime-net-engine --config prime-net-engine.toml blocklist update`
-- Проверить blocklist: `prime-net-engine --config prime-net-engine.toml blocklist status`
-- Проверить обновления: `prime-net-engine --config prime-net-engine.toml update check`
-
-Подробности: `docs/USER_GUIDE.md` и `docs/TROUBLESHOOTING.md`.
+```bash
+cargo fmt --all -- --check
+cargo check --all-targets
+cargo test -p prime-net-engine --lib --no-run
+```

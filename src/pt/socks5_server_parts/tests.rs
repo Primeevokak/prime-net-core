@@ -1334,7 +1334,9 @@ mod tests {
         let prefix = format!("runtime-prune-bypass-{}", now_unix_secs());
         let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(DashMap::new);
         let old_keys: Vec<String> = (0..3).map(|i| format!("bypass:{prefix}-old-{i}")).collect();
-        let fresh_keys: Vec<String> = (0..3).map(|i| format!("bypass:{prefix}-fresh-{i}")).collect();
+        let fresh_keys: Vec<String> = (0..3)
+            .map(|i| format!("bypass:{prefix}-fresh-{i}"))
+            .collect();
 
         for (idx, key) in old_keys.iter().enumerate() {
             map.insert(

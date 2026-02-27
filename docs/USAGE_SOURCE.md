@@ -8,7 +8,7 @@ prime_net_engine_core = { path = "../coreprime" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
-## Вариант 1: прямой HTTP-клиент
+## Вариант 1: `PrimeHttpClient` + `fetch`
 
 ```rust
 use prime_net_engine_core::{EngineConfig, PrimeHttpClient, RequestData};
@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-## Вариант 2: streaming без буферизации тела
+## Вариант 2: `fetch_stream`
 
 ```rust
 use prime_net_engine_core::{EngineConfig, PrimeHttpClient, RequestData};
@@ -34,7 +34,9 @@ use prime_net_engine_core::{EngineConfig, PrimeHttpClient, RequestData};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = PrimeHttpClient::new(EngineConfig::default())?;
-    let mut resp = client.fetch_stream(RequestData::get("https://example.com/large.bin")).await?;
+    let mut resp = client
+        .fetch_stream(RequestData::get("https://example.com/large.bin"))
+        .await?;
 
     let mut out = tokio::fs::File::create("large.bin").await?;
     tokio::io::copy(&mut resp.stream, &mut out).await?;
@@ -42,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-## Вариант 3: скачивание в файл
+## Вариант 3: `download_to_path`
 
 ```rust
 use std::sync::Arc;
@@ -57,17 +59,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let out = client
-        .download_to_path(RequestData::get("https://example.com/file.bin"), "file.bin", Some(progress))
+        .download_to_path(
+            RequestData::get("https://example.com/file.bin"),
+            "file.bin",
+            Some(progress),
+        )
         .await?;
 
-    println!("written={}, resumed={}, chunked={}", out.bytes_written, out.resumed, out.chunked);
+    println!(
+        "written={}, resumed={}, chunked={}",
+        out.bytes_written,
+        out.resumed,
+        out.chunked
+    );
     Ok(())
 }
 ```
 
-## Когда нужен `PrimeEngine`
+## Когда использовать `PrimeEngine`
 
-Если в конфиге включён `[pt]`, используйте:
+Если включен `[pt]`, создавайте клиент через `PrimeEngine`:
 
 ```rust
 use prime_net_engine_core::{EngineConfig, PrimeEngine, RequestData};
@@ -84,8 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-## Дополнительно
+## Смежные API
 
-- примеры в репозитории: `examples/simple_download.rs`, `examples/download_to_file.rs`;
-- WebSocket/SSE API доступны через `PrimeHttpClient`;
-- подробности по конфигу: `docs/CONFIG.md`.
+- WebSocket: `PrimeHttpClient::websocket_client(WsConfig)`
+- SSE: `Arc<PrimeHttpClient>::sse_connect(RequestData, SseConfig)`

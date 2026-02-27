@@ -252,7 +252,11 @@ async fn run_sse(
                 "id" => {
                     let id = value.to_owned();
                     // Per SSE spec, empty `id:` resets Last-Event-ID even when no event is dispatched.
-                    last_event_id = if id.is_empty() { None } else { Some(id.clone()) };
+                    last_event_id = if id.is_empty() {
+                        None
+                    } else {
+                        Some(id.clone())
+                    };
                     acc.id = Some(id);
                 }
                 _ => {}

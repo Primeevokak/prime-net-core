@@ -16,44 +16,40 @@ prime-net-engine --config prime-net-engine.toml proxy status
 
 ## 2. `--config-check` падает на DNS/DoH
 
-- запустите локальную проверку без сети:
+- выполните локальную валидацию без сети:
 
 ```bash
 prime-net-engine --config prime-net-engine.toml --config-check --offline
 ```
 
-- проверьте рабочие провайдеры в `anticensorship.doh_providers`;
-- при необходимости временно используйте более совместимый пресет:
-
-```bash
-prime-net-engine --config prime-net-engine.toml --preset max-compatibility test --url https://example.com
-```
+- проверьте `anticensorship.doh_providers`, `bootstrap_ips`, `dns_fallback_chain`;
+- для диагностики сравните с пресетом `max-compatibility`.
 
 ## 3. System proxy не включается
 
 Проверьте:
 
-- права пользователя/политики ОС;
-- корректность `system_proxy.socks_endpoint` (`host:port`);
+- права/политики ОС;
+- формат `system_proxy.socks_endpoint` (`host:port`, для IPv6: `[::1]:port`);
 - что SOCKS endpoint действительно слушает.
-
-Полезные команды:
-
-```bash
-prime-net-engine --config prime-net-engine.toml proxy enable --mode all
-prime-net-engine --config prime-net-engine.toml proxy status
-```
 
 ## 4. `update install` завершается ошибкой подписи
 
-Это ожидаемо, если:
+Частые причины:
 
 - сборка без feature `signature-verification`;
-- в коде не заменён публичный ключ-заглушка.
+- не настроены release signing key/fingerprint в `src/updater/verification.rs`;
+- недоступны системные зависимости `gpgme/gpg-error` в окружении сборки.
 
-В таком состоянии используйте `update check` только для информирования, а установку делайте вручную через доверенный release pipeline.
+## 5. Packet bypass не стартует
 
-## 5. PT (`obfs4`/`snowflake`) не стартует
+Проверьте:
+
+- включение `evasion.packet_bypass_enabled` и отсутствие `PRIME_PACKET_BYPASS=0`;
+- доступность pinned release asset;
+- корректность digest-переменных (`PRIME_PACKET_BYPASS_PAYLOAD_SHA256` / `PRIME_PACKET_BYPASS_BINARY_SHA256`).
+
+## 6. PT (`obfs4`/`snowflake`) не стартует
 
 Проверьте наличие внешних инструментов:
 
@@ -61,25 +57,29 @@ prime-net-engine --config prime-net-engine.toml proxy status
 - `obfs4proxy` (для obfs4)
 - `snowflake-client` (для snowflake)
 
-Также учитывайте env-переключатели авто-bootstrap (`PRIME_PT_AUTO_BOOTSTRAP`, `PRIME_PT_*_URLS`).
-
-## 6. Низкая скорость / нестабильный throughput
+## 7. Низкая скорость / нестабильный throughput
 
 Проверьте:
 
-- `evasion.traffic_shaping_enabled`
-- агрессивность `evasion.strategy`
-- таймауты и concurrency в `[download]`
+- `evasion.strategy` и `prime_mode`;
+- `evasion.fragment_*` параметры;
+- `download.*` таймауты/конкурентность;
+- влияние `traffic_shaping_enabled`.
 
-Для сравнения можно быстро переключиться:
+## 8. CI падает на `tempfile`/`fmt`
 
-```bash
-prime-net-engine --config prime-net-engine.toml --preset max-compatibility test --url https://example.com
-```
+Если ошибка вида `use of unresolved crate tempfile`:
 
-## 7. Что приложить при разборе инцидента
+- проверьте, что dependency подключена в `[dependencies]` (не только `dev-dependencies`) для соответствующей feature.
 
-- ОС и версия;
-- используемый конфиг (без секретов);
-- точная команда запуска;
-- фрагмент логов (`--log-format json --log-level debug`).
+Если падает `cargo fmt --all -- --check`:
+
+- выполните локально `cargo fmt --all` и перезапустите checks.
+
+## 9. Что прикладывать к баг-репорту
+
+- ОС и архитектуру;
+- команду запуска;
+- редактированный конфиг (без секретов);
+- логи с `--log-level debug --log-format json`;
+- при необходимости: browser/network консоль и таймштампы.

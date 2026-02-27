@@ -2,7 +2,7 @@
 
 ## Файлы и артефакты
 
-- заголовок: `include/prime_net.h`
+- C header: `include/prime_net.h`
 - пример: `examples/c_integration/main.c`
 
 Сборка:
@@ -11,7 +11,7 @@
 cargo build --release
 ```
 
-Выходные артефакты (имя библиотеки = `prime_net_engine_core`):
+Артефакты (`prime_net_engine_core`):
 
 - Windows: `prime_net_engine_core.dll`, `prime_net_engine_core.lib`
 - Linux: `libprime_net_engine_core.so`
@@ -27,7 +27,7 @@ cargo build --release
 
 Если `prime_engine_new` вернул `NULL`, читайте `prime_last_error_message()`.
 
-## Sync запрос
+## Sync API
 
 ```c
 PrimeResponse* prime_engine_fetch(
@@ -38,20 +38,22 @@ PrimeResponse* prime_engine_fetch(
 );
 ```
 
-## Async запрос
+## Async API
 
 1. `prime_engine_fetch_async(...) -> PrimeRequestHandle*`
 2. `prime_request_wait(handle, timeout_ms)`
-3. при необходимости `prime_request_cancel`, `prime_request_status`, `prime_request_free`
+3. опционально `prime_request_cancel(handle)`
+4. `prime_request_status(handle)`
+5. обязательно `prime_request_free(handle)`
 
-`timeout_ms = 0` означает ждать бесконечно.
+`timeout_ms = 0` -> ждать бесконечно.
 
 При timeout:
 
 - `prime_request_wait` возвращает response с ошибкой `"timeout"`;
-- handle остаётся валиден и можно ждать повторно.
+- handle остается валиден.
 
-## Коды ошибок
+## Error codes
 
 - `PRIME_OK`
 - `PRIME_ERR_NULL_PTR`
@@ -59,12 +61,14 @@ PrimeResponse* prime_engine_fetch(
 - `PRIME_ERR_INVALID_REQUEST`
 - `PRIME_ERR_RUNTIME`
 
-## Ownership и потокобезопасность
+## Ownership
 
 - `PrimeResponse*` всегда освобождать через `prime_response_free`.
-- `PrimeRequestHandle*` освобождать через `prime_request_free`, если не был поглощён `prime_request_wait`.
-- `PrimeEngine*` можно использовать из нескольких потоков; внутри работает runtime thread с очередью задач.
+- `PrimeRequestHandle*` всегда освобождать через `prime_request_free`.
+- `prime_request_wait` не освобождает handle автоматически.
 
 ## Progress callback
 
-`ProgressCallback(downloaded, total, speed_mbps, user_data)` вызывается best-effort во время загрузки. Если callback не нужен, передавайте `NULL`.
+`ProgressCallback(downloaded, total, speed_mbps, user_data)` вызывается best-effort во время загрузки.
+
+Если callback не нужен, передавайте `NULL`.

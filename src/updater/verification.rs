@@ -15,7 +15,9 @@ impl SignatureVerifier {
     }
 
     fn ensure_public_key_configured(&self) -> Result<()> {
-        if self.public_key.contains("REPLACE_WITH_REAL_RELEASE_SIGNING_KEY")
+        if self
+            .public_key
+            .contains("REPLACE_WITH_REAL_RELEASE_SIGNING_KEY")
             || self
                 .public_key_fingerprint
                 .contains("REPLACE_WITH_REAL_RELEASE_SIGNING_FINGERPRINT")

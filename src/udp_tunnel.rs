@@ -127,9 +127,9 @@ impl UdpOverTcpTunnel {
             ack: ack_tx,
         };
         self.write_tx.try_send(req).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => EngineError::Internal(
-                "udp tunnel send queue is full; datagram dropped".to_owned(),
-            ),
+            mpsc::error::TrySendError::Full(_) => {
+                EngineError::Internal("udp tunnel send queue is full; datagram dropped".to_owned())
+            }
             mpsc::error::TrySendError::Closed(_) => {
                 EngineError::Internal("udp tunnel is closed".to_owned())
             }
@@ -182,7 +182,9 @@ async fn read_datagram(
             let mut port = [0u8; 2];
             rd.read_exact(&mut port).await.map_err(EngineError::Io)?;
             let mut scope_id = [0u8; 4];
-            rd.read_exact(&mut scope_id).await.map_err(EngineError::Io)?;
+            rd.read_exact(&mut scope_id)
+                .await
+                .map_err(EngineError::Io)?;
             UdpTargetAddr::Socket(SocketAddr::V6(SocketAddrV6::new(
                 Ipv6Addr::from(ip),
                 u16::from_be_bytes(port),
@@ -342,7 +344,11 @@ mod tests {
         let mut tunnel = UdpOverTcpTunnel::connect(addr, UdpOverTcpConfig::default())
             .await
             .expect("connect");
-        let item = tunnel.next().await.expect("stream item").expect("ok datagram");
+        let item = tunnel
+            .next()
+            .await
+            .expect("stream item")
+            .expect("ok datagram");
         match item.addr {
             UdpTargetAddr::Domain { host, port } => {
                 assert_eq!(host, "example.com");
@@ -372,7 +378,11 @@ mod tests {
         let mut tunnel = UdpOverTcpTunnel::connect(addr, UdpOverTcpConfig::default())
             .await
             .expect("connect");
-        let item = tunnel.next().await.expect("stream item").expect("ok datagram");
+        let item = tunnel
+            .next()
+            .await
+            .expect("stream item")
+            .expect("ok datagram");
         match item.addr {
             UdpTargetAddr::Socket(SocketAddr::V6(v6)) => {
                 assert_eq!(*v6.ip(), Ipv6Addr::LOCALHOST);

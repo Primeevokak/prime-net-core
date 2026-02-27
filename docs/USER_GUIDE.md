@@ -2,19 +2,19 @@
 
 ## Базовый ежедневный сценарий
 
-1. Создать или обновить конфиг:
+1. Создать/обновить конфиг:
 
 ```bash
 prime-net-engine wizard --out prime-net-engine.toml
 ```
 
-2. Проверить валидность:
+2. Проверить конфиг:
 
 ```bash
 prime-net-engine --config prime-net-engine.toml --config-check
 ```
 
-3. Поднять локальный SOCKS5:
+3. Запустить локальный SOCKS5:
 
 ```bash
 prime-net-engine --config prime-net-engine.toml socks --bind 127.0.0.1:1080
@@ -40,21 +40,21 @@ prime-net-engine --config prime-net-engine.toml test --url https://example.com
 prime-net-engine --config prime-net-engine.toml tui
 ```
 
-Что обычно делают в TUI:
+Обычно в TUI:
 
-- вкладка `Конфиг`: редактирование + сохранение (`s`) и reload (`r`);
-- вкладка `Прокси`: запуск/остановка ядра (`a`/`x`) и диагностика (`u`);
-- вкладка `Логи` (в advanced режиме): фильтры, поиск, экспорт.
+- `Config`: правка/сохранение конфигурации;
+- `Proxy`: запуск ядра и диагностика прокси;
+- `Logs`: фильтры и анализ событий.
 
-## Preset-first сценарий
+## Preset-first сценарии
 
-Если нужно быстро стартовать с понятным профилем:
+Строгая приватность:
 
 ```bash
 prime-net-engine --config prime-net-engine.toml --preset strict-privacy --config-check
 ```
 
-или
+Агрессивный обход:
 
 ```bash
 prime-net-engine --config prime-net-engine.toml --preset aggressive-evasion test --url https://example.com
@@ -69,7 +69,7 @@ prime-net-engine --config prime-net-engine.toml blocklist status
 
 ## Обновления
 
-Проверка:
+Проверка доступных релизов:
 
 ```bash
 prime-net-engine --config prime-net-engine.toml update check
@@ -81,24 +81,16 @@ prime-net-engine --config prime-net-engine.toml update check
 prime-net-engine --config prime-net-engine.toml update install
 ```
 
-Важно: установка обновления требует успешной проверки подписи. Если сборка без `signature-verification` или в коде не настроен публичный ключ релизов, `update install` завершится ошибкой.
+Важно: `update install` требует рабочей цепочки signature verification и настроенного release signing key/fingerprint.
 
 ## PT сценарий (Trojan/Shadowsocks/Obfs4/Snowflake)
 
-- настройте секцию `[pt]` в конфиге;
+- заполните `[pt]` секцию;
 - не задавайте одновременно `[pt]` и `[proxy]`;
-- запускайте через `socks`, чтобы движок поднял локальный SOCKS5 endpoint.
+- запускайте через `socks`.
 
-Пример запуска:
-
-```bash
-prime-net-engine --config prime-net-engine.toml socks --bind 127.0.0.1:1080
-```
-
-## Логи для диагностики
+## Диагностический запуск с логами
 
 ```bash
 prime-net-engine --config prime-net-engine.toml --log-level debug --log-format json --log-file prime.log test --url https://example.com
 ```
-
-Дальше: `docs/TROUBLESHOOTING.md`.

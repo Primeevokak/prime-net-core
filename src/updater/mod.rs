@@ -367,13 +367,9 @@ mod tests {
             "https://github.com/openai/example/releases/download/v1/bin"
         )
         .is_ok());
-        assert!(validate_update_download_url(
-            "https://objects.githubusercontent.com/asset"
-        )
-        .is_ok());
-        assert!(validate_update_download_url(
-            "https://downloads.evil.example/asset"
-        )
-        .is_err());
+        assert!(
+            validate_update_download_url("https://objects.githubusercontent.com/asset").is_ok()
+        );
+        assert!(validate_update_download_url("https://downloads.evil.example/asset").is_err());
     }
 }

@@ -1,6 +1,6 @@
 ﻿# CLI `prime-net-engine`
 
-Документ соответствует `src/bin/prime-net-engine/main.rs`.
+Источник истины: `src/bin/prime-net-engine/main.rs`.
 
 ## Формат запуска
 
@@ -12,15 +12,15 @@ prime-net-engine [GLOBAL_OPTS] <command> [command_opts]
 
 ## Глобальные опции
 
-- `--config <path>`: путь к конфигу (TOML/JSON/YAML).
-- `--preset <name>`: `strict-privacy|balanced-privacy|max-compatibility|aggressive-evasion`.
-- `--config-check`: валидация конфига + probes (DoH/fronting).
-- `--offline`: только для `--config-check`, пропустить сетевые probes.
-- `--probe-domain <domain>`: домен для DoH probe (по умолчанию `example.com`).
-- `--log-level <lvl>`: `error|warn|info|debug|trace`.
-- `--log-format <fmt>`: `text|json`.
-- `--log-file <path>`: писать логи в файл.
-- `--log-rotation <rot>`: `never|daily|hourly|minutely`.
+- `--config <path>`
+- `--preset <strict-privacy|balanced-privacy|max-compatibility|aggressive-evasion>`
+- `--config-check`
+- `--offline` (только вместе с `--config-check`)
+- `--probe-domain <domain>` (default: `example.com`)
+- `--log-level <error|warn|info|debug|trace>`
+- `--log-format <text|json>`
+- `--log-file <path>`
+- `--log-rotation <never|daily|hourly|minutely>`
 
 ## Команды
 
@@ -32,11 +32,11 @@ prime-net-engine [GLOBAL_OPTS] fetch <url> [FETCH_OPTS]
 
 `FETCH_OPTS`:
 
-- `--method <METHOD>` (по умолчанию `GET`)
+- `--method <METHOD>`
 - `-H, --header "Key: Value"` (повторяемый)
 - `--body <string>`
 - `--body-file <path>`
-- `--out <path>` или `--out -` для stdout
+- `--out <path>` (или `-` для stdout)
 - `--print-headers`
 
 ### `download`
@@ -53,7 +53,7 @@ prime-net-engine [GLOBAL_OPTS] socks [SOCKS_OPTS]
 
 `SOCKS_OPTS`:
 
-- `--bind <host:port>` (по умолчанию `127.0.0.1:1080`)
+- `--bind <host:port>` (default: `127.0.0.1:1080`)
 - `--silent-drop`
 
 ### `wizard`
@@ -67,8 +67,6 @@ prime-net-engine [GLOBAL_OPTS] wizard [--out <path>] [--force]
 ```text
 prime-net-engine [GLOBAL_OPTS] tui [--config <path>]
 ```
-
-Запускает соседний бинарник `prime-tui`.
 
 ### `proxy`
 
@@ -109,7 +107,7 @@ prime-net-engine [GLOBAL_OPTS] update <check|install|rollback> [opts]
 prime-net-engine [GLOBAL_OPTS] test [--url <url>] [--check-leaks]
 ```
 
-Также поддерживается позиционный URL первым аргументом: `test https://example.com`.
+Также поддерживается позиционный URL: `test https://example.com`.
 
 ## Примеры
 
@@ -124,9 +122,9 @@ prime-net-engine --config cfg.toml update check --channel beta
 prime-net-engine --config cfg.toml test --url https://example.com --check-leaks
 ```
 
-## Что важно знать
+## Важные замечания
 
-- Неиспользуемые/неизвестные флаги приводят к ошибке `InvalidInput`.
-- `download` требует обязательный `--out`.
-- В `proxy enable --mode custom` обязателен `--pac-url`.
+- Неизвестные флаги/аргументы завершаются ошибкой `InvalidInput`.
+- Для `download` параметр `--out` обязателен.
+- Для `proxy enable --mode custom` параметр `--pac-url` обязателен.
 - Отдельного флага `--version` в CLI нет.

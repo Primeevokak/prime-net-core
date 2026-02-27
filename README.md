@@ -1,6 +1,6 @@
 ﻿# prime-net-engine
 
-Актуальная версия: `0.5.0`.
+Актуальная версия: `0.6.0`.
 
 `prime-net-engine` это сетевой движок на Rust с двумя основными способами использования:
 
@@ -23,6 +23,14 @@
 
 ```bash
 cargo build --release --bin prime-net-engine --bin prime-tui
+```
+
+Локальные проверки перед пушем (как в CI):
+
+```bash
+cargo fmt --all -- --check
+cargo check --all-targets
+cargo test -p prime-net-engine --lib --no-run
 ```
 
 Минимальный сценарий:
