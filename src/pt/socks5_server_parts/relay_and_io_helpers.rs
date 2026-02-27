@@ -344,17 +344,6 @@ pub(super) fn apply_tcp_window_size(stream: &TcpStream, size: u32) -> std::io::R
     Ok(())
 }
 
-pub async fn handle_socks5_udp_associate(
-    _conn_id: u64,
-    _client_tcp: &mut TcpStream,
-    _listen_addr: SocketAddr,
-    _relay_opts: RelayOptions,
-) -> Result<()> {
-    Err(EngineError::Internal(
-        "UDP Associate not fully implemented in this module".to_owned(),
-    ))
-}
-
 pub fn route_capability_slot_mut(
     caps: &mut RouteCapabilities,
     kind: RouteKind,

@@ -222,6 +222,7 @@ pub struct RouteCandidate {
 }
 
 impl RouteCandidate {
+    #[cfg(test)]
     pub fn direct(source: &'static str) -> Self {
         Self {
             source,
@@ -244,6 +245,7 @@ impl RouteCandidate {
         }
     }
 
+    #[cfg(test)]
     pub fn bypass(source: &'static str, addr: SocketAddr, idx: u8, total: u8) -> Self {
         Self {
             source,
