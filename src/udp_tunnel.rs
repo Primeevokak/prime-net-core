@@ -200,7 +200,9 @@ async fn read_datagram(
                 return Err(EngineError::Internal("udp tunnel empty domain".to_owned()));
             }
             let mut host_buf = vec![0u8; len];
-            rd.read_exact(&mut host_buf).await.map_err(EngineError::Io)?;
+            rd.read_exact(&mut host_buf)
+                .await
+                .map_err(EngineError::Io)?;
             let host = String::from_utf8(host_buf).map_err(|e| {
                 EngineError::Internal(format!("udp tunnel domain decode failed: {e}"))
             })?;

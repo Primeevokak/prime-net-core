@@ -35,13 +35,17 @@ fn main() {
     let worker_threads = std::env::var("PRIME_WORKER_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        });
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads.max(1))
         .enable_all()
         // Aggressive I/O polling for lower latency in packet forwarding
-        .global_queue_interval(31) 
+        .global_queue_interval(31)
         .build()
         .expect("Failed to build tokio runtime");
 
@@ -65,6 +69,14 @@ async fn real_main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print_help();
+        return Ok(());
+    }
+
+    if args.iter().any(|a| a == "-v" || a == "--version") {
+        println!(
+            "prime-net-engine {}",
+            prime_net_engine_core::version::APP_VERSION
+        );
         return Ok(());
     }
 
@@ -718,6 +730,7 @@ USAGE:
   prime-net-engine [GLOBAL_OPTS] test [--url <url>] [--check-leaks]
 
 GLOBAL_OPTS:
+  -v, --version            Print version information
   --config <path>          Config file (TOML/JSON/YAML)
   --preset <name>          Apply a built-in preset (strict-privacy|balanced-privacy|max-compatibility|aggressive-evasion)
   --config-check           Validate config and probe DoH/fronting endpoints

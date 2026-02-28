@@ -166,7 +166,10 @@ pub fn looks_like_domain(s: &str) -> bool {
     if labels.len() < 2 {
         return false;
     }
-    if labels.iter().any(|label| label.is_empty() || label.len() > 63) {
+    if labels
+        .iter()
+        .any(|label| label.is_empty() || label.len() > 63)
+    {
         return false;
     }
     if labels.iter().any(|label| {
@@ -284,7 +287,7 @@ fn parse_entities_from_text(body: &str) -> (Vec<String>, Vec<String>) {
     if d1.is_empty() && i1.is_empty() {
         return (d_legacy, i_legacy);
     }
-    
+
     // De-duplicate domains and IPs across all parsers
     d1.extend(d_legacy);
     i1.extend(i_legacy);

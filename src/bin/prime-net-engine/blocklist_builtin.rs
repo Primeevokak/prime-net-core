@@ -22,7 +22,6 @@ pub fn is_bypass_domain(host: &str) -> bool {
             "twitch.tv",
             "ttvnw.net",
             "jtvnw.net",
-
             // === Gaming (Censored) ===
             "discord.com",
             "discord.gg",
@@ -31,7 +30,6 @@ pub fn is_bypass_domain(host: &str) -> bool {
             "discord.media",
             "discord-attachments.net",
             "steamcommunity.com",
-
             // === Social Media & Messengers (Censored) ===
             "instagram.com",
             "cdninstagram.com",
@@ -48,11 +46,9 @@ pub fn is_bypass_domain(host: &str) -> bool {
             "viber.com",
             "signal.org",
             "patreon.com",
-
             // === Media & Audio (Censored) ===
             "soundcloud.com",
             "sndcdn.com",
-
             // === News & Information (Censored) ===
             "bbc.com",
             "bbc.co.uk",
@@ -68,7 +64,6 @@ pub fn is_bypass_domain(host: &str) -> bool {
             "zona.media",
             "tvrain.tv",
             "themoscowtimes.com",
-
             // === Privacy & Infrastructure (Censored) ===
             "proton.me",
             "protonmail.com",
@@ -98,7 +93,8 @@ pub fn is_bypass_domain(host: &str) -> bool {
         let suffix_len = domain.len();
         if host.len() > suffix_len {
             let dot_pos = host.len() - suffix_len - 1;
-            if host.as_bytes()[dot_pos] == b'.' && host[dot_pos + 1..].eq_ignore_ascii_case(domain) {
+            if host.as_bytes()[dot_pos] == b'.' && host[dot_pos + 1..].eq_ignore_ascii_case(domain)
+            {
                 return true;
             }
         }

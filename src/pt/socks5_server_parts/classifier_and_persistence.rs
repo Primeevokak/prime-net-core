@@ -197,9 +197,7 @@ pub(super) fn should_mark_suspicious_zero_reply(
     bytes_upstream_to_client: u64,
     min_c2u: usize,
 ) -> bool {
-    port == 443
-        && bytes_upstream_to_client <= 7
-        && bytes_client_to_upstream >= min_c2u as u64
+    port == 443 && bytes_upstream_to_client <= 7 && bytes_client_to_upstream >= min_c2u as u64
 }
 
 pub(super) static LAST_CLASSIFIER_EMIT_UNIX: AtomicU64 = AtomicU64::new(0);

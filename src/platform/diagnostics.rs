@@ -96,8 +96,7 @@ impl ProxyDiagnostics {
             return match output {
                 Ok(out) if out.status.success() => {
                     let text = String::from_utf8_lossy(&out.stdout);
-                    if text.contains("SOCKSProxy : 1")
-                        || text.contains("ProxyAutoConfigEnable : 1")
+                    if text.contains("SOCKSProxy : 1") || text.contains("ProxyAutoConfigEnable : 1")
                     {
                         DiagnosticResult::ok("System proxy configured (active)")
                     } else {
@@ -128,7 +127,7 @@ impl ProxyDiagnostics {
                     }
                 }
             }
-            
+
             // Check resolvectl for DNS
             let r_out = Command::new("resolvectl").arg("status").output();
             if let Ok(out) = r_out {
@@ -137,11 +136,14 @@ impl ProxyDiagnostics {
                 }
             }
 
-            if results.is_empty() {
-                DiagnosticResult::info("Generic Linux: no desktop-specific proxy detected", "Check environment variables (ALL_PROXY)")
+            return if results.is_empty() {
+                DiagnosticResult::info(
+                    "Generic Linux: no desktop-specific proxy detected",
+                    "Check environment variables (ALL_PROXY)",
+                )
             } else {
                 DiagnosticResult::ok(&results.join(", "))
-            }
+            };
         }
 
         #[allow(unreachable_code)]
@@ -153,7 +155,10 @@ impl ProxyDiagnostics {
         let addr = "8.8.8.8:53".parse::<SocketAddr>().unwrap();
         match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
             Ok(_) => DiagnosticResult::ok("Internet connectivity established (ICMP/TCP)"),
-            Err(e) => DiagnosticResult::error("No internet connectivity", &format!("Error: {e}. Check your network interface or ISP.")),
+            Err(e) => DiagnosticResult::error(
+                "No internet connectivity",
+                &format!("Error: {e}. Check your network interface or ISP."),
+            ),
         }
     }
 

@@ -501,12 +501,13 @@ pub(super) async fn handle_http_proxy(
             Err(e) if is_expected_disconnect(&e) => {
                 let lifetime_ms = direct_tunnel_started.elapsed().as_millis() as u64;
                 let mut outcome_error_class = "client-disconnect";
-                
-                // For censored services, a client disconnect with zero data from upstream 
+
+                // For censored services, a client disconnect with zero data from upstream
                 // is almost certainly a blocked connection that we should penalize.
                 let bucket = host_service_bucket(route_destination_key(&connected.route_key));
-                let is_censored = matches!(bucket.as_str(), "meta-group:youtube" | "meta-group:discord");
-                
+                let is_censored =
+                    matches!(bucket.as_str(), "meta-group:youtube" | "meta-group:discord");
+
                 if is_censored && lifetime_ms > 1000 {
                     record_route_failure(
                         &connected.route_key,

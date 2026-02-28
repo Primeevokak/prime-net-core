@@ -1579,22 +1579,12 @@ mod tests {
 
     #[test]
     fn shadow_reward_penalizes_zero_byte_disconnect_after_connect() {
-        let long_disconnect = shadow_reward_from_outcome(
-            true,
-            false,
-            0,
-            12_000,
-            "client-disconnect",
-        );
+        let long_disconnect =
+            shadow_reward_from_outcome(true, false, 0, 12_000, "client-disconnect");
         assert!(long_disconnect < 0);
 
-        let before_confirm = shadow_reward_from_outcome(
-            true,
-            false,
-            0,
-            0,
-            "client-disconnect-before-confirm",
-        );
+        let before_confirm =
+            shadow_reward_from_outcome(true, false, 0, 0, "client-disconnect-before-confirm");
         assert!(before_confirm < 0);
     }
 

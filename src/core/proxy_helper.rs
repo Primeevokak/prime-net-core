@@ -5,9 +5,7 @@ use url::Url;
 use crate::anticensorship::ResolverChain;
 use crate::error::{EngineError, Result};
 
-pub fn normalize_proxy_host_port(
-    s: &str,
-) -> Result<(String, u16, Option<String>, Option<String>)> {
+pub fn normalize_proxy_host_port(s: &str) -> Result<(String, u16, Option<String>, Option<String>)> {
     let s = s.trim();
     if s.is_empty() {
         return Err(EngineError::Config("proxy.address is empty".to_owned()));
@@ -122,11 +120,9 @@ pub async fn connect_via_socks5(
     let mut tcp = if let Some(stream) = tcp_opt {
         stream
     } else {
-        return Err(last_connect_err
-            .map(EngineError::from)
-            .unwrap_or_else(|| {
-                EngineError::Internal("failed to resolve/connect SOCKS5 proxy".to_owned())
-            }));
+        return Err(last_connect_err.map(EngineError::from).unwrap_or_else(|| {
+            EngineError::Internal("failed to resolve/connect SOCKS5 proxy".to_owned())
+        }));
     };
     let _ = tcp.set_nodelay(true);
 

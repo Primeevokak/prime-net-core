@@ -232,8 +232,14 @@ impl WindowsProxyManager {
 
     fn backup_current_settings(&self) -> Result<WindowsProxyBackup> {
         let key_r = Self::open_settings_read()?;
-        let conn_key = RegKey::predef(HKEY_CURRENT_USER).open_subkey(INTERNET_CONNECTIONS).ok();
-        let connection_settings = conn_key.and_then(|k| k.get_raw_value("DefaultConnectionSettings").ok().map(|v| v.bytes));
+        let conn_key = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(INTERNET_CONNECTIONS)
+            .ok();
+        let connection_settings = conn_key.and_then(|k| {
+            k.get_raw_value("DefaultConnectionSettings")
+                .ok()
+                .map(|v| v.bytes)
+        });
 
         Ok(WindowsProxyBackup {
             proxy_enable: key_r.get_value("ProxyEnable").unwrap_or(0_u32),
@@ -256,29 +262,40 @@ impl WindowsProxyManager {
         let mut data: Vec<u8> = key
             .get_raw_value("DefaultConnectionSettings")
             .map(|v| v.bytes)
-            .unwrap_or_else(|_| vec![0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+            .unwrap_or_else(|_| {
+                vec![
+                    0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00,
+                ]
+            });
 
         if data.len() < 12 {
             // Re-initialize with minimal valid header if corrupted
-            data = vec![0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+            data = vec![
+                0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00,
+            ];
         }
 
         // Flags byte is usually at offset 8
         data[8] = flags;
 
         // Structured binary format requires careful length-prefixed strings.
-        // For now, we only patch the flags and clear strings to be safe, 
-        // as InternetSetOption handles strings in registry keys well enough 
+        // For now, we only patch the flags and clear strings to be safe,
+        // as InternetSetOption handles strings in registry keys well enough
         // if flags in binary blob are synced.
-        
+
         // Offset 12: Proxy server string
         // Offset 12 + len: Bypass string
         // Offset 12 + len + len: PAC URL string
 
-        let _ = key.set_raw_value("DefaultConnectionSettings", &winreg::RegValue {
-            bytes: data,
-            vtype: winreg::enums::REG_BINARY,
-        });
+        let _ = key.set_raw_value(
+            "DefaultConnectionSettings",
+            &winreg::RegValue {
+                bytes: data,
+                vtype: winreg::enums::REG_BINARY,
+            },
+        );
         Ok(())
     }
 
@@ -311,10 +328,13 @@ impl WindowsProxyManager {
         }
         if let Some(ref bin) = backup.connection_settings {
             let conn_key = Self::open_connections_write()?;
-            let _ = conn_key.set_raw_value("DefaultConnectionSettings", &winreg::RegValue {
-                bytes: bin.clone(),
-                vtype: winreg::enums::REG_BINARY,
-            });
+            let _ = conn_key.set_raw_value(
+                "DefaultConnectionSettings",
+                &winreg::RegValue {
+                    bytes: bin.clone(),
+                    vtype: winreg::enums::REG_BINARY,
+                },
+            );
         }
         self.refresh_internet_settings()?;
         Ok(())
@@ -542,7 +562,12 @@ impl ProxyManager for WindowsProxyManager {
         key_w.set_value("AutoDetect", &0_u32)?;
         self.set_proxy_bypass("")?;
 
-        let _ = self.patch_binary_connection_settings(0x03, Some(&server), None, Some(Self::DEFAULT_PROXY_BYPASS));
+        let _ = self.patch_binary_connection_settings(
+            0x03,
+            Some(&server),
+            None,
+            Some(Self::DEFAULT_PROXY_BYPASS),
+        );
 
         if let Ok(adapters) = self.get_active_adapters() {
             for adapter in adapters {
@@ -563,7 +588,12 @@ impl ProxyManager for WindowsProxyManager {
         key_w.set_value("AutoDetect", &0_u32)?;
         self.set_proxy_bypass("")?;
 
-        let _ = self.patch_binary_connection_settings(0x05, None, Some(pac_url), Some(Self::DEFAULT_PROXY_BYPASS));
+        let _ = self.patch_binary_connection_settings(
+            0x05,
+            None,
+            Some(pac_url),
+            Some(Self::DEFAULT_PROXY_BYPASS),
+        );
 
         self.refresh_internet_settings()?;
         Ok(())
@@ -592,7 +622,15 @@ impl ProxyManager for WindowsProxyManager {
             for adapter in adapters {
                 // netsh interface ipv4 set dns name="Adapter Name" static 127.0.0.1
                 let _ = Command::new("netsh")
-                    .args(["interface", "ipv4", "set", "dns", &format!("name=\"{}\"", adapter), "static", dns_server])
+                    .args([
+                        "interface",
+                        "ipv4",
+                        "set",
+                        "dns",
+                        &format!("name=\"{}\"", adapter),
+                        "static",
+                        dns_server,
+                    ])
                     .status();
             }
         }
@@ -604,7 +642,14 @@ impl ProxyManager for WindowsProxyManager {
             for adapter in adapters {
                 // netsh interface ipv4 set dns name="Adapter Name" source=dhcp
                 let _ = Command::new("netsh")
-                    .args(["interface", "ipv4", "set", "dns", &format!("name=\"{}\"", adapter), "source=dhcp"])
+                    .args([
+                        "interface",
+                        "ipv4",
+                        "set",
+                        "dns",
+                        &format!("name=\"{}\"", adapter),
+                        "source=dhcp",
+                    ])
                     .status();
             }
         }

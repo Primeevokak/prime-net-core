@@ -405,7 +405,9 @@ fn base_crypto_provider() -> rustls::crypto::CryptoProvider {
         .unwrap_or_else(rustls::crypto::aws_lc_rs::default_provider)
 }
 
-pub(crate) fn select_crypto_provider(cfg: &EngineConfig) -> std::sync::Arc<rustls::crypto::CryptoProvider> {
+pub(crate) fn select_crypto_provider(
+    cfg: &EngineConfig,
+) -> std::sync::Arc<rustls::crypto::CryptoProvider> {
     match cfg.tls.ja3_fingerprint {
         Ja3Fingerprint::RustlsDefault => default_crypto_provider_arc(),
         other => std::sync::Arc::new(apply_ja3_profile(base_crypto_provider(), other)),
@@ -561,7 +563,7 @@ fn build_rustls_client_config(
 ) -> Result<rustls::ClientConfig> {
     use crate::tls::TlsRootStore;
     let mut roots = rustls::RootCertStore::empty();
-    
+
     let use_system_verifier = cfg.tls.root_store == TlsRootStore::System;
 
     // Load bundled roots anyway as a fallback or for the initial builder state
@@ -587,7 +589,8 @@ fn build_rustls_client_config(
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         {
             use rustls_platform_verifier::Verifier;
-            tls.dangerous().set_certificate_verifier(std::sync::Arc::new(Verifier::new()));
+            tls.dangerous()
+                .set_certificate_verifier(std::sync::Arc::new(Verifier::new()));
         }
     }
 

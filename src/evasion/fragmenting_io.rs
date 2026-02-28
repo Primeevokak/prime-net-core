@@ -218,13 +218,14 @@ pub(crate) fn find_sni_info(client_hello: &[u8]) -> Option<(usize, usize)> {
     }
     let record_len = read_u16(b, 3)? as usize;
     if record_len + 5 > b.len() {
-        // Record is fragmented or incomplete in this buffer. 
+        // Record is fragmented or incomplete in this buffer.
         // We can't reliably find SNI without the full record.
         return None;
     }
 
     let mut pos = 5usize;
-    if b[pos] != 0x01 { // Handshake Type: Client Hello
+    if b[pos] != 0x01 {
+        // Handshake Type: Client Hello
         return None;
     }
     let hs_len = read_u24(b, pos + 1)? as usize;
@@ -264,7 +265,7 @@ pub(crate) fn find_sni_info(client_hello: &[u8]) -> Option<(usize, usize)> {
         let ext_type = read_u16(b, pos)?;
         let ext_len = read_u16(b, pos + 2)? as usize;
         pos += 4;
-        
+
         if pos + ext_len > ext_end {
             break;
         }

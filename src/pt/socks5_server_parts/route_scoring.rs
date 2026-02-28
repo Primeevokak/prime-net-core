@@ -480,7 +480,8 @@ pub(super) fn record_route_failure(
                 m.connect_failure_direct.fetch_add(1, Ordering::Relaxed);
             }
             if matches!(reason, "zero-reply-soft" | "suspicious-zero-reply") {
-                m.route_soft_zero_reply_direct.fetch_add(1, Ordering::Relaxed);
+                m.route_soft_zero_reply_direct
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
         RouteKind::Bypass => {
@@ -489,7 +490,8 @@ pub(super) fn record_route_failure(
                 m.connect_failure_bypass.fetch_add(1, Ordering::Relaxed);
             }
             if matches!(reason, "zero-reply-soft" | "suspicious-zero-reply") {
-                m.route_soft_zero_reply_bypass.fetch_add(1, Ordering::Relaxed);
+                m.route_soft_zero_reply_bypass
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -999,7 +1001,8 @@ pub(super) fn record_route_race_decision(race: bool, reason: RouteRaceReason) {
             m.race_reason_non_tls.fetch_add(1, Ordering::Relaxed);
         }
         RouteRaceReason::SingleCandidate => {
-            m.race_reason_single_candidate.fetch_add(1, Ordering::Relaxed);
+            m.race_reason_single_candidate
+                .fetch_add(1, Ordering::Relaxed);
         }
         RouteRaceReason::NoWinner => {
             m.race_reason_no_winner.fetch_add(1, Ordering::Relaxed);

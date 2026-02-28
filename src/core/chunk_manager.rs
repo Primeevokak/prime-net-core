@@ -118,15 +118,19 @@ impl ChunkManager {
             let downloaded = downloaded.clone();
             let progress = progress.clone();
             let sem = semaphore.clone();
-            
+
             join_set.spawn(async move {
-                let _permit = sem.acquire_owned().await
+                let _permit = sem
+                    .acquire_owned()
+                    .await
                     .map_err(|_| EngineError::Internal("semaphore closed".to_owned()))?;
-                
-                let bytes = download_chunk_with_retry(&client, &request, chunk, max_retries).await?;
+
+                let bytes =
+                    download_chunk_with_retry(&client, &request, chunk, max_retries).await?;
                 let chunk_len = bytes.len() as u64;
-                let total_downloaded = downloaded.fetch_add(chunk_len, Ordering::Relaxed) + chunk_len;
-                
+                let total_downloaded =
+                    downloaded.fetch_add(chunk_len, Ordering::Relaxed) + chunk_len;
+
                 if let Some(cb) = progress {
                     let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
                     let speed_mbps = (total_downloaded as f64 * 8.0 / 1_000_000.0) / elapsed;
@@ -189,13 +193,16 @@ impl ChunkManager {
             let progress = progress.clone();
             let sem = semaphore.clone();
             let file = file.clone();
-            
+
             join_set.spawn(async move {
-                let _permit = sem.acquire_owned().await
+                let _permit = sem
+                    .acquire_owned()
+                    .await
                     .map_err(|_| EngineError::Internal("semaphore closed".to_owned()))?;
-                
-                let bytes = download_chunk_with_retry(&client, &request, chunk, max_retries).await?;
-                
+
+                let bytes =
+                    download_chunk_with_retry(&client, &request, chunk, max_retries).await?;
+
                 let chunk_len = bytes.len() as u64;
                 let chunk_start = chunk.start;
                 tokio::task::spawn_blocking(move || {
@@ -203,10 +210,13 @@ impl ChunkManager {
                     guard.seek(SeekFrom::Start(chunk_start))?;
                     guard.write_all(&bytes)?;
                     Ok::<(), std::io::Error>(())
-                }).await.map_err(|e| EngineError::Internal(format!("blocking write task failed: {e}")))??;
+                })
+                .await
+                .map_err(|e| EngineError::Internal(format!("blocking write task failed: {e}")))??;
 
-                let total_downloaded = downloaded.fetch_add(chunk_len, Ordering::Relaxed) + chunk_len;
-                
+                let total_downloaded =
+                    downloaded.fetch_add(chunk_len, Ordering::Relaxed) + chunk_len;
+
                 if let Some(cb) = progress {
                     let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
                     let speed_mbps = (total_downloaded as f64 * 8.0 / 1_000_000.0) / elapsed;

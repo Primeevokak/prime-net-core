@@ -88,7 +88,7 @@ pub fn build_client_hello_for_domain(domain: &str) -> Vec<u8> {
 
     exts_data.extend_from_slice(&grease_type1.to_be_bytes());
     exts_data.extend_from_slice(&0u16.to_be_bytes());
-    
+
     exts_data.extend_from_slice(&grease_type2.to_be_bytes());
     exts_data.extend_from_slice(&0u16.to_be_bytes());
 

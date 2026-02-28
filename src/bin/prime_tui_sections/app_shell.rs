@@ -271,7 +271,13 @@ async fn main() {
 }
 
 async fn run_main() -> Result<()> {
-    let config_path = parse_config_path(std::env::args().skip(1).collect::<Vec<_>>())?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "-v" || a == "--version") {
+        println!("{}", PRIME_TUI_VERSION_LABEL);
+        return Ok(());
+    }
+
+    let config_path = parse_config_path(args)?;
     let (config, startup_note) = load_config_for_tui(&config_path);
 
     let log_viewer = Arc::new(LogViewer::new());

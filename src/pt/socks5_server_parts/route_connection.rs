@@ -96,7 +96,7 @@ pub fn route_race_launch_candidates(
         if let Some(direct) = ordered.iter().find(|c| c.kind == RouteKind::Direct) {
             out.push(direct.clone());
         }
-        // For Google we also want to probe a few bypass profiles in parallel 
+        // For Google we also want to probe a few bypass profiles in parallel
         // to avoid stalling if direct is TCP-silent.
         for bypass in ordered
             .iter()
@@ -224,8 +224,10 @@ pub async fn connect_via_best_route(
 
     let mut winners = JoinSet::new();
     let launch = route_race_launch_candidates(&candidates, target_label);
-    let launched_ids: std::collections::HashSet<String> =
-        launch.iter().map(|candidate| candidate.route_id()).collect();
+    let launched_ids: std::collections::HashSet<String> = launch
+        .iter()
+        .map(|candidate| candidate.route_id())
+        .collect();
     let direct_present = candidates.iter().any(|c| c.kind == RouteKind::Direct);
     let mut last_failed_candidate: Option<RouteCandidate> = None;
 

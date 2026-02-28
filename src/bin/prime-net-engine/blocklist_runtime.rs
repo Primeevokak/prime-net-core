@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use prime_net_engine_core::blocklist::{expand_tilde, looks_like_domain, update_blocklist, BlocklistCache};
+use prime_net_engine_core::blocklist::{
+    expand_tilde, looks_like_domain, update_blocklist, BlocklistCache,
+};
 use prime_net_engine_core::config::BlocklistConfig;
 use prime_net_engine_core::error::Result;
 use tracing::{info, warn};

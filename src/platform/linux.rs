@@ -247,8 +247,12 @@ impl LinuxProxyManager {
         // Try resolvectl (systemd-resolved)
         if Self::run_ok("resolvectl", &["status"]) {
             if let Ok(iface) = Self::get_default_interface() {
-                let _ = Command::new("resolvectl").args(["dns", &iface, dns_server]).status();
-                let _ = Command::new("resolvectl").args(["domain", &iface, "~."]).status();
+                let _ = Command::new("resolvectl")
+                    .args(["dns", &iface, dns_server])
+                    .status();
+                let _ = Command::new("resolvectl")
+                    .args(["domain", &iface, "~."])
+                    .status();
                 let _ = Command::new("resolvectl").arg("flush-caches").status();
             }
         }
@@ -256,9 +260,19 @@ impl LinuxProxyManager {
         // Also try NetworkManager as a backup
         if let Ok(conn) = Self::get_active_nm_connection() {
             let _ = Command::new("nmcli")
-                .args(["connection", "modify", &conn, "ipv4.dns", dns_server, "ipv4.ignore-auto-dns", "yes"])
+                .args([
+                    "connection",
+                    "modify",
+                    &conn,
+                    "ipv4.dns",
+                    dns_server,
+                    "ipv4.ignore-auto-dns",
+                    "yes",
+                ])
                 .status();
-            let _ = Command::new("nmcli").args(["connection", "up", &conn]).status();
+            let _ = Command::new("nmcli")
+                .args(["connection", "up", &conn])
+                .status();
         }
 
         Ok(())
@@ -272,20 +286,33 @@ impl LinuxProxyManager {
         }
         if let Ok(conn) = Self::get_active_nm_connection() {
             let _ = Command::new("nmcli")
-                .args(["connection", "modify", &conn, "-ipv4.dns", "ipv4.ignore-auto-dns", "no"])
+                .args([
+                    "connection",
+                    "modify",
+                    &conn,
+                    "-ipv4.dns",
+                    "ipv4.ignore-auto-dns",
+                    "no",
+                ])
                 .status();
-            let _ = Command::new("nmcli").args(["connection", "up", &conn]).status();
+            let _ = Command::new("nmcli")
+                .args(["connection", "up", &conn])
+                .status();
         }
         Ok(())
     }
 
     fn get_default_interface() -> Result<String> {
-        let out = Command::new("ip").args(["route", "show", "default"]).output()?;
+        let out = Command::new("ip")
+            .args(["route", "show", "default"])
+            .output()?;
         let text = String::from_utf8_lossy(&out.stdout);
         text.split_whitespace()
             .nth(4)
             .map(|s| s.to_owned())
-            .ok_or_else(|| EngineError::Internal("could not find default network interface".to_owned()))
+            .ok_or_else(|| {
+                EngineError::Internal("could not find default network interface".to_owned())
+            })
     }
 }
 
