@@ -209,72 +209,72 @@ impl<T> FragmentingIo<T> {
 
 pub(crate) fn find_sni_info(client_hello: &[u8]) -> Option<(usize, usize)> {
     let b = client_hello;
-    if b.len() < 5 {
+    // Minimal TLS Record + Handshake + ClientHello size
+    if b.len() < 42 {
         return None;
     }
     if b[0] != 0x16 {
         return None;
     }
     let record_len = read_u16(b, 3)? as usize;
-    let record_end = 5usize.checked_add(record_len)?;
-    if record_end > b.len() {
+    if record_len + 5 > b.len() {
+        // Record is fragmented or incomplete in this buffer. 
+        // We can't reliably find SNI without the full record.
         return None;
     }
 
     let mut pos = 5usize;
-    if pos + 4 > record_end || b[pos] != 0x01 {
+    if b[pos] != 0x01 { // Handshake Type: Client Hello
         return None;
     }
     let hs_len = read_u24(b, pos + 1)? as usize;
-    pos = pos.checked_add(4)?;
-    let hs_end = pos.checked_add(hs_len)?;
-    if hs_end > record_end {
+    pos += 4;
+    if pos + hs_len > b.len() {
         return None;
     }
 
-    if pos + 2 + 32 > hs_end {
-        return None;
-    }
-    pos = pos.checked_add(2 + 32)?;
+    // Skip Version (2) + Random (32)
+    pos = pos.checked_add(34)?;
 
-    let session_id_len = *b.get(pos)? as usize;
-    pos = pos.checked_add(1 + session_id_len)?;
-    if pos > hs_end {
-        return None;
-    }
+    // Session ID
+    let sid_len = *b.get(pos)? as usize;
+    pos = pos.checked_add(1 + sid_len)?;
 
+    // Cipher Suites
     let cs_len = read_u16(b, pos)? as usize;
     pos = pos.checked_add(2 + cs_len)?;
-    if pos > hs_end {
-        return None;
-    }
 
+    // Compression Methods
     let cm_len = *b.get(pos)? as usize;
     pos = pos.checked_add(1 + cm_len)?;
-    if pos > hs_end {
+
+    if pos + 2 > b.len() {
         return None;
     }
 
+    // Extensions
     let ext_total = read_u16(b, pos)? as usize;
-    pos = pos.checked_add(2)?;
-    let ext_end = pos.checked_add(ext_total)?;
-    if ext_end > hs_end {
+    pos += 2;
+    let ext_end = pos + ext_total;
+    if ext_end > b.len() {
         return None;
     }
 
     while pos + 4 <= ext_end {
         let ext_type = read_u16(b, pos)?;
         let ext_len = read_u16(b, pos + 2)? as usize;
-        let next = pos.checked_add(4 + ext_len)?;
-        if next > ext_end {
-            return None;
+        pos += 4;
+        
+        if pos + ext_len > ext_end {
+            break;
         }
+
         if ext_type == 0x0000 {
             // Found SNI extension.
-            // Structure: Type(2) | Len(2) | ListLen(2) | NameType(1) | NameLen(2) | Name(N)
-            return Some((pos, 4 + ext_len));
+            // Type(2) | Len(2) | ListLen(2) | NameType(1) | NameLen(2) | Name(N)
+            return Some((pos - 4, 4 + ext_len));
         }
-        pos = next;
+        pos += ext_len;
     }
     None
 }

@@ -6,6 +6,12 @@ impl EngineConfig {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let content = fs::read_to_string(path)?;
+        if content.trim().is_empty() {
+            let mut config = EngineConfig::default();
+            let _ = config.apply_compat_repairs();
+            config.validate()?;
+            return Ok(config);
+        }
         let ext = path
             .extension()
             .and_then(|v| v.to_str())

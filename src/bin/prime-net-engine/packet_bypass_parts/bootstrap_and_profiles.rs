@@ -255,53 +255,67 @@ fn set_port_arg(args: &mut Vec<String>, port: u16) {
 }
 
 fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
-    #[cfg(target_os = "windows")]
-    {
-        let mut profiles = vec![
-            PacketBypassProfile {
-                name: "stable-split-disorder".to_owned(),
-                args: vec![
-                    "--split".into(),
-                    "1+s".into(),
-                    "--disorder".into(),
-                    "3+s".into(),
-                    "--auto=torst".into(),
-                    "--timeout".into(),
-                    "10".into(),
-                ],
-            },
-            PacketBypassProfile {
-                name: "stable-disorder-fake".to_owned(),
-                args: vec![
-                    "--disorder".into(),
-                    "1".into(),
-                    "--fake".into(),
-                    "-1".into(),
-                    "--auto=torst".into(),
-                    "--timeout".into(),
-                    "10".into(),
-                ],
-            },
-            PacketBypassProfile {
-                name: "stable-auto-tlsrec".to_owned(),
-                args: vec![
-                    "--split".into(),
-                    "1+s".into(),
-                    "--disorder".into(),
-                    "3+s".into(),
-                    "--auto=torst".into(),
-                    "--timeout".into(),
-                    "3".into(),
-                    "--tlsrec".into(),
-                    "3+s".into(),
-                ],
-            },
-        ];
-        for p in &mut profiles { set_port_arg(&mut p.args, find_free_port()); }
-        profiles
+    let mut profiles = vec![
+        PacketBypassProfile {
+            name: "stable-split-disorder".to_owned(),
+            args: vec![
+                "--split".into(), "1+s".into(),
+                "--disorder".into(), "3+s".into(),
+                "--auto=torst".into(),
+                "--timeout".into(), "10".into(),
+            ],
+        },
+        PacketBypassProfile {
+            name: "stable-disorder-fake".to_owned(),
+            args: vec![
+                "--disorder".into(), "1".into(),
+                "--fake".into(), "-1".into(),
+                "--auto=torst".into(),
+                "--timeout".into(), "10".into(),
+            ],
+        },
+        PacketBypassProfile {
+            name: "stable-auto-tlsrec".to_owned(),
+            args: vec![
+                "--split".into(), "1+s".into(),
+                "--disorder".into(), "3+s".into(),
+                "--auto=torst".into(),
+                "--timeout".into(), "3".into(),
+                "--tlsrec".into(), "3+s".into(),
+            ],
+        },
+        PacketBypassProfile {
+            name: "aggressive-split-2".to_owned(),
+            args: vec![
+                "--split".into(), "2".into(),
+                "--disorder".into(), "1".into(),
+                "--auto=torst".into(),
+                "--timeout".into(), "5".into(),
+            ],
+        },
+        PacketBypassProfile {
+            name: "fixed-ttl-3".to_owned(),
+            args: vec![
+                "--fake".into(), "-1".into(),
+                "--ttl".into(), "3".into(),
+                "--auto=torst".into(),
+                "--timeout".into(), "5".into(),
+            ],
+        },
+        PacketBypassProfile {
+            name: "experimental-oob".to_owned(),
+            args: vec![
+                "--split".into(), "1+s".into(),
+                "--oob".into(), "1".into(),
+                "--auto=torst".into(),
+                "--timeout".into(), "5".into(),
+            ],
+        },
+    ];
+    for p in &mut profiles {
+        set_port_arg(&mut p.args, find_free_port());
     }
-    #[cfg(not(target_os = "windows"))]
-    { vec![] }
+    profiles
 }
 
 async fn start_packet_bypass_process(bin: &Path, profile: &PacketBypassProfile) -> Result<(Child, Vec<tokio::task::JoinHandle<()>>, Option<u16>)> {

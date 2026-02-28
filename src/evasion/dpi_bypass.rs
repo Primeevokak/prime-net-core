@@ -242,11 +242,12 @@ async fn write_http_fragmented(stream: &mut TcpStream, data: &[u8]) -> std::io::
     let mut pos = 0usize;
     while pos < header_end {
         let remaining = header_end - pos;
-        let chunk = remaining.min(rand::thread_rng().gen_range(8..=24));
+        let chunk = remaining.min(rand::thread_rng().gen_range(8..=32));
         stream.write_all(&data[pos..pos + chunk]).await?;
         pos += chunk;
         if pos < header_end {
-            tokio::time::sleep(Duration::from_millis(8)).await;
+            let delay = rand::thread_rng().gen_range(5..=25);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
         }
     }
 

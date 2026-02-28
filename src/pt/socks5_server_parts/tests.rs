@@ -116,6 +116,19 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_http_forward_head_keeps_non_default_port_in_host_header() {
+        let req = "GET http://example.com:8080/api HTTP/1.1\r\nHost: example.com:8080\r\nProxy-Connection: keep-alive\r\n\r\n";
+        let target = HttpForwardTarget {
+            host: "example.com".to_owned(),
+            port: 8080,
+            request_uri: "/api".to_owned(),
+        };
+        let rewritten = rewrite_http_forward_head(req, &target);
+        assert!(rewritten.contains("\r\nHost: example.com:8080\r\n"));
+        assert!(!rewritten.contains("\r\nProxy-Connection:"));
+    }
+
+    #[test]
     fn parse_ip_literal_accepts_bracketed_ipv6() {
         assert_eq!(
             parse_ip_literal("[2001:db8::3]").map(|ip| ip.to_string()),
@@ -189,6 +202,26 @@ mod tests {
             assert!(_tuned.options.fragment_size_max >= _tuned.options.fragment_size_min);
         }
         DEST_FAILURES.get_or_init(DashMap::new).remove(&key);
+    }
+
+    #[test]
+    fn bypass_mode_disables_internal_evasion_toggles() {
+        let base = RelayOptions {
+            fragment_client_hello: true,
+            split_at_sni: true,
+            client_hello_split_offsets: vec![1, 5, 16],
+            tcp_window_trick: true,
+            sni_spoofing: true,
+            sni_case_toggle: true,
+            ..RelayOptions::default()
+        };
+        let tuned = tune_relay_for_target(base, 443, "www.youtube.com:443", false, true);
+        assert!(!tuned.options.fragment_client_hello);
+        assert!(!tuned.options.split_at_sni);
+        assert!(tuned.options.client_hello_split_offsets.is_empty());
+        assert!(!tuned.options.tcp_window_trick);
+        assert!(!tuned.options.sni_spoofing);
+        assert!(!tuned.options.sni_case_toggle);
     }
 
     #[test]
@@ -323,7 +356,13 @@ mod tests {
             0,
             ROUTE_SOFT_ZERO_REPLY_MIN_LIFETIME_MS
         ));
-        assert!(!should_mark_bypass_zero_reply_soft(443, 500, 5, 5_000));
+        assert!(should_mark_bypass_zero_reply_soft(
+            443,
+            ROUTE_SOFT_ZERO_REPLY_MIN_C2U,
+            7,
+            ROUTE_SOFT_ZERO_REPLY_MIN_LIFETIME_MS
+        ));
+        assert!(!should_mark_bypass_zero_reply_soft(443, 500, 8, 5_000));
         assert!(!should_mark_bypass_zero_reply_soft(80, 500, 0, 5_000));
     }
 
@@ -491,7 +530,7 @@ mod tests {
         let route_key = "route-connected-prime.example:443|any";
         clear_route_state_for_test(route_key);
         let candidate =
-            RouteCandidate::bypass("builtin", "127.0.0.1:19080".parse().expect("addr"), 0, 2);
+            RouteCandidate::bypass("manual", "127.0.0.1:19080".parse().expect("addr"), 0, 2);
         record_route_connected(route_key, &candidate);
         let winner = route_winner_for_key(route_key).expect("winner");
         assert_eq!(winner.route_id, "bypass:1");
@@ -998,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn route_race_youtube_bypass_candidates_launch_without_stagger() {
+    fn route_race_youtube_bypass_candidates_are_staggered() {
         let bypass_1 =
             RouteCandidate::bypass("builtin", "127.0.0.1:19080".parse().expect("addr"), 0, 3);
         let bypass_2 =
@@ -1010,9 +1049,25 @@ mod tests {
         let d2 = route_race_candidate_delay_ms(2, &bypass_2, false, "www.youtube.com:443|any");
         let d3 = route_race_candidate_delay_ms(3, &bypass_3, false, "www.youtube.com:443|any");
 
-        assert_eq!(d1, 0);
-        assert_eq!(d2, 0);
-        assert_eq!(d3, 0);
+        assert!(d2 > d1);
+        assert!(d3 > d2);
+    }
+
+    #[test]
+    fn route_race_google_bypass_candidates_are_staggered() {
+        let bypass_1 =
+            RouteCandidate::bypass("builtin", "127.0.0.1:19080".parse().expect("addr"), 0, 3);
+        let bypass_2 =
+            RouteCandidate::bypass("builtin", "127.0.0.1:19081".parse().expect("addr"), 1, 3);
+        let bypass_3 =
+            RouteCandidate::bypass("builtin", "127.0.0.1:19082".parse().expect("addr"), 2, 3);
+
+        let d1 = route_race_candidate_delay_ms(1, &bypass_1, false, "www.google.com:443|any");
+        let d2 = route_race_candidate_delay_ms(2, &bypass_2, false, "www.google.com:443|any");
+        let d3 = route_race_candidate_delay_ms(3, &bypass_3, false, "www.google.com:443|any");
+
+        assert!(d2 > d1);
+        assert!(d3 > d2);
     }
 
     #[test]
@@ -1095,9 +1150,39 @@ mod tests {
 
         let launch = route_race_launch_candidates(&ordered, "www.youtube.com:443|any");
         assert_eq!(launch.len(), 3);
-        assert_eq!(launch[0].route_id(), bypass_1.route_id());
-        assert_eq!(launch[1].route_id(), "bypass:2");
-        assert_eq!(launch[2].route_id(), direct.route_id());
+        assert_eq!(launch[0].route_id(), direct.route_id());
+        assert_eq!(launch[1].route_id(), bypass_1.route_id());
+        assert_eq!(launch[2].route_id(), "bypass:2");
+    }
+
+    #[test]
+    fn route_race_launch_for_google_uses_direct_and_two_best_bypass_profiles() {
+        let direct = RouteCandidate::direct("adaptive");
+        let bypass_1 = RouteCandidate::bypass(
+            "adaptive-race",
+            "127.0.0.1:19080".parse().expect("addr"),
+            0,
+            3,
+        );
+        let bypass_2 = RouteCandidate::bypass(
+            "adaptive-race",
+            "127.0.0.1:19081".parse().expect("addr"),
+            1,
+            3,
+        );
+        let bypass_3 = RouteCandidate::bypass(
+            "adaptive-race",
+            "127.0.0.1:19082".parse().expect("addr"),
+            2,
+            3,
+        );
+        let ordered = vec![direct, bypass_1.clone(), bypass_2, bypass_3];
+
+        let launch = route_race_launch_candidates(&ordered, "www.google.com:443|any");
+        assert_eq!(launch.len(), 3);
+        assert_eq!(launch[0].route_id(), "direct");
+        assert_eq!(launch[1].route_id(), bypass_1.route_id());
+        assert_eq!(launch[2].route_id(), "bypass:2");
     }
 
     #[test]
@@ -1489,6 +1574,27 @@ mod tests {
         let mut invalid_outcome = outcome.clone();
         invalid_outcome.error_class.clear();
         assert!(invalid_outcome.validate().is_err());
+    }
+
+    #[test]
+    fn shadow_reward_penalizes_zero_byte_disconnect_after_connect() {
+        let long_disconnect = shadow_reward_from_outcome(
+            true,
+            false,
+            0,
+            12_000,
+            "client-disconnect",
+        );
+        assert!(long_disconnect < 0);
+
+        let before_confirm = shadow_reward_from_outcome(
+            true,
+            false,
+            0,
+            0,
+            "client-disconnect-before-confirm",
+        );
+        assert!(before_confirm < 0);
     }
 
     #[test]

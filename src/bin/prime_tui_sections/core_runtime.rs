@@ -428,6 +428,7 @@ fn load_config_for_tui(path: &Path) -> (EngineConfig, Option<String>) {
             let runtime_note = apply_runtime_pt_repair(&mut cfg);
             if let Err(e) = cfg.validate() {
                 let fallback = default_tui_config();
+                let _ = persist_default_config(path, &fallback);
                 (
                     fallback,
                     Some(format!(
@@ -467,6 +468,7 @@ fn load_config_for_tui(path: &Path) -> (EngineConfig, Option<String>) {
         }
         Err(e) => {
             let cfg = default_tui_config();
+            let _ = persist_default_config(path, &cfg);
             (
                 cfg,
                 Some(format!(
@@ -522,7 +524,18 @@ fn apply_aggressive_direct_profile(cfg: &mut EngineConfig) {
 }
 
 fn persist_default_config(path: &Path, cfg: &EngineConfig) -> std::io::Result<()> {
-    let rendered = toml::to_string_pretty(cfg).unwrap_or_else(|_| String::new());
+    let rendered = toml::to_string_pretty(cfg).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("failed to serialize config: {e}"),
+        )
+    })?;
+    if rendered.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "refusing to write empty config",
+        ));
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

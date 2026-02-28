@@ -103,6 +103,11 @@ pub(super) async fn handle_http_proxy(
                 return Ok(());
             }
         };
+        let service_bucket = host_service_bucket(&destination);
+        let high_signal_bucket = matches!(
+            service_bucket.as_str(),
+            "meta-group:youtube" | "meta-group:google" | "meta-group:discord"
+        );
         if connected.candidate.kind == RouteKind::Bypass {
             info!(
                 target: "socks5",
@@ -115,6 +120,19 @@ pub(super) async fn handle_http_proxy(
                 bypass = ?connected.candidate.bypass_addr,
                 bypass_profile = connected.candidate.bypass_profile_idx + 1,
                 bypass_profiles = connected.candidate.bypass_profile_total,
+                raced = connected.raced,
+                "HTTP CONNECT route selected"
+            );
+        } else if high_signal_bucket {
+            info!(
+                target: "socks5",
+                conn_id,
+                peer = %peer,
+                client = %client,
+                destination = %destination,
+                bucket = %service_bucket,
+                route = connected.candidate.route_label(),
+                source = connected.candidate.source,
                 raced = connected.raced,
                 "HTTP CONNECT route selected"
             );
@@ -382,17 +400,7 @@ pub(super) async fn handle_http_proxy(
             return Ok(());
         }
 
-        let is_bypass = connected.candidate.kind == RouteKind::Bypass;
-        let mut tuned = tune_relay_for_target(relay_opts, port, &destination, false, false);
-
-        // CRITICAL: If we are using a Bypass route, disable internal evasion to avoid "double fragmentation"
-        // which triggers antivirus resets and breaks Discord/Cloudflare.
-        if is_bypass {
-            tuned.options.fragment_client_hello = false;
-            tuned.options.tcp_window_trick = false;
-            tuned.options.sni_spoofing = false;
-            tuned.options.sni_case_toggle = false;
-        }
+        let tuned = tune_relay_for_target(relay_opts, port, &destination, false, false);
 
         let direct_tunnel_started = Instant::now();
         match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options.clone()).await {
@@ -491,6 +499,23 @@ pub(super) async fn handle_http_proxy(
                 );
             }
             Err(e) if is_expected_disconnect(&e) => {
+                let lifetime_ms = direct_tunnel_started.elapsed().as_millis() as u64;
+                let mut outcome_error_class = "client-disconnect";
+                
+                // For censored services, a client disconnect with zero data from upstream 
+                // is almost certainly a blocked connection that we should penalize.
+                let bucket = host_service_bucket(route_destination_key(&connected.route_key));
+                let is_censored = matches!(bucket.as_str(), "meta-group:youtube" | "meta-group:discord");
+                
+                if is_censored && lifetime_ms > 1000 {
+                    record_route_failure(
+                        &connected.route_key,
+                        &connected.candidate,
+                        "zero-reply-soft",
+                    );
+                    outcome_error_class = "zero-reply-soft";
+                }
+
                 complete_route_outcome_event(
                     connected.decision_id,
                     &connected.route_key,
@@ -498,8 +523,8 @@ pub(super) async fn handle_http_proxy(
                     true,
                     false,
                     0,
-                    direct_tunnel_started.elapsed().as_millis() as u64,
-                    "client-disconnect",
+                    lifetime_ms,
+                    outcome_error_class,
                 );
                 debug!(
                     target: "socks5",
@@ -743,9 +768,14 @@ pub(super) fn tune_relay_for_target(
     if is_bypass {
         // In bypass mode (external tool like ciadpi), we should NOT force internal fragmentation.
         // Doing so often breaks the connection because ciadpi already applies its own evasion.
-        // We use base options but explicitly disable our own fragmentation to avoid "double-evasion".
+        // We disable all internal evasion toggles to avoid "double-evasion".
         let mut opts = base.clone();
         opts.fragment_client_hello = false;
+        opts.split_at_sni = false;
+        opts.client_hello_split_offsets.clear();
+        opts.tcp_window_trick = false;
+        opts.sni_spoofing = false;
+        opts.sni_case_toggle = false;
 
         return TunedRelay {
             options: opts,

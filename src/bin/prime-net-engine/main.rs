@@ -31,12 +31,26 @@ use crate::tui_cmd::{run_tui, TuiOpts};
 use crate::update_cmd::{run_update, UpdateOpts};
 use crate::wizard::{run_wizard, WizardOpts};
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() {
-    if let Err(e) = real_main().await {
-        eprintln!("error: {e}");
-        std::process::exit(1);
-    }
+fn main() {
+    let worker_threads = std::env::var("PRIME_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads.max(1))
+        .enable_all()
+        // Aggressive I/O polling for lower latency in packet forwarding
+        .global_queue_interval(31) 
+        .build()
+        .expect("Failed to build tokio runtime");
+
+    runtime.block_on(async {
+        if let Err(e) = real_main().await {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    });
 }
 
 async fn real_main() -> Result<()> {

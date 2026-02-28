@@ -363,17 +363,13 @@ pub(super) fn record_route_success(route_key: &str, candidate: &RouteCandidate) 
     if matches!(candidate.kind, RouteKind::Bypass) {
         record_global_bypass_profile_success(candidate, now);
     }
-    if let Ok(mut m) = ROUTE_METRICS
-        .get_or_init(|| RwLock::new(RouteMetrics::default()))
-        .write()
-    {
-        match candidate.kind {
-            RouteKind::Direct => {
-                m.route_success_direct = m.route_success_direct.saturating_add(1);
-            }
-            RouteKind::Bypass => {
-                m.route_success_bypass = m.route_success_bypass.saturating_add(1);
-            }
+    let m = ROUTE_METRICS.get_or_init(RouteMetrics::default);
+    match candidate.kind {
+        RouteKind::Direct => {
+            m.route_success_direct.fetch_add(1, Ordering::Relaxed);
+        }
+        RouteKind::Bypass => {
+            m.route_success_bypass.fetch_add(1, Ordering::Relaxed);
         }
     }
     mark_route_capability_healthy(candidate.kind, candidate.family);
@@ -476,30 +472,24 @@ pub(super) fn record_route_failure(
             );
         }
     }
-    if let Ok(mut m) = ROUTE_METRICS
-        .get_or_init(|| RwLock::new(RouteMetrics::default()))
-        .write()
-    {
-        match candidate.kind {
-            RouteKind::Direct => {
-                m.route_failure_direct = m.route_failure_direct.saturating_add(1);
-                if reason == "connect-failed" {
-                    m.connect_failure_direct = m.connect_failure_direct.saturating_add(1);
-                }
-                if matches!(reason, "zero-reply-soft" | "suspicious-zero-reply") {
-                    m.route_soft_zero_reply_direct =
-                        m.route_soft_zero_reply_direct.saturating_add(1);
-                }
+    let m = ROUTE_METRICS.get_or_init(RouteMetrics::default);
+    match candidate.kind {
+        RouteKind::Direct => {
+            m.route_failure_direct.fetch_add(1, Ordering::Relaxed);
+            if reason == "connect-failed" {
+                m.connect_failure_direct.fetch_add(1, Ordering::Relaxed);
             }
-            RouteKind::Bypass => {
-                m.route_failure_bypass = m.route_failure_bypass.saturating_add(1);
-                if reason == "connect-failed" {
-                    m.connect_failure_bypass = m.connect_failure_bypass.saturating_add(1);
-                }
-                if matches!(reason, "zero-reply-soft" | "suspicious-zero-reply") {
-                    m.route_soft_zero_reply_bypass =
-                        m.route_soft_zero_reply_bypass.saturating_add(1);
-                }
+            if matches!(reason, "zero-reply-soft" | "suspicious-zero-reply") {
+                m.route_soft_zero_reply_direct.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        RouteKind::Bypass => {
+            m.route_failure_bypass.fetch_add(1, Ordering::Relaxed);
+            if reason == "connect-failed" {
+                m.connect_failure_bypass.fetch_add(1, Ordering::Relaxed);
+            }
+            if matches!(reason, "zero-reply-soft" | "suspicious-zero-reply") {
+                m.route_soft_zero_reply_bypass.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -676,6 +666,9 @@ pub(super) fn record_route_connected(route_key: &str, candidate: &RouteCandidate
     // This is especially harmful for YouTube/Discord where a transient direct
     // TCP connect would suppress route racing for a short window.
     if candidate.source == "adaptive-race"
+        || candidate.source == "builtin"
+        || candidate.source == "learned-domain"
+        || candidate.source == "learned-ip"
         || (candidate.kind == RouteKind::Direct && candidate.source == "adaptive")
     {
         return;
@@ -995,67 +988,59 @@ pub(super) fn mark_route_capability_healthy(kind: RouteKind, family: RouteIpFami
 }
 
 pub(super) fn record_route_race_decision(race: bool, reason: RouteRaceReason) {
-    if let Ok(mut m) = ROUTE_METRICS
-        .get_or_init(|| RwLock::new(RouteMetrics::default()))
-        .write()
-    {
-        if race {
-            m.race_started = m.race_started.saturating_add(1);
-        } else {
-            m.race_skipped = m.race_skipped.saturating_add(1);
+    let m = ROUTE_METRICS.get_or_init(RouteMetrics::default);
+    if race {
+        m.race_started.fetch_add(1, Ordering::Relaxed);
+    } else {
+        m.race_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+    match reason {
+        RouteRaceReason::NonTlsPort => {
+            m.race_reason_non_tls.fetch_add(1, Ordering::Relaxed);
         }
-        match reason {
-            RouteRaceReason::NonTlsPort => {
-                m.race_reason_non_tls = m.race_reason_non_tls.saturating_add(1)
-            }
-            RouteRaceReason::SingleCandidate => {
-                m.race_reason_single_candidate = m.race_reason_single_candidate.saturating_add(1)
-            }
-            RouteRaceReason::NoWinner => {
-                m.race_reason_no_winner = m.race_reason_no_winner.saturating_add(1);
-                m.winner_cache_misses = m.winner_cache_misses.saturating_add(1);
-            }
-            RouteRaceReason::EmptyWinner => {
-                m.race_reason_empty_winner = m.race_reason_empty_winner.saturating_add(1);
-                m.winner_cache_misses = m.winner_cache_misses.saturating_add(1);
-            }
-            RouteRaceReason::WinnerStale => {
-                m.race_reason_winner_stale = m.race_reason_winner_stale.saturating_add(1);
-                m.winner_cache_misses = m.winner_cache_misses.saturating_add(1);
-            }
-            RouteRaceReason::WinnerMissingFromCandidates => {
-                m.race_reason_winner_missing = m.race_reason_winner_missing.saturating_add(1);
-                m.winner_cache_misses = m.winner_cache_misses.saturating_add(1);
-            }
-            RouteRaceReason::WinnerWeak => {
-                m.race_reason_winner_weak = m.race_reason_winner_weak.saturating_add(1);
-                m.winner_cache_misses = m.winner_cache_misses.saturating_add(1);
-            }
-            RouteRaceReason::WinnerHealthy => {
-                m.race_reason_winner_healthy = m.race_reason_winner_healthy.saturating_add(1);
-                m.winner_cache_hits = m.winner_cache_hits.saturating_add(1);
-            }
+        RouteRaceReason::SingleCandidate => {
+            m.race_reason_single_candidate.fetch_add(1, Ordering::Relaxed);
+        }
+        RouteRaceReason::NoWinner => {
+            m.race_reason_no_winner.fetch_add(1, Ordering::Relaxed);
+            m.winner_cache_misses.fetch_add(1, Ordering::Relaxed);
+        }
+        RouteRaceReason::EmptyWinner => {
+            m.race_reason_empty_winner.fetch_add(1, Ordering::Relaxed);
+            m.winner_cache_misses.fetch_add(1, Ordering::Relaxed);
+        }
+        RouteRaceReason::WinnerStale => {
+            m.race_reason_winner_stale.fetch_add(1, Ordering::Relaxed);
+            m.winner_cache_misses.fetch_add(1, Ordering::Relaxed);
+        }
+        RouteRaceReason::WinnerMissingFromCandidates => {
+            m.race_reason_winner_missing.fetch_add(1, Ordering::Relaxed);
+            m.winner_cache_misses.fetch_add(1, Ordering::Relaxed);
+        }
+        RouteRaceReason::WinnerWeak => {
+            m.race_reason_winner_weak.fetch_add(1, Ordering::Relaxed);
+            m.winner_cache_misses.fetch_add(1, Ordering::Relaxed);
+        }
+        RouteRaceReason::WinnerHealthy => {
+            m.race_reason_winner_healthy.fetch_add(1, Ordering::Relaxed);
+            m.winner_cache_hits.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 
 pub(super) fn record_route_selected(candidate: &RouteCandidate, raced: bool) {
-    if let Ok(mut m) = ROUTE_METRICS
-        .get_or_init(|| RwLock::new(RouteMetrics::default()))
-        .write()
-    {
-        match candidate.kind {
-            RouteKind::Direct => {
-                m.route_selected_direct = m.route_selected_direct.saturating_add(1);
-                if raced {
-                    m.race_winner_direct = m.race_winner_direct.saturating_add(1);
-                }
+    let m = ROUTE_METRICS.get_or_init(RouteMetrics::default);
+    match candidate.kind {
+        RouteKind::Direct => {
+            m.route_selected_direct.fetch_add(1, Ordering::Relaxed);
+            if raced {
+                m.race_winner_direct.fetch_add(1, Ordering::Relaxed);
             }
-            RouteKind::Bypass => {
-                m.route_selected_bypass = m.route_selected_bypass.saturating_add(1);
-                if raced {
-                    m.race_winner_bypass = m.race_winner_bypass.saturating_add(1);
-                }
+        }
+        RouteKind::Bypass => {
+            m.route_selected_bypass.fetch_add(1, Ordering::Relaxed);
+            if raced {
+                m.race_winner_bypass.fetch_add(1, Ordering::Relaxed);
             }
         }
     }

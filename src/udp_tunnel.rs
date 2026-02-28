@@ -193,12 +193,15 @@ async fn read_datagram(
             )))
         }
         0x03 => {
-            let mut len = [0u8; 1];
-            rd.read_exact(&mut len).await.map_err(EngineError::Io)?;
-            let len = len[0] as usize;
-            let mut host = vec![0u8; len];
-            rd.read_exact(&mut host).await.map_err(EngineError::Io)?;
-            let host = String::from_utf8(host).map_err(|e| {
+            let mut len_buf = [0u8; 1];
+            rd.read_exact(&mut len_buf).await.map_err(EngineError::Io)?;
+            let len = len_buf[0] as usize;
+            if len == 0 {
+                return Err(EngineError::Internal("udp tunnel empty domain".to_owned()));
+            }
+            let mut host_buf = vec![0u8; len];
+            rd.read_exact(&mut host_buf).await.map_err(EngineError::Io)?;
+            let host = String::from_utf8(host_buf).map_err(|e| {
                 EngineError::Internal(format!("udp tunnel domain decode failed: {e}"))
             })?;
             let mut port = [0u8; 2];
@@ -215,9 +218,9 @@ async fn read_datagram(
         }
     };
 
-    let mut len = [0u8; 2];
-    rd.read_exact(&mut len).await.map_err(EngineError::Io)?;
-    let len = u16::from_be_bytes(len) as usize;
+    let mut len_buf = [0u8; 2];
+    rd.read_exact(&mut len_buf).await.map_err(EngineError::Io)?;
+    let len = u16::from_be_bytes(len_buf) as usize;
     if len > max_datagram_size {
         return Err(EngineError::Internal(format!(
             "udp tunnel datagram too large: {len} > {max_datagram_size}"
@@ -225,7 +228,9 @@ async fn read_datagram(
     }
 
     let mut data = vec![0u8; len];
-    rd.read_exact(&mut data).await.map_err(EngineError::Io)?;
+    if len > 0 {
+        rd.read_exact(&mut data).await.map_err(EngineError::Io)?;
+    }
     Ok(UdpDatagram { addr, data })
 }
 

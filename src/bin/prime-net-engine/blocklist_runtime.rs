@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use prime_net_engine_core::blocklist::{expand_tilde, update_blocklist, BlocklistCache};
+use prime_net_engine_core::blocklist::{expand_tilde, looks_like_domain, update_blocklist, BlocklistCache};
 use prime_net_engine_core::config::BlocklistConfig;
 use prime_net_engine_core::error::Result;
 use tracing::{info, warn};
@@ -35,13 +35,16 @@ impl DomainMatcher {
         let mut d_set = HashSet::with_capacity(domains.len());
         for domain in domains {
             let normalized = normalize_domain(domain);
-            if !normalized.is_empty() {
+            if !normalized.is_empty() && looks_like_domain(&normalized) {
                 d_set.insert(normalized);
             }
         }
         let mut i_set = HashSet::with_capacity(ips.len());
         for ip in ips {
-            i_set.insert(ip.trim().to_owned());
+            let trimmed = ip.trim();
+            if !trimmed.is_empty() && trimmed.parse::<std::net::IpAddr>().is_ok() {
+                i_set.insert(trimmed.to_owned());
+            }
         }
         Self {
             domains: d_set,
@@ -50,17 +53,26 @@ impl DomainMatcher {
     }
 
     fn contains_host_or_suffix(&self, host: &str) -> bool {
-        let host = normalize_domain(host);
-        if host.is_empty() {
+        let clean_host = host.trim().trim_start_matches("*.").trim_end_matches('.');
+        if clean_host.is_empty() {
             return false;
         }
 
+        // Fast path: Zero-copy check if already lowercase (99% of browser traffic)
+        if clean_host.bytes().all(|b| !b.is_ascii_uppercase()) {
+            self.check_normalized(clean_host)
+        } else {
+            self.check_normalized(&clean_host.to_ascii_lowercase())
+        }
+    }
+
+    fn check_normalized(&self, host: &str) -> bool {
         // If it's an IP literal, check the IP set
         if host.parse::<std::net::IpAddr>().is_ok() {
-            return self.ips.contains(&host);
+            return self.ips.contains(host);
         }
 
-        if self.domains.contains(&host) {
+        if self.domains.contains(host) {
             return true;
         }
         for (idx, byte) in host.as_bytes().iter().enumerate() {
@@ -183,11 +195,10 @@ pub fn sync_domains_to_pt_tools(domains: &[String]) -> Result<Option<PathBuf>> {
     let mut out = String::new();
     for domain in domains {
         let normalized = normalize_domain(domain);
-        if normalized.is_empty() {
-            continue;
+        if !normalized.is_empty() && looks_like_domain(&normalized) {
+            out.push_str(&normalized);
+            out.push('\n');
         }
-        out.push_str(&normalized);
-        out.push('\n');
     }
     fs::write(&path, out)?;
     Ok(Some(path))
@@ -199,7 +210,7 @@ fn load_domains_from_pt_tools() -> Option<Vec<String>> {
     let mut out = Vec::new();
     for line in body.lines() {
         let domain = normalize_domain(line);
-        if !domain.is_empty() {
+        if !domain.is_empty() && looks_like_domain(&domain) {
             out.push(domain);
         }
     }

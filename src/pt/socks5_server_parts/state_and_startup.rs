@@ -17,7 +17,7 @@ pub(super) static DEST_ROUTE_HEALTH: OnceLock<DashMap<String, DashMap<String, Ro
     OnceLock::new();
 pub(super) static STAGE_RACE_STATS: OnceLock<DashMap<u8, StageRaceStats>> = OnceLock::new();
 pub(super) static RACE_SOURCE_COUNTERS: OnceLock<RaceSourceCounters> = OnceLock::new();
-pub(super) static ROUTE_METRICS: OnceLock<RwLock<RouteMetrics>> = OnceLock::new();
+pub(super) static ROUTE_METRICS: OnceLock<RouteMetrics> = OnceLock::new();
 pub(super) static ROUTE_CAPABILITIES: OnceLock<RwLock<RouteCapabilities>> = OnceLock::new();
 pub(super) static BYPASS_POOL: OnceLock<DashMap<SocketAddr, Vec<TcpStream>>> = OnceLock::new();
 pub(super) static BYPASS_POOL_WARMUP_NEXT_AT_MS: OnceLock<DashMap<SocketAddr, u64>> =
@@ -114,32 +114,32 @@ pub struct RaceSourceCounters {
     pub adaptive: AtomicU64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct RouteMetrics {
-    pub route_selected_direct: u64,
-    pub route_selected_bypass: u64,
-    pub race_started: u64,
-    pub race_skipped: u64,
-    pub race_winner_direct: u64,
-    pub race_winner_bypass: u64,
-    pub route_success_direct: u64,
-    pub route_success_bypass: u64,
-    pub route_failure_direct: u64,
-    pub route_failure_bypass: u64,
-    pub route_soft_zero_reply_direct: u64,
-    pub route_soft_zero_reply_bypass: u64,
-    pub connect_failure_direct: u64,
-    pub connect_failure_bypass: u64,
-    pub winner_cache_hits: u64,
-    pub winner_cache_misses: u64,
-    pub race_reason_no_winner: u64,
-    pub race_reason_empty_winner: u64,
-    pub race_reason_winner_stale: u64,
-    pub race_reason_winner_weak: u64,
-    pub race_reason_winner_missing: u64,
-    pub race_reason_winner_healthy: u64,
-    pub race_reason_single_candidate: u64,
-    pub race_reason_non_tls: u64,
+    pub route_selected_direct: AtomicU64,
+    pub route_selected_bypass: AtomicU64,
+    pub race_started: AtomicU64,
+    pub race_skipped: AtomicU64,
+    pub race_winner_direct: AtomicU64,
+    pub race_winner_bypass: AtomicU64,
+    pub route_success_direct: AtomicU64,
+    pub route_success_bypass: AtomicU64,
+    pub route_failure_direct: AtomicU64,
+    pub route_failure_bypass: AtomicU64,
+    pub route_soft_zero_reply_direct: AtomicU64,
+    pub route_soft_zero_reply_bypass: AtomicU64,
+    pub connect_failure_direct: AtomicU64,
+    pub connect_failure_bypass: AtomicU64,
+    pub winner_cache_hits: AtomicU64,
+    pub winner_cache_misses: AtomicU64,
+    pub race_reason_no_winner: AtomicU64,
+    pub race_reason_empty_winner: AtomicU64,
+    pub race_reason_winner_stale: AtomicU64,
+    pub race_reason_winner_weak: AtomicU64,
+    pub race_reason_winner_missing: AtomicU64,
+    pub race_reason_winner_healthy: AtomicU64,
+    pub race_reason_single_candidate: AtomicU64,
+    pub race_reason_non_tls: AtomicU64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

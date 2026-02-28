@@ -33,7 +33,7 @@ pub async fn relay_bidirectional(
             }
         }
 
-        let mut buf = vec![0u8; 16384];
+        let mut buf = vec![0u8; 65536];
         loop {
             let n = client_r.read(&mut buf).await?;
             if n == 0 {
@@ -48,7 +48,7 @@ pub async fn relay_bidirectional(
 
     let u2c = async {
         let mut total = 0u64;
-        let mut buf = vec![0u8; 16384];
+        let mut buf = vec![0u8; 65536];
         loop {
             let n = upstream_r.read(&mut buf).await?;
             if n == 0 {
@@ -307,7 +307,12 @@ pub fn rewrite_http_forward_head(headers: &str, target: &HttpForwardTarget) -> S
         }
         lines.push(line.to_owned());
     }
-    lines.push(format!("Host: {}", target.host));
+    let host_value = if target.port == 80 {
+        target.host.clone()
+    } else {
+        format!("{}:{}", target.host, target.port)
+    };
+    lines.push(format!("Host: {host_value}"));
     lines.push("Connection: close".to_owned());
     lines.push("".to_owned());
     lines.push("".to_owned());
@@ -408,11 +413,11 @@ pub fn should_mark_empty_bypass_session_as_soft_failure(
 }
 
 pub fn should_mark_bypass_profile_failure(port: u16, c2u: u64, u2c: u64, min_c2u: u64) -> bool {
-    port == 443 && u2c == 0 && c2u >= min_c2u
+    port == 443 && u2c <= 7 && c2u >= min_c2u
 }
 
 pub fn should_mark_bypass_zero_reply_soft(port: u16, c2u: u64, u2c: u64, lifetime: u64) -> bool {
-    port == 443 && u2c == 0 && c2u >= 256 && lifetime >= 2000
+    port == 443 && u2c <= 7 && c2u >= 256 && lifetime >= 2000
 }
 
 const SOFT_ZERO_REPLY_DISCONNECT_MIN_LIFETIME_MS: u64 = 3_000;
@@ -430,7 +435,7 @@ pub fn should_penalize_disconnect_as_soft_zero_reply(
     }
     matches!(
         host_service_bucket(route_destination_key(route_key)).as_str(),
-        "meta-group:youtube" | "meta-group:discord"
+        "meta-group:youtube" | "meta-group:discord" | "meta-group:google"
     )
 }
 
@@ -475,5 +480,5 @@ pub fn record_bypass_profile_success(destination: &str, idx: u8) {
 }
 
 pub fn should_mark_route_soft_zero_reply(port: u16, c2u: u64, u2c: u64) -> bool {
-    port == 443 && u2c == 0 && c2u >= 256
+    port == 443 && u2c <= 7 && c2u >= 256
 }

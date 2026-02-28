@@ -564,10 +564,20 @@ pub(super) fn shadow_reward_from_outcome(
         reward -= 10;
     }
 
+    // A plain TCP connect without any usable upstream bytes is not a real success.
+    // Treat this as negative evidence so direct "phantom connects" don't dominate.
+    if connect_ok && !tls_ok_proxy && bytes_u2c <= 7 {
+        reward -= 45;
+    }
+
     reward += (bytes_u2c.min(256 * 1024) / 16_384) as i64;
 
     if lifetime_ms > 0 && lifetime_ms < 250 && !tls_ok_proxy {
         reward -= 10;
+    }
+
+    if error_class.contains("client-disconnect") && !tls_ok_proxy && bytes_u2c <= 7 {
+        reward -= 20;
     }
 
     if error_class.contains("timeout") {
@@ -957,10 +967,12 @@ fn shadow_arm_prior(bucket: &str, arm: &str) -> ShadowArmPrior {
             _ => ShadowArmPrior::with_mean(0),
         },
         "google-common" => match arm {
-            "direct" => ShadowArmPrior::with_mean(35),
-            "bypass:1" => ShadowArmPrior::with_mean(20),
-            "bypass:2" => ShadowArmPrior::with_mean(12),
-            _ if bypass_idx > 0 => ShadowArmPrior::with_mean(5),
+            // In blocked regions, direct often "connects" but dies before usable TLS traffic.
+            // Biasing a bit towards bypass reduces long cold-start degradation.
+            "direct" => ShadowArmPrior::with_mean(18),
+            "bypass:1" => ShadowArmPrior::with_mean(32),
+            "bypass:2" => ShadowArmPrior::with_mean(22),
+            _ if bypass_idx > 0 => ShadowArmPrior::with_mean(12),
             _ => ShadowArmPrior::with_mean(0),
         },
         "ads-noise" => match arm {

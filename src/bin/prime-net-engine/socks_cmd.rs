@@ -45,7 +45,8 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
     if !opts.bind.trim().is_empty() {
         cfg.system_proxy.socks_endpoint = opts.bind.clone();
     }
-    let _proxy_cleanup = SystemProxyCleanupGuard::new(maybe_auto_configure_system_proxy(&cfg));
+    // Arm cleanup early, but enable system proxy only after listener is ready.
+    let mut proxy_cleanup = SystemProxyCleanupGuard::new(false);
 
     // Initialize Pluggable Transports if configured
     if let Some(ref mut pt) = cfg.pt {
@@ -64,6 +65,7 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
                 println!("SOCKS5 listening on {addr}");
                 println!("Hint (TUN): run tun2socks and point it to this SOCKS5 endpoint.");
 
+                proxy_cleanup.armed = maybe_auto_configure_system_proxy(&cfg);
                 let _keep = eng;
                 wait_for_shutdown().await;
                 return Ok(());
@@ -92,15 +94,13 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
         .map(|g| g.socks5_addrs())
         .filter(|v| !v.is_empty())
     {
-        let addr = addrs[0];
-        relay_opts.bypass_socks5 = Some(addr);
+        relay_opts.bypass_socks5 = None; // Disable legacy single-addr mode
         relay_opts.bypass_socks5_pool = addrs.clone();
         relay_opts.bypass_domain_check = Some(is_bypass_domain_runtime);
         info!(
             target: "socks_cmd",
-            bypass = %addr,
             backends = relay_opts.bypass_socks5_pool.len(),
-            "packet bypass active: blocked domains will be tunneled through ciadpi"
+            "packet bypass active: blocked domains will be tunneled through ciadpi pool"
         );
     } else if !relay_opts.fragment_client_hello {
         warn!(target: "socks_cmd", "no bypass transport or internal evasion active; running as plain SOCKS5 proxy");
@@ -125,6 +125,7 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
     println!("SOCKS5 listening on {}", guard.listen_addr());
     println!("Hint (TUN): run tun2socks and point it to this SOCKS5 endpoint.");
 
+    proxy_cleanup.armed = maybe_auto_configure_system_proxy(&cfg);
     let _keep = guard;
     wait_for_shutdown().await;
     Ok(())

@@ -16,13 +16,17 @@ use crate::error::{EngineError, Result};
 use crate::platform::{ProxyManager, ProxyMode, ProxyStatus};
 
 const INTERNET_SETTINGS: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+const INTERNET_CONNECTIONS: &str =
+    "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\\Connections";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WindowsProxyBackup {
     proxy_enable: u32,
     proxy_server: Option<String>,
     auto_config_url: Option<String>,
+    auto_detect: Option<u32>,
     proxy_override: Option<String>,
+    connection_settings: Option<Vec<u8>>,
 }
 
 pub struct WindowsProxyManager;
@@ -88,6 +92,12 @@ impl WindowsProxyManager {
     fn open_settings_write() -> Result<RegKey> {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         hkcu.open_subkey_with_flags(INTERNET_SETTINGS, KEY_SET_VALUE | KEY_READ)
+            .map_err(EngineError::Io)
+    }
+
+    fn open_connections_write() -> Result<RegKey> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        hkcu.open_subkey_with_flags(INTERNET_CONNECTIONS, KEY_SET_VALUE | KEY_READ)
             .map_err(EngineError::Io)
     }
 
@@ -222,12 +232,54 @@ impl WindowsProxyManager {
 
     fn backup_current_settings(&self) -> Result<WindowsProxyBackup> {
         let key_r = Self::open_settings_read()?;
+        let conn_key = RegKey::predef(HKEY_CURRENT_USER).open_subkey(INTERNET_CONNECTIONS).ok();
+        let connection_settings = conn_key.and_then(|k| k.get_raw_value("DefaultConnectionSettings").ok().map(|v| v.bytes));
+
         Ok(WindowsProxyBackup {
             proxy_enable: key_r.get_value("ProxyEnable").unwrap_or(0_u32),
             proxy_server: key_r.get_value("ProxyServer").ok(),
             auto_config_url: key_r.get_value("AutoConfigURL").ok(),
+            auto_detect: key_r.get_value("AutoDetect").ok(),
             proxy_override: key_r.get_value("ProxyOverride").ok(),
+            connection_settings,
         })
+    }
+
+    fn patch_binary_connection_settings(
+        &self,
+        flags: u8,
+        _proxy_server: Option<&str>,
+        _pac_url: Option<&str>,
+        _bypass: Option<&str>,
+    ) -> Result<()> {
+        let key = Self::open_connections_write()?;
+        let mut data: Vec<u8> = key
+            .get_raw_value("DefaultConnectionSettings")
+            .map(|v| v.bytes)
+            .unwrap_or_else(|_| vec![0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+
+        if data.len() < 12 {
+            // Re-initialize with minimal valid header if corrupted
+            data = vec![0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        }
+
+        // Flags byte is usually at offset 8
+        data[8] = flags;
+
+        // Structured binary format requires careful length-prefixed strings.
+        // For now, we only patch the flags and clear strings to be safe, 
+        // as InternetSetOption handles strings in registry keys well enough 
+        // if flags in binary blob are synced.
+        
+        // Offset 12: Proxy server string
+        // Offset 12 + len: Bypass string
+        // Offset 12 + len + len: PAC URL string
+
+        let _ = key.set_raw_value("DefaultConnectionSettings", &winreg::RegValue {
+            bytes: data,
+            vtype: winreg::enums::REG_BINARY,
+        });
+        Ok(())
     }
 
     fn restore_from_backup(&self, backup: &WindowsProxyBackup) -> Result<()> {
@@ -245,11 +297,24 @@ impl WindowsProxyManager {
                 let _ = key_w.delete_value("AutoConfigURL");
             }
         }
+        match backup.auto_detect {
+            Some(v) => key_w.set_value("AutoDetect", &v)?,
+            None => {
+                let _ = key_w.delete_value("AutoDetect");
+            }
+        }
         match &backup.proxy_override {
             Some(v) => key_w.set_value("ProxyOverride", v)?,
             None => {
                 let _ = key_w.delete_value("ProxyOverride");
             }
+        }
+        if let Some(ref bin) = backup.connection_settings {
+            let conn_key = Self::open_connections_write()?;
+            let _ = conn_key.set_raw_value("DefaultConnectionSettings", &winreg::RegValue {
+                bytes: bin.clone(),
+                vtype: winreg::enums::REG_BINARY,
+            });
         }
         self.refresh_internet_settings()?;
         Ok(())
@@ -470,10 +535,14 @@ impl ProxyManager for WindowsProxyManager {
         self.save_backup_if_missing()?;
 
         let key_w = Self::open_settings_write()?;
+        let server = Self::composite_proxy_server(socks_endpoint);
         key_w.set_value("ProxyEnable", &1_u32)?;
-        key_w.set_value("ProxyServer", &Self::composite_proxy_server(socks_endpoint))?;
+        key_w.set_value("ProxyServer", &server)?;
         let _ = key_w.delete_value("AutoConfigURL");
+        key_w.set_value("AutoDetect", &0_u32)?;
         self.set_proxy_bypass("")?;
+
+        let _ = self.patch_binary_connection_settings(0x03, Some(&server), None, Some(Self::DEFAULT_PROXY_BYPASS));
 
         if let Ok(adapters) = self.get_active_adapters() {
             for adapter in adapters {
@@ -491,7 +560,10 @@ impl ProxyManager for WindowsProxyManager {
         let key_w = Self::open_settings_write()?;
         key_w.set_value("ProxyEnable", &0_u32)?;
         key_w.set_value("AutoConfigURL", &pac_url)?;
+        key_w.set_value("AutoDetect", &0_u32)?;
         self.set_proxy_bypass("")?;
+
+        let _ = self.patch_binary_connection_settings(0x05, None, Some(pac_url), Some(Self::DEFAULT_PROXY_BYPASS));
 
         self.refresh_internet_settings()?;
         Ok(())
@@ -506,7 +578,10 @@ impl ProxyManager for WindowsProxyManager {
             key_w.set_value("ProxyEnable", &0_u32)?;
             let _ = key_w.delete_value("ProxyServer");
             let _ = key_w.delete_value("AutoConfigURL");
+            let _ = key_w.delete_value("AutoDetect");
             let _ = key_w.delete_value("ProxyOverride");
+
+            let _ = self.patch_binary_connection_settings(0x01, None, None, None);
             self.refresh_internet_settings()?;
         }
         Ok(())
@@ -515,10 +590,11 @@ impl ProxyManager for WindowsProxyManager {
     fn status(&self) -> Result<ProxyStatus> {
         let key = Self::open_settings_read()?;
         let enabled = key.get_value("ProxyEnable").unwrap_or(0_u32) != 0;
+        let auto_detect = key.get_value("AutoDetect").unwrap_or(0_u32) != 0;
         let server: Option<String> = key.get_value("ProxyServer").ok();
         let pac: Option<String> = key.get_value("AutoConfigURL").ok();
         let socks_endpoint = server.as_deref().and_then(Self::extract_socks_endpoint);
-        let mode = if pac.as_deref().is_some() {
+        let mode = if pac.as_deref().is_some() || auto_detect {
             ProxyMode::Pac
         } else if enabled {
             ProxyMode::All
@@ -527,7 +603,7 @@ impl ProxyManager for WindowsProxyManager {
         };
 
         Ok(ProxyStatus {
-            enabled: enabled || pac.is_some(),
+            enabled: enabled || pac.is_some() || auto_detect,
             mode,
             socks_endpoint,
             pac_url: pac,

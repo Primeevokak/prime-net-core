@@ -643,12 +643,25 @@ impl PrimeHttpClient {
         let response = response.error_for_status()?;
         let status = response.status();
         let headers = response.headers().clone();
+
+        // Limit concurrent body streams to prevent H2 Rapid Reset issues.
+        // The permit is held by the Boxed reader until it is dropped.
+        let permit = match &self.h2_reset_limiter {
+            Some(s) => Some(s.clone().acquire_owned().await.map_err(|_| {
+                EngineError::Internal("h2 reset limiter closed".to_owned())
+            })?),
+            None => None,
+        };
+
         let body_stream = response.bytes_stream().map_err(io::Error::other);
         let reader = StreamReader::new(body_stream);
         Ok(ResponseStream {
             status,
             headers,
-            stream: Box::new(reader),
+            stream: Box::new(LimitedReader {
+                inner: reader,
+                _permit: permit,
+            }),
         })
     }
 

@@ -197,7 +197,9 @@ pub(super) fn should_mark_suspicious_zero_reply(
     bytes_upstream_to_client: u64,
     min_c2u: usize,
 ) -> bool {
-    port == 443 && bytes_upstream_to_client == 0 && bytes_client_to_upstream >= min_c2u as u64
+    port == 443
+        && bytes_upstream_to_client <= 7
+        && bytes_client_to_upstream >= min_c2u as u64
 }
 
 pub(super) static LAST_CLASSIFIER_EMIT_UNIX: AtomicU64 = AtomicU64::new(0);
@@ -284,50 +286,58 @@ pub(super) fn maybe_emit_classifier_summary(interval_secs: u64) {
         }
     }
 
-    if let Ok(guard) = ROUTE_METRICS
-        .get_or_init(|| RwLock::new(RouteMetrics::default()))
-        .read()
     {
-        let selected_total = guard.route_selected_direct + guard.route_selected_bypass;
-        let race_wins_total = guard.race_winner_direct + guard.race_winner_bypass;
-        let winner_cache_total = guard.winner_cache_hits + guard.winner_cache_misses;
-        if selected_total > 0 || guard.race_started > 0 || guard.race_skipped > 0 {
+        let m = ROUTE_METRICS.get_or_init(RouteMetrics::default);
+        let route_selected_direct = m.route_selected_direct.load(Ordering::Relaxed);
+        let route_selected_bypass = m.route_selected_bypass.load(Ordering::Relaxed);
+        let race_started = m.race_started.load(Ordering::Relaxed);
+        let race_skipped = m.race_skipped.load(Ordering::Relaxed);
+        let race_winner_direct = m.race_winner_direct.load(Ordering::Relaxed);
+        let race_winner_bypass = m.race_winner_bypass.load(Ordering::Relaxed);
+        let winner_cache_hits = m.winner_cache_hits.load(Ordering::Relaxed);
+        let winner_cache_misses = m.winner_cache_misses.load(Ordering::Relaxed);
+
+        let selected_total = route_selected_direct + route_selected_bypass;
+        let race_wins_total = race_winner_direct + race_winner_bypass;
+        let winner_cache_total = winner_cache_hits + winner_cache_misses;
+
+        if selected_total > 0 || race_started > 0 || race_skipped > 0 {
             info!(
                 target: "socks5.classifier",
                 selected_total,
-                selected_direct = guard.route_selected_direct,
-                selected_bypass = guard.route_selected_bypass,
-                races_started = guard.race_started,
-                races_skipped = guard.race_skipped,
+                selected_direct = route_selected_direct,
+                selected_bypass = route_selected_bypass,
+                races_started = race_started,
+                races_skipped = race_skipped,
                 race_wins_total,
-                race_wins_direct = guard.race_winner_direct,
-                race_wins_bypass = guard.race_winner_bypass,
-                route_success_direct = guard.route_success_direct,
-                route_success_bypass = guard.route_success_bypass,
-                route_failure_direct = guard.route_failure_direct,
-                route_failure_bypass = guard.route_failure_bypass,
-                soft_zero_reply_direct = guard.route_soft_zero_reply_direct,
-                soft_zero_reply_bypass = guard.route_soft_zero_reply_bypass,
-                connect_fail_direct = guard.connect_failure_direct,
-                connect_fail_bypass = guard.connect_failure_bypass,
+                race_wins_direct = race_winner_direct,
+                race_wins_bypass = race_winner_bypass,
+                route_success_direct = m.route_success_direct.load(Ordering::Relaxed),
+                route_success_bypass = m.route_success_bypass.load(Ordering::Relaxed),
+                route_failure_direct = m.route_failure_direct.load(Ordering::Relaxed),
+                route_failure_bypass = m.route_failure_bypass.load(Ordering::Relaxed),
+                soft_zero_reply_direct = m.route_soft_zero_reply_direct.load(Ordering::Relaxed),
+                soft_zero_reply_bypass = m.route_soft_zero_reply_bypass.load(Ordering::Relaxed),
+                connect_fail_direct = m.connect_failure_direct.load(Ordering::Relaxed),
+                connect_fail_bypass = m.connect_failure_bypass.load(Ordering::Relaxed),
                 "adaptive route counters"
             );
         }
         if winner_cache_total > 0 {
-            let winner_cache_hit_rate = guard.winner_cache_hits as f64 / winner_cache_total as f64;
+            let winner_cache_hit_rate = winner_cache_hits as f64 / winner_cache_total as f64;
             info!(
                 target: "socks5.classifier",
-                winner_cache_hits = guard.winner_cache_hits,
-                winner_cache_misses = guard.winner_cache_misses,
+                winner_cache_hits,
+                winner_cache_misses,
                 winner_cache_hit_rate,
-                reason_no_winner = guard.race_reason_no_winner,
-                reason_empty_winner = guard.race_reason_empty_winner,
-                reason_winner_stale = guard.race_reason_winner_stale,
-                reason_winner_weak = guard.race_reason_winner_weak,
-                reason_winner_missing = guard.race_reason_winner_missing,
-                reason_winner_healthy = guard.race_reason_winner_healthy,
-                reason_single_candidate = guard.race_reason_single_candidate,
-                reason_non_tls = guard.race_reason_non_tls,
+                reason_no_winner = m.race_reason_no_winner.load(Ordering::Relaxed),
+                reason_empty_winner = m.race_reason_empty_winner.load(Ordering::Relaxed),
+                reason_winner_stale = m.race_reason_winner_stale.load(Ordering::Relaxed),
+                reason_winner_weak = m.race_reason_winner_weak.load(Ordering::Relaxed),
+                reason_winner_missing = m.race_reason_winner_missing.load(Ordering::Relaxed),
+                reason_winner_healthy = m.race_reason_winner_healthy.load(Ordering::Relaxed),
+                reason_single_candidate = m.race_reason_single_candidate.load(Ordering::Relaxed),
+                reason_non_tls = m.race_reason_non_tls.load(Ordering::Relaxed),
                 "adaptive route race diagnostics"
             );
         }

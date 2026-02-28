@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use csv::{ReaderBuilder, Trim};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use url::Url;
 
 use crate::error::{EngineError, Result};
 
@@ -23,13 +24,18 @@ impl BlocklistCache {
             return Ok(None);
         }
         let raw = fs::read(path)?;
+        if raw.iter().all(|b| b.is_ascii_whitespace()) {
+            return Ok(None);
+        }
         if let Ok(parsed) = serde_json::from_slice::<BlocklistCache>(&raw) {
             return Ok(Some(normalize_cache(parsed)));
         }
 
         // Legacy compatibility: accept `updated_at` string and missing `source`.
-        let value: Value =
-            serde_json::from_slice(&raw).map_err(|e| EngineError::Config(e.to_string()))?;
+        let value: Value = match serde_json::from_slice(&raw) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
         let source = value
             .get("source")
             .and_then(Value::as_str)
@@ -138,7 +144,7 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn looks_like_domain(s: &str) -> bool {
+pub fn looks_like_domain(s: &str) -> bool {
     if s.is_empty() || s.len() > 253 {
         return false;
     }
@@ -146,9 +152,120 @@ fn looks_like_domain(s: &str) -> bool {
     if s.parse::<std::net::IpAddr>().is_ok() {
         return false;
     }
-    s.contains('.')
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
+    if !s.contains('.') || s.starts_with('.') || s.ends_with('.') {
+        return false;
+    }
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    {
+        return false;
+    }
+
+    let labels: Vec<&str> = s.split('.').collect();
+    if labels.len() < 2 {
+        return false;
+    }
+    if labels.iter().any(|label| label.is_empty() || label.len() > 63) {
+        return false;
+    }
+    if labels.iter().any(|label| {
+        let first = label.as_bytes().first().copied().unwrap_or_default();
+        let last = label.as_bytes().last().copied().unwrap_or_default();
+        !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric()
+    }) {
+        return false;
+    }
+    if !s.chars().any(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    let tld = labels.last().copied().unwrap_or_default();
+    if tld.len() < 2 || tld.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    true
+}
+
+fn extract_host_from_urlish(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    // Feed rows often keep domains only inside URL columns.
+    let url_like = if value.contains("://") {
+        value.to_owned()
+    } else if let Some(rest) = value.strip_prefix("//") {
+        format!("http://{rest}")
+    } else if value.contains('/') {
+        format!("http://{value}")
+    } else {
+        return None;
+    };
+
+    Url::parse(&url_like)
+        .ok()
+        .and_then(|u| u.host_str().map(normalize_domain_candidate))
+}
+
+fn extract_host_from_host_port_token(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = value.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        let port = tail.strip_prefix(':')?;
+        if host.is_empty() || port.parse::<u16>().is_err() {
+            return None;
+        }
+        return Some(normalize_domain_candidate(host));
+    }
+
+    let (host, port) = value.rsplit_once(':')?;
+    if host.is_empty() || port.parse::<u16>().is_err() {
+        return None;
+    }
+    if host.contains(':') {
+        // Unbracketed IPv6/garbage tokens are too ambiguous here.
+        return None;
+    }
+    Some(normalize_domain_candidate(host))
+}
+
+fn push_domain_or_ip(candidate: &str, domains: &mut Vec<String>, ips: &mut Vec<String>) {
+    if candidate.is_empty() {
+        return;
+    }
+    if candidate.parse::<std::net::IpAddr>().is_ok() {
+        ips.push(candidate.to_owned());
+    } else if looks_like_domain(candidate) {
+        domains.push(candidate.to_owned());
+    }
+}
+
+fn collect_entities_from_field(field: &str, domains: &mut Vec<String>, ips: &mut Vec<String>) {
+    let field = field.trim();
+    if field.is_empty() {
+        return;
+    }
+
+    for token in field.split(|c: char| c == '|' || c.is_whitespace() || c == ',' || c == ';') {
+        let token = normalize_domain_candidate(token);
+        if token.is_empty() {
+            continue;
+        }
+
+        push_domain_or_ip(&token, domains, ips);
+
+        if let Some(host) = extract_host_from_urlish(&token) {
+            push_domain_or_ip(&host, domains, ips);
+        }
+        if let Some(host) = extract_host_from_host_port_token(&token) {
+            push_domain_or_ip(&host, domains, ips);
+        }
+    }
 }
 
 #[allow(clippy::expect_used)]
@@ -167,10 +284,14 @@ fn parse_entities_from_text(body: &str) -> (Vec<String>, Vec<String>) {
     if d1.is_empty() && i1.is_empty() {
         return (d_legacy, i_legacy);
     }
-    if d_legacy.len() + i_legacy.len() > d1.len() + i1.len() {
-        d1.extend(d_legacy);
-        i1.extend(i_legacy);
-    }
+    
+    // De-duplicate domains and IPs across all parsers
+    d1.extend(d_legacy);
+    i1.extend(i_legacy);
+    d1.sort();
+    d1.dedup();
+    i1.sort();
+    i1.dedup();
 
     (d1, i1)
 }
@@ -198,18 +319,7 @@ fn pick_entities_from_record(record: &csv::StringRecord) -> (Vec<String>, Vec<St
     let mut domains = Vec::new();
     let mut ips = Vec::new();
     for field in record.iter() {
-        let candidate = normalize_domain_candidate(field);
-        for part in candidate.split(|c: char| c == '|' || c.is_whitespace()) {
-            let sub = normalize_domain_candidate(part);
-            if sub.is_empty() {
-                continue;
-            }
-            if sub.parse::<std::net::IpAddr>().is_ok() {
-                ips.push(sub);
-            } else if looks_like_domain(&sub) {
-                domains.push(sub);
-            }
-        }
+        collect_entities_from_field(field, &mut domains, &mut ips);
     }
     (domains, ips)
 }
@@ -228,15 +338,7 @@ fn parse_entities_legacy(body: &str) -> (Vec<String>, Vec<String>) {
     let mut ips = Vec::new();
     for line in body.lines() {
         for field in line.split_whitespace() {
-            let sub = normalize_domain_candidate(field);
-            if sub.is_empty() {
-                continue;
-            }
-            if sub.parse::<std::net::IpAddr>().is_ok() {
-                ips.push(sub);
-            } else if looks_like_domain(&sub) {
-                domains.push(sub);
-            }
+            collect_entities_from_field(field, &mut domains, &mut ips);
         }
     }
     (domains, ips)
@@ -290,24 +392,44 @@ mod tests {
     fn parse_entities_handles_comma_csv() {
         let body = "example.com,1.1.1.1,Org\napi.example.org,2.2.2.2,Org B\n";
         let (domains, ips) = parse_entities_from_text(body);
-        assert_eq!(domains, vec!["example.com", "api.example.org"]);
-        assert_eq!(ips, vec!["1.1.1.1", "2.2.2.2"]);
+        assert!(domains.contains(&"example.com".to_owned()));
+        assert!(domains.contains(&"api.example.org".to_owned()));
+        assert!(ips.contains(&"1.1.1.1".to_owned()));
+        assert!(ips.contains(&"2.2.2.2".to_owned()));
     }
 
     #[test]
     fn parse_entities_legacy_whitespace_fallback() {
         let body = "example.com\n1.2.3.4\nbad_token\napi.example.org";
         let (domains, ips) = parse_entities_from_text(body);
-        assert_eq!(domains, vec!["example.com", "api.example.org"]);
-        assert_eq!(ips, vec!["1.2.3.4"]);
+        assert!(domains.contains(&"example.com".to_owned()));
+        assert!(domains.contains(&"api.example.org".to_owned()));
+        assert!(ips.contains(&"1.2.3.4".to_owned()));
     }
 
     #[test]
     fn parse_entities_collects_ips_and_domains() {
         let body = "1.1.1.1,org\nexample.com,org\n8.8.8.8,org";
         let (domains, ips) = parse_entities_from_text(body);
-        assert_eq!(domains, vec!["example.com"]);
-        assert_eq!(ips, vec!["1.1.1.1", "8.8.8.8"]);
+        assert!(domains.contains(&"example.com".to_owned()));
+        assert!(ips.contains(&"1.1.1.1".to_owned()));
+        assert!(ips.contains(&"8.8.8.8".to_owned()));
+    }
+
+    #[test]
+    fn parse_entities_extracts_domains_from_url_fields() {
+        let body = "1;\"https://www.google.com/search?q=test\";x\n2;\"http://i.ytimg.com/vi/abc/default.jpg\";x\n";
+        let (domains, _ips) = parse_entities_from_text(body);
+        assert!(domains.contains(&"www.google.com".to_owned()));
+        assert!(domains.contains(&"i.ytimg.com".to_owned()));
+    }
+
+    #[test]
+    fn parse_entities_extracts_domain_from_host_port_tokens() {
+        let body = "www.youtube.com:443;ok\nfonts.gstatic.com:443;ok\n";
+        let (domains, _ips) = parse_entities_from_text(body);
+        assert!(domains.contains(&"www.youtube.com".to_owned()));
+        assert!(domains.contains(&"fonts.gstatic.com".to_owned()));
     }
 
     #[test]
@@ -325,5 +447,27 @@ mod tests {
         let normalized = normalize_cache(cache);
         assert_eq!(normalized.domains, vec!["example.com"]);
         assert_eq!(normalized.ips, vec!["1.1.1.1"]);
+    }
+
+    #[test]
+    fn looks_like_domain_rejects_noise_tokens() {
+        assert!(!looks_like_domain(".018"));
+        assert!(!looks_like_domain("1.042.751.751"));
+        assert!(!looks_like_domain("a..b.com"));
+        assert!(!looks_like_domain("_bad.example.com"));
+        assert!(looks_like_domain("fonts.gstatic.com"));
+    }
+
+    #[test]
+    fn status_returns_none_for_empty_cache_file() {
+        let path = std::env::temp_dir().join(format!(
+            "prime-net-engine-empty-cache-{}.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        fs::write(&path, b"").expect("write empty cache");
+        let status = BlocklistCache::status(&path).expect("status");
+        assert!(status.is_none());
+        let _ = fs::remove_file(&path);
     }
 }

@@ -59,15 +59,22 @@ pub fn route_race_candidate_delay_ms(
     if index == 0 {
         return 0;
     }
-    // For YouTube/Discord buckets we want true parallel probing across bypass
-    // profiles; staggered launch makes profile #1 win almost always.
     let bucket = host_service_bucket(destination);
-    if matches!(bucket.as_str(), "meta-group:youtube" | "meta-group:discord")
-        && candidate.kind == RouteKind::Bypass
-    {
-        return 0;
-    }
+    let is_censored = matches!(bucket.as_str(), "meta-group:youtube" | "meta-group:discord");
+
     let mut delay = ROUTE_RACE_BASE_DELAY_MS.saturating_mul(index as u64);
+
+    if is_censored {
+        // For censored services, we WANT bypass to win the race even if direct TCP is faster.
+        // We give bypass routes a huge advantage.
+        if candidate.kind == RouteKind::Direct {
+            // Penalize direct connection on YouTube/Discord to let proxy win.
+            return 500;
+        }
+        // Sequential but fast launch for bypass backends.
+        return (index as u64).saturating_mul(25);
+    }
+
     if direct_present && candidate.kind == RouteKind::Bypass {
         delay += ROUTE_RACE_DIRECT_HEADSTART_MS;
         delay += match candidate.source {
@@ -84,8 +91,13 @@ pub fn route_race_launch_candidates(
     destination: &str,
 ) -> Vec<RouteCandidate> {
     let bucket = host_service_bucket(destination);
-    if matches!(bucket.as_str(), "meta-group:youtube" | "meta-group:discord") {
+    if bucket == "meta-group:google" {
         let mut out = Vec::with_capacity(3);
+        if let Some(direct) = ordered.iter().find(|c| c.kind == RouteKind::Direct) {
+            out.push(direct.clone());
+        }
+        // For Google we also want to probe a few bypass profiles in parallel 
+        // to avoid stalling if direct is TCP-silent.
         for bypass in ordered
             .iter()
             .filter(|c| c.kind == RouteKind::Bypass)
@@ -93,12 +105,25 @@ pub fn route_race_launch_candidates(
         {
             out.push(bypass.clone());
         }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    if matches!(bucket.as_str(), "meta-group:youtube" | "meta-group:discord") {
+        let mut out = Vec::with_capacity(7);
         if let Some(direct) = ordered.iter().find(|c| c.kind == RouteKind::Direct) {
             out.push(direct.clone());
         }
+        for bypass in ordered
+            .iter()
+            .filter(|c| c.kind == RouteKind::Bypass)
+            .take(6)
+        {
+            out.push(bypass.clone());
+        }
         if !out.is_empty() {
-            if out.len() > ROUTE_RACE_MAX_CANDIDATES {
-                out.truncate(ROUTE_RACE_MAX_CANDIDATES);
+            if out.len() > 7 {
+                out.truncate(7);
             }
             return out;
         }
@@ -199,6 +224,8 @@ pub async fn connect_via_best_route(
 
     let mut winners = JoinSet::new();
     let launch = route_race_launch_candidates(&candidates, target_label);
+    let launched_ids: std::collections::HashSet<String> =
+        launch.iter().map(|candidate| candidate.route_id()).collect();
     let direct_present = candidates.iter().any(|c| c.kind == RouteKind::Direct);
     let mut last_failed_candidate: Option<RouteCandidate> = None;
 
@@ -263,6 +290,46 @@ pub async fn connect_via_best_route(
                     && !is_noise_probe_https_destination(route_destination_key(target_label))
                 {
                     record_route_failure(target_label, &candidate, "connect-failed");
+                }
+                last_failed_candidate = Some(candidate.clone());
+                last_err = Some(e);
+            }
+        }
+    }
+
+    // All raced candidates failed. Try any remaining ordered candidates sequentially
+    // before giving up, so we don't miss a working lower-priority fallback.
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| !launched_ids.contains(&candidate.route_id()))
+    {
+        match connect_route_candidate(
+            conn_id,
+            target,
+            target_label,
+            candidate,
+            outbound.clone(),
+            relay_opts,
+        )
+        .await
+        {
+            Ok(stream) => {
+                record_route_connected(target_label, candidate);
+                record_route_selected(candidate, false);
+                return Ok(ConnectedRoute {
+                    stream,
+                    candidate: candidate.clone(),
+                    route_key: target_label.to_owned(),
+                    raced: false,
+                    decision_id,
+                });
+            }
+            Err(e) => {
+                maybe_mark_route_capability_failure(candidate, &e);
+                if !should_ignore_route_failure(candidate, &e)
+                    && !is_noise_probe_https_destination(route_destination_key(target_label))
+                {
+                    record_route_failure(target_label, candidate, "connect-failed");
                 }
                 last_failed_candidate = Some(candidate.clone());
                 last_err = Some(e);

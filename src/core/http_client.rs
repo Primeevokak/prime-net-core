@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -48,6 +49,21 @@ mod http3;
 
 trait AsyncIo: AsyncRead + AsyncWrite {}
 impl<T: AsyncRead + AsyncWrite + ?Sized> AsyncIo for T {}
+
+struct LimitedReader<R> {
+    inner: R,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for LimitedReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
 
 #[derive(Debug)]
 /// Primary HTTP client used by the engine.
