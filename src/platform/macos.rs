@@ -52,18 +52,29 @@ impl MacOSProxyManager {
     }
 
     pub fn get_primary_service() -> Result<String> {
-        let out = Command::new("route").args(["get", "default"]).output()?;
-        if !out.status.success() {
-            return Self::services()?
-                .into_iter()
-                .next()
-                .ok_or_else(|| EngineError::Internal("no network services found".to_owned()));
-        }
+        // Use scutil to find the primary interface more reliably than 'route' alone.
+        let out = Command::new("scutil").args(["--nwi"]).output()?;
         let body = String::from_utf8_lossy(&out.stdout);
-        let interface = body.lines().find_map(|line| {
-            line.split_once("interface:")
-                .map(|(_, v)| v.trim().to_owned())
+        
+        let interface = body.lines()
+            .find(|l| l.contains("Network information") && l.contains("IPv4"))
+            .and_then(|_| {
+                body.lines()
+                    .find(|l| l.contains("->") && l.contains("en"))
+                    .and_then(|l| l.split_whitespace().last())
+            })
+            .map(|s| s.trim().to_owned());
+
+        let interface = interface.or_else(|| {
+             // Fallback to route get default
+             let out = Command::new("route").args(["get", "default"]).output().ok()?;
+             let body = String::from_utf8_lossy(&out.stdout);
+             body.lines().find_map(|line| {
+                line.split_once("interface:")
+                    .map(|(_, v)| v.trim().to_owned())
+             })
         });
+
         let Some(interface) = interface else {
             return Self::services()?
                 .into_iter()
@@ -115,6 +126,23 @@ impl MacOSProxyManager {
         }
         Ok(())
     }
+
+    pub fn set_system_dns(&self, dns_server: &str) -> Result<()> {
+        let service = Self::get_primary_service()?;
+        Self::run_ok(&["-setdnsservers", &service, dns_server])?;
+        // Optional: clear DNS cache
+        let _ = Command::new("dscacheutil").arg("-flushcache").status();
+        let _ = Command::new("killall").args(["-HUP", "mDNSResponder"]).status();
+        Ok(())
+    }
+
+    pub fn reset_system_dns(&self) -> Result<()> {
+        let service = Self::get_primary_service()?;
+        Self::run_ok(&["-setdnsservers", &service, "Empty"])?;
+        let _ = Command::new("dscacheutil").arg("-flushcache").status();
+        let _ = Command::new("killall").args(["-HUP", "mDNSResponder"]).status();
+        Ok(())
+    }
 }
 
 impl ProxyManager for MacOSProxyManager {
@@ -137,7 +165,16 @@ impl ProxyManager for MacOSProxyManager {
         Ok(())
     }
 
+    fn set_dns(&self, dns_server: &str) -> Result<()> {
+        self.set_system_dns(dns_server)
+    }
+
+    fn reset_dns(&self) -> Result<()> {
+        self.reset_system_dns()
+    }
+
     fn status(&self) -> Result<ProxyStatus> {
+        // First get the service-specific settings via networksetup (as currently implemented).
         let service = Self::get_primary_service()?;
         let out = Command::new("networksetup")
             .args(["-getsocksfirewallproxy", &service])
@@ -168,11 +205,19 @@ impl ProxyManager for MacOSProxyManager {
             .find_map(|l| l.strip_prefix("URL: "))
             .map(|s| s.trim().to_owned());
 
+        // Now verify against the system's actual dynamic store via scutil.
+        // This handles cases where a proxy might be set via other means or is "zombied".
+        let sc_out = Command::new("scutil").arg("--proxy").output()?;
+        let sc_body = String::from_utf8_lossy(&sc_out.stdout);
+        
+        let sc_socks_enabled = sc_body.lines().any(|l| l.contains("SOCKSProxy : 1"));
+        let sc_pac_enabled = sc_body.lines().any(|l| l.contains("ProxyAutoConfigEnable : 1"));
+
         Ok(ProxyStatus {
-            enabled: enabled || pac_enabled,
-            mode: if pac_enabled {
+            enabled: enabled || pac_enabled || sc_socks_enabled || sc_pac_enabled,
+            mode: if pac_enabled || sc_pac_enabled {
                 ProxyMode::Pac
-            } else if enabled {
+            } else if enabled || sc_socks_enabled {
                 ProxyMode::All
             } else {
                 ProxyMode::Off

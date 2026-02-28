@@ -59,11 +59,21 @@ pub async fn run_proxy(
                         "system proxy enabled (all traffic via {})",
                         proxy_cfg.socks_endpoint
                     );
+                    if let Err(e) = mgr.set_dns("127.0.0.1") {
+                        eprintln!("warning: failed to set system DNS: {e}");
+                    } else {
+                        println!("system DNS set to 127.0.0.1 (leak protection active)");
+                    }
                 }
                 "pac" => {
                     let pac_url = format!("http://127.0.0.1:{}/proxy.pac", proxy_cfg.pac_port);
                     mgr.enable_pac(&pac_url)?;
                     println!("system proxy enabled (PAC: {pac_url})");
+                    if let Err(e) = mgr.set_dns("127.0.0.1") {
+                        eprintln!("warning: failed to set system DNS: {e}");
+                    } else {
+                        println!("system DNS set to 127.0.0.1 (leak protection active)");
+                    }
                     println!(
                         "tip: run `prime-net-engine proxy serve-pac --port {}`",
                         proxy_cfg.pac_port
@@ -75,6 +85,7 @@ pub async fn run_proxy(
                     })?;
                     mgr.enable_pac(url)?;
                     println!("system proxy enabled (custom PAC: {url})");
+                    let _ = mgr.set_dns("127.0.0.1");
                 }
                 _ => {
                     return Err(EngineError::InvalidInput(
@@ -85,7 +96,8 @@ pub async fn run_proxy(
         }
         ProxyAction::Disable => {
             mgr.disable()?;
-            println!("system proxy disabled");
+            let _ = mgr.reset_dns();
+            println!("system proxy disabled and DNS restored");
         }
         ProxyAction::Status => {
             let status = mgr.status()?;

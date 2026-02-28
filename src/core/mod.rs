@@ -2,6 +2,7 @@ pub mod chunk_manager;
 pub mod connection_pool;
 pub mod download;
 pub mod http_client;
+pub mod proxy_helper;
 pub mod request;
 pub mod response_stream;
 

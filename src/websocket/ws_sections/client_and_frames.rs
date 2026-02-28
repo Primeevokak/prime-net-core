@@ -10,7 +10,7 @@ use reqwest::header::{HeaderValue, HOST};
 use url::Url;
 
 use crate::anticensorship::{DomainFrontingProxy, PrimeReqwestDnsResolver, ResolverChain};
-use crate::config::DomainFrontingRule;
+use crate::config::{DomainFrontingRule, EngineConfig};
 use crate::core::RequestData;
 use crate::error::{EngineError, Result};
 
@@ -33,6 +33,8 @@ pub struct WsConfig {
     pub inbound_queue: usize,
     pub permessage_deflate: bool,
     pub max_message_size: usize,
+    /// Optional engine configuration for proxying and DPI bypass.
+    pub engine_config: Option<EngineConfig>,
 }
 
 impl Default for WsConfig {
@@ -46,6 +48,7 @@ impl Default for WsConfig {
             inbound_queue: 256,
             permessage_deflate: true,
             max_message_size: 8 * 1024 * 1024,
+            engine_config: None,
         }
     }
 }
@@ -519,7 +522,8 @@ async fn connect_and_run(
 
     let parsed =
         Url::parse(&url).map_err(|e| EngineError::InvalidInput(format!("invalid url: {e}")))?;
-    let (mut stream, connect_host) = connect_transport(&parsed, resolver_chain.as_ref()).await?;
+    let (mut stream, connect_host) =
+        connect_transport(&parsed, resolver_chain.as_ref(), cfg.engine_config.as_ref()).await?;
     let handshake = handshake(&mut stream, &parsed, &connect_host, &cfg).await?;
 
     let (mut rd, mut wr) = tokio::io::split(stream);

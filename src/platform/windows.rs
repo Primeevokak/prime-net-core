@@ -587,6 +587,30 @@ impl ProxyManager for WindowsProxyManager {
         Ok(())
     }
 
+    fn set_dns(&self, dns_server: &str) -> Result<()> {
+        if let Ok(adapters) = self.get_active_adapters() {
+            for adapter in adapters {
+                // netsh interface ipv4 set dns name="Adapter Name" static 127.0.0.1
+                let _ = Command::new("netsh")
+                    .args(["interface", "ipv4", "set", "dns", &format!("name=\"{}\"", adapter), "static", dns_server])
+                    .status();
+            }
+        }
+        Ok(())
+    }
+
+    fn reset_dns(&self) -> Result<()> {
+        if let Ok(adapters) = self.get_active_adapters() {
+            for adapter in adapters {
+                // netsh interface ipv4 set dns name="Adapter Name" source=dhcp
+                let _ = Command::new("netsh")
+                    .args(["interface", "ipv4", "set", "dns", &format!("name=\"{}\"", adapter), "source=dhcp"])
+                    .status();
+            }
+        }
+        Ok(())
+    }
+
     fn status(&self) -> Result<ProxyStatus> {
         let key = Self::open_settings_read()?;
         let enabled = key.get_value("ProxyEnable").unwrap_or(0_u32) != 0;

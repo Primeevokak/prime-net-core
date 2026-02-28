@@ -67,6 +67,8 @@ tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "time", "ne
 tokio-util = { version = "0.7.16", features = ["io"] }
 futures-util = "0.3.31"
 tokio-rustls = "0.26.4"
+rustls-native-certs = "0.8"
+rustls-platform-verifier = "0.5"
 tiny_http = "0.12"
 toml = "0.8"
 toml_edit = "0.22"

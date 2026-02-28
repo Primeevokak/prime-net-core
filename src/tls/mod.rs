@@ -29,6 +29,16 @@ pub enum TlsVersion {
     Tls1_3,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsRootStore {
+    /// Use the bundled Mozilla roots (via webpki-roots). Good for portability.
+    #[default]
+    Webpki,
+    /// Use the system's trust store. Required for corporate proxies or local certs.
+    System,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
     #[serde(default)]
@@ -39,6 +49,8 @@ pub struct TlsConfig {
     pub alpn_protocols: Vec<String>,
     #[serde(default)]
     pub ja3_fingerprint: Ja3Fingerprint,
+    #[serde(default)]
+    pub root_store: TlsRootStore,
 }
 
 fn default_tls_max() -> TlsVersion {
@@ -56,6 +68,7 @@ impl Default for TlsConfig {
             max_version: TlsVersion::Tls1_3,
             alpn_protocols: default_alpn(),
             ja3_fingerprint: Ja3Fingerprint::default(),
+            root_store: TlsRootStore::default(),
         }
     }
 }

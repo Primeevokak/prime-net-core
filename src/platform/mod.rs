@@ -30,6 +30,16 @@ pub trait ProxyManager: Send + Sync {
     fn enable_pac(&self, pac_url: &str) -> Result<()>;
     fn disable(&self) -> Result<()>;
     fn status(&self) -> Result<ProxyStatus>;
+
+    /// Sets the system DNS server (e.g. to 127.0.0.1) to prevent leaks.
+    fn set_dns(&self, _dns_server: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Resets system DNS to automatic/default settings.
+    fn reset_dns(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "windows")]

@@ -173,7 +173,12 @@ impl PrimeHttpClient {
             )));
         }
 
-        let mut endpoint = bind_quinn_endpoint()?;
+        // Lazy initialize or use shared endpoint if available
+        let mut endpoint = if let Some(ep) = &self.h3_endpoint {
+            ep.clone()
+        } else {
+            bind_quinn_endpoint()?
+        };
         let tls_cfg = build_rustls_config_http3(self)?;
         let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(tls_cfg)
             .map_err(|e| EngineError::Internal(format!("quic tls config failed: {e}")))?;
@@ -291,7 +296,12 @@ impl PrimeHttpClient {
             )));
         }
 
-        let mut endpoint = bind_quinn_endpoint()?;
+        // Lazy initialize or use shared endpoint if available
+        let mut endpoint = if let Some(ep) = &self.h3_endpoint {
+            ep.clone()
+        } else {
+            bind_quinn_endpoint()?
+        };
         let tls_cfg = build_rustls_config_http3(self)?;
         let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(tls_cfg)
             .map_err(|e| EngineError::Internal(format!("quic tls config failed: {e}")))?;

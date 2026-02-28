@@ -1126,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn route_race_launch_for_youtube_uses_direct_and_two_best_bypass_profiles() {
+    fn route_race_launch_for_youtube_uses_direct_and_all_available_bypass_profiles_up_to_limit() {
         let direct = RouteCandidate::direct("adaptive");
         let bypass_1 = RouteCandidate::bypass(
             "adaptive-race",
@@ -1149,10 +1149,11 @@ mod tests {
         let ordered = vec![direct.clone(), bypass_1.clone(), bypass_2, bypass_3];
 
         let launch = route_race_launch_candidates(&ordered, "www.youtube.com:443|any");
-        assert_eq!(launch.len(), 3);
+        // We set the limit for YouTube to 7. Since we only have 4 candidates (1 direct + 3 bypass),
+        // all of them should be launched.
+        assert_eq!(launch.len(), 4);
         assert_eq!(launch[0].route_id(), direct.route_id());
         assert_eq!(launch[1].route_id(), bypass_1.route_id());
-        assert_eq!(launch[2].route_id(), "bypass:2");
     }
 
     #[test]

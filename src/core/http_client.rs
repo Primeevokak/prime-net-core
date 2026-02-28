@@ -74,6 +74,7 @@ pub struct PrimeHttpClient {
     client_plain: reqwest::Client,
     client_ech_grease: Option<reqwest::Client>,
     client_ech_real_cache: parking_lot::Mutex<std::collections::HashMap<String, reqwest::Client>>,
+    h3_endpoint: Option<quinn::Endpoint>,
     config: EngineConfig,
     chunk_manager: ChunkManager,
     resolver_chain: std::sync::Arc<ResolverChain>,
@@ -404,7 +405,7 @@ fn base_crypto_provider() -> rustls::crypto::CryptoProvider {
         .unwrap_or_else(rustls::crypto::aws_lc_rs::default_provider)
 }
 
-fn select_crypto_provider(cfg: &EngineConfig) -> std::sync::Arc<rustls::crypto::CryptoProvider> {
+pub(crate) fn select_crypto_provider(cfg: &EngineConfig) -> std::sync::Arc<rustls::crypto::CryptoProvider> {
     match cfg.tls.ja3_fingerprint {
         Ja3Fingerprint::RustlsDefault => default_crypto_provider_arc(),
         other => std::sync::Arc::new(apply_ja3_profile(base_crypto_provider(), other)),
@@ -558,15 +559,17 @@ fn build_rustls_client_config(
     cfg: &EngineConfig,
     ech_mode: Option<rustls::client::EchMode>,
 ) -> Result<rustls::ClientConfig> {
+    use crate::tls::TlsRootStore;
     let mut roots = rustls::RootCertStore::empty();
+    
+    let use_system_verifier = cfg.tls.root_store == TlsRootStore::System;
+
+    // Load bundled roots anyway as a fallback or for the initial builder state
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
     let versions = select_rustls_versions_plain(cfg)?;
-
     let provider = select_crypto_provider(cfg);
 
-    // NOTE: rustls' `with_ech()` typestate transition does not allow calling
-    // `with_protocol_versions()` after it. Internally, `with_ech()` forces TLS 1.3.
     let builder = if let Some(mode) = ech_mode {
         validate_ech_tls_constraints(cfg)?;
         rustls::ClientConfig::builder_with_provider(provider)
@@ -579,6 +582,14 @@ fn build_rustls_client_config(
     };
 
     let mut tls = builder.with_root_certificates(roots).with_no_client_auth();
+
+    if use_system_verifier {
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        {
+            use rustls_platform_verifier::Verifier;
+            tls.dangerous().set_certificate_verifier(std::sync::Arc::new(Verifier::new()));
+        }
+    }
 
     // ALPN protocols (drives HTTP/2 negotiation).
     let mut alpn = Vec::new();

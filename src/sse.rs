@@ -87,6 +87,8 @@ struct EventAcc {
     retry: Option<Duration>,
 }
 
+const MAX_DATA_SIZE: usize = 8 * 1024 * 1024; // 8MB limit for accumulated event data
+
 impl EventAcc {
     fn new() -> Self {
         Self {
@@ -120,6 +122,15 @@ impl EventAcc {
         } else {
             Some(out)
         }
+    }
+
+    fn push_data(&mut self, line: &str) -> Result<()> {
+        if self.data.len() + line.len() > MAX_DATA_SIZE {
+            return Err(EngineError::Internal("sse event data exceeds maximum size".to_owned()));
+        }
+        self.data.push_str(line);
+        self.data.push('\n');
+        Ok(())
     }
 }
 
@@ -236,8 +247,10 @@ async fn run_sse(
             match field {
                 "event" => acc.event = Some(value.to_owned()),
                 "data" => {
-                    acc.data.push_str(value);
-                    acc.data.push('\n');
+                    if let Err(e) = acc.push_data(value) {
+                        let _ = out.send(Err(e)).await;
+                        return;
+                    }
                 }
                 "retry" => {
                     if let Ok(ms) = value.trim().parse::<u64>() {

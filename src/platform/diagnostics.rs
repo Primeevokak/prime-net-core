@@ -96,18 +96,18 @@ impl ProxyDiagnostics {
             return match output {
                 Ok(out) if out.status.success() => {
                     let text = String::from_utf8_lossy(&out.stdout);
-                    if text.contains("SOCKSEnable : 1")
+                    if text.contains("SOCKSProxy : 1")
                         || text.contains("ProxyAutoConfigEnable : 1")
                     {
-                        DiagnosticResult::ok("System proxy configured")
+                        DiagnosticResult::ok("System proxy configured (active)")
                     } else {
                         DiagnosticResult::warn(
-                            "No SOCKS/PAC proxy enabled",
+                            "No SOCKS/PAC proxy enabled in scutil",
                             "Run: prime-net-engine proxy enable --mode pac",
                         )
                     }
                 }
-                _ => DiagnosticResult::error("Cannot check proxy settings", ""),
+                _ => DiagnosticResult::error("Cannot check proxy settings via scutil", ""),
             };
         }
 
@@ -116,27 +116,45 @@ impl ProxyDiagnostics {
             let output = Command::new("gsettings")
                 .args(["get", "org.gnome.system.proxy", "mode"])
                 .output();
-            return match output {
-                Ok(out) if out.status.success() => {
+            let mut results = Vec::new();
+            if let Ok(out) = output {
+                if out.status.success() {
                     let mode = String::from_utf8_lossy(&out.stdout)
                         .trim()
                         .trim_matches('\'')
                         .to_owned();
                     if mode == "manual" || mode == "auto" {
-                        DiagnosticResult::ok(&format!("System proxy mode: {mode}"))
-                    } else {
-                        DiagnosticResult::warn(
-                            &format!("Proxy mode: {mode}"),
-                            "Run: prime-net-engine proxy enable --mode pac",
-                        )
+                        results.push(format!("GSettings mode: {mode}"));
                     }
                 }
-                _ => DiagnosticResult::info("Cannot detect proxy (gsettings not available)", ""),
-            };
+            }
+            
+            // Check resolvectl for DNS
+            let r_out = Command::new("resolvectl").arg("status").output();
+            if let Ok(out) = r_out {
+                if out.status.success() {
+                    results.push("systemd-resolved (resolvectl) active".to_owned());
+                }
+            }
+
+            if results.is_empty() {
+                DiagnosticResult::info("Generic Linux: no desktop-specific proxy detected", "Check environment variables (ALL_PROXY)")
+            } else {
+                DiagnosticResult::ok(&results.join(", "))
+            }
         }
 
         #[allow(unreachable_code)]
         DiagnosticResult::info("Platform diagnostics not available", "")
+    }
+
+    pub fn check_network_connectivity() -> DiagnosticResult {
+        // Simple check to see if we can reach a public DNS server (e.g., Google DNS)
+        let addr = "8.8.8.8:53".parse::<SocketAddr>().unwrap();
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+            Ok(_) => DiagnosticResult::ok("Internet connectivity established (ICMP/TCP)"),
+            Err(e) => DiagnosticResult::error("No internet connectivity", &format!("Error: {e}. Check your network interface or ISP.")),
+        }
     }
 
     pub fn run_sync_basic(socks_endpoint: &str) -> Result<Vec<DiagnosticResult>> {
@@ -146,6 +164,7 @@ impl ProxyDiagnostics {
             ));
         }
         Ok(vec![
+            Self::check_network_connectivity(),
             Self::check_socks5_listening(socks_endpoint),
             Self::check_system_proxy_config(),
         ])

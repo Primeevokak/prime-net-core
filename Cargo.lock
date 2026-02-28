@@ -2698,6 +2698,8 @@ dependencies = [
  "reqwest 0.12.28",
  "rexpect",
  "rustls",
+ "rustls-native-certs",
+ "rustls-platform-verifier 0.5.3",
  "security-framework 2.11.1",
  "self_update",
  "sentry",
@@ -2804,7 +2806,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "rustls-pki-types",
- "rustls-platform-verifier",
+ "rustls-platform-verifier 0.6.2",
  "slab",
  "thiserror 2.0.18",
  "tinyvec",
@@ -3197,6 +3199,27 @@ dependencies = [
 
 [[package]]
 name = "rustls-platform-verifier"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19787cda76408ec5404443dc8b31795c87cd8fec49762dc75fa727740d34acc1"
+dependencies = [
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
+ "jni",
+ "log",
+ "once_cell",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-platform-verifier-android",
+ "rustls-webpki",
+ "security-framework 3.5.1",
+ "security-framework-sys",
+ "webpki-root-certs 0.26.11",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "rustls-platform-verifier"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d99feebc72bae7ab76ba994bb5e121b8d83d910ca40b36e0921f53becc41784"
@@ -3212,7 +3235,7 @@ dependencies = [
  "rustls-webpki",
  "security-framework 3.5.1",
  "security-framework-sys",
- "webpki-root-certs",
+ "webpki-root-certs 1.0.6",
  "windows-sys 0.61.2",
 ]
 
@@ -4564,6 +4587,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-root-certs"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75c7f0ef91146ebfb530314f5f1d24528d7f0767efbfd31dce919275413e393e"
+dependencies = [
+ "webpki-root-certs 1.0.6",
 ]
 
 [[package]]

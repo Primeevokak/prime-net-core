@@ -98,7 +98,6 @@ pub struct PrimeRequest {
     pub body: *const u8,
     pub body_len: usize,
 }
-
 #[repr(C)]
 pub struct PrimeResponse {
     pub status_code: u16,
@@ -109,8 +108,11 @@ pub struct PrimeResponse {
     pub error_code: i32,
     pub error_message: *const c_char,
     pub owner: *mut c_void,
+    magic: u64,
 }
 
+const PRIME_RESPONSE_MAGIC: u64 = 0x5052_494D_455F_5245; // "PRIME_RE"
+const PRIME_OK: i32 = 0;
 struct OwnedPrimeResponse {
     _headers: Vec<CString>,
     header_ptrs: Vec<*const c_char>,
@@ -118,7 +120,6 @@ struct OwnedPrimeResponse {
     error_message: Option<CString>,
 }
 
-const PRIME_OK: i32 = 0;
 const PRIME_ERR_NULL_PTR: i32 = 1;
 const PRIME_ERR_INVALID_UTF8: i32 = 2;
 const PRIME_ERR_INVALID_REQUEST: i32 = 3;
@@ -663,6 +664,10 @@ pub unsafe extern "C" fn prime_response_free(response: *mut PrimeResponse) {
             }
             // SAFETY: response pointer was allocated in pack_response.
             unsafe {
+                if (*response).magic != PRIME_RESPONSE_MAGIC {
+                    return;
+                }
+                (*response).magic = 0;
                 let boxed = Box::from_raw(response);
                 if !boxed.owner.is_null() {
                     let _ = Box::from_raw(boxed.owner as *mut OwnedPrimeResponse);
@@ -867,6 +872,7 @@ fn pack_response(
             .as_ref()
             .map_or(ptr::null(), |s| s.as_ptr()),
         owner: ptr::null_mut(),
+        magic: PRIME_RESPONSE_MAGIC,
     });
 
     let mut response = response;

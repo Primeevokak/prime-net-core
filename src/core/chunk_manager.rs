@@ -105,11 +105,7 @@ impl ChunkManager {
         if chunks.is_empty() {
             return Ok(Vec::new());
         }
-        let concurrency = self
-            .concurrent_chunks
-            .load(Ordering::Relaxed)
-            .min(self.strategy.max_concurrency)
-            .max(1);
+        let concurrency = self.current_concurrency();
 
         let semaphore = Arc::new(Semaphore::new(concurrency));
         let downloaded = Arc::new(AtomicU64::new(0));
@@ -117,22 +113,20 @@ impl ChunkManager {
 
         let mut join_set = JoinSet::new();
         for (index, chunk) in chunks.iter().copied().enumerate() {
-            let permit = semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| EngineError::Internal("semaphore closed".to_owned()))?;
             let client = client.clone();
             let request = request.clone();
             let downloaded = downloaded.clone();
             let progress = progress.clone();
+            let sem = semaphore.clone();
+            
             join_set.spawn(async move {
-                let _permit = permit;
-                let bytes =
-                    download_chunk_with_retry(&client, &request, chunk, max_retries).await?;
+                let _permit = sem.acquire_owned().await
+                    .map_err(|_| EngineError::Internal("semaphore closed".to_owned()))?;
+                
+                let bytes = download_chunk_with_retry(&client, &request, chunk, max_retries).await?;
                 let chunk_len = bytes.len() as u64;
-                let total_downloaded =
-                    downloaded.fetch_add(chunk_len, Ordering::Relaxed) + chunk_len;
+                let total_downloaded = downloaded.fetch_add(chunk_len, Ordering::Relaxed) + chunk_len;
+                
                 if let Some(cb) = progress {
                     let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
                     let speed_mbps = (total_downloaded as f64 * 8.0 / 1_000_000.0) / elapsed;
@@ -157,6 +151,79 @@ impl ChunkManager {
         let speed_mbps = (content_length as f64 * 8.0 / 1_000_000.0) / elapsed;
         self.adjust_concurrency(speed_mbps);
         Ok(merged)
+    }
+
+    pub async fn download_to_path(
+        &self,
+        client: &reqwest::Client,
+        request: &RequestData,
+        content_length: u64,
+        max_retries: usize,
+        path: &std::path::Path,
+        progress: Option<ProgressHook>,
+    ) -> Result<()> {
+        use std::fs::OpenOptions;
+        use std::io::{Seek, SeekFrom, Write};
+
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        if content_length > 0 {
+            file.set_len(content_length)?;
+        }
+        let file = Arc::new(parking_lot::Mutex::new(file));
+
+        let chunks = self.calculate_chunks(content_length);
+        let concurrency = self.current_concurrency();
+        let semaphore = Arc::new(Semaphore::new(concurrency));
+        let downloaded = Arc::new(AtomicU64::new(0));
+        let started_at = Instant::now();
+
+        let mut join_set = JoinSet::new();
+        for chunk in chunks {
+            let client = client.clone();
+            let request = request.clone();
+            let downloaded = downloaded.clone();
+            let progress = progress.clone();
+            let sem = semaphore.clone();
+            let file = file.clone();
+            
+            join_set.spawn(async move {
+                let _permit = sem.acquire_owned().await
+                    .map_err(|_| EngineError::Internal("semaphore closed".to_owned()))?;
+                
+                let bytes = download_chunk_with_retry(&client, &request, chunk, max_retries).await?;
+                
+                let chunk_len = bytes.len() as u64;
+                let chunk_start = chunk.start;
+                tokio::task::spawn_blocking(move || {
+                    let mut guard = file.lock();
+                    guard.seek(SeekFrom::Start(chunk_start))?;
+                    guard.write_all(&bytes)?;
+                    Ok::<(), std::io::Error>(())
+                }).await.map_err(|e| EngineError::Internal(format!("blocking write task failed: {e}")))??;
+
+                let total_downloaded = downloaded.fetch_add(chunk_len, Ordering::Relaxed) + chunk_len;
+                
+                if let Some(cb) = progress {
+                    let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
+                    let speed_mbps = (total_downloaded as f64 * 8.0 / 1_000_000.0) / elapsed;
+                    cb(total_downloaded, content_length, speed_mbps);
+                }
+                Ok::<(), EngineError>(())
+            });
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            result??;
+        }
+
+        let elapsed = started_at.elapsed().as_secs_f64().max(0.001);
+        let speed_mbps = (content_length as f64 * 8.0 / 1_000_000.0) / elapsed;
+        self.adjust_concurrency(speed_mbps);
+        Ok(())
     }
 }
 
@@ -254,6 +321,7 @@ async fn download_range(
 struct ParsedContentRange {
     start: u64,
     end: u64,
+    total: Option<u64>,
 }
 
 fn parse_content_range(headers: &HeaderMap) -> Option<ParsedContentRange> {
@@ -262,14 +330,19 @@ fn parse_content_range(headers: &HeaderMap) -> Option<ParsedContentRange> {
     if !unit.eq_ignore_ascii_case("bytes") {
         return None;
     }
-    let (range_part, _) = rest.split_once('/')?;
+    let (range_part, total_part) = rest.split_once('/')?;
     let (start_s, end_s) = range_part.split_once('-')?;
     let start = start_s.trim().parse::<u64>().ok()?;
     let end = end_s.trim().parse::<u64>().ok()?;
+    let total = if total_part.trim() == "*" {
+        None
+    } else {
+        total_part.trim().parse::<u64>().ok()
+    };
     if end < start {
         return None;
     }
-    Some(ParsedContentRange { start, end })
+    Some(ParsedContentRange { start, end, total })
 }
 
 #[cfg(test)]

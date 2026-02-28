@@ -50,6 +50,7 @@ impl PrimeHttpClient {
             client_plain,
             client_ech_grease,
             client_ech_real_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            h3_endpoint: None,
             chunk_manager: ChunkManager::new(strategy, config.download.adaptive_enabled),
             fronting,
             fronting_v2,
@@ -67,7 +68,8 @@ impl PrimeHttpClient {
     }
 
     /// Creates a `WebSocketClient` wired to the same DNS resolver chain and domain fronting rules as this HTTP client.
-    pub fn websocket_client(&self, ws_config: WsConfig) -> WebSocketClient {
+    pub fn websocket_client(&self, mut ws_config: WsConfig) -> WebSocketClient {
+        ws_config.engine_config = Some(self.config.clone());
         WebSocketClient::new(ws_config, self.resolver_chain.clone())
             .with_domain_fronting(
                 self.config.anticensorship.domain_fronting_enabled,
