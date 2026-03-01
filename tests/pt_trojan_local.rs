@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use prime_net_engine_core::anticensorship::ResolverChain;
-use prime_net_engine_core::config::{AntiCensorshipConfig, TrojanPtConfig};
+use prime_net_engine_core::config::{AntiCensorshipConfig, TrojanPtConfig, EngineConfig};
 use prime_net_engine_core::pt::socks5_server::start_socks5_server;
 use prime_net_engine_core::pt::trojan::TrojanOutbound;
 use prime_net_engine_core::pt::DynOutbound;
@@ -258,6 +258,7 @@ async fn trojan_outbound_via_local_socks5_can_proxy_http() -> Result<()> {
     let socks = start_socks5_server(
         "127.0.0.1:0",
         outbound,
+        Arc::new(EngineConfig::default()),
         true,
         prime_net_engine_core::pt::socks5_server::RelayOptions::default(),
     )

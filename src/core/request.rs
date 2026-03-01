@@ -80,3 +80,52 @@ pub fn parse_header_line(line: &str) -> Option<(String, String)> {
     }
     Some((name.to_owned(), value.to_owned()))
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Bounds and total length extracted from a `Content-Range` header (RFC 9110).
+pub struct ContentRangeBounds {
+    /// Byte index where the range starts (inclusive).
+    pub start: u64,
+    /// Byte index where the range ends (inclusive).
+    pub end: u64,
+    /// Total size of the resource if known (`*` in header means None).
+    pub total: Option<u64>,
+}
+
+/// Parses a `reqwest::header::HeaderMap` for `Content-Range`.
+///
+/// Returns `None` if the header is missing, malformed, or if the unit is not `bytes`.
+pub fn parse_content_range_bounds(headers: &reqwest::header::HeaderMap) -> Option<ContentRangeBounds> {
+    // Content-Range: bytes 0-0/12345
+    let v = headers
+        .get(reqwest::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .trim();
+    let (unit, rest) = v.split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+
+    let (range_part, total_part) = rest.split_once('/')?;
+    let (start_s, end_s) = range_part.split_once('-')?;
+    let start = start_s.trim().parse::<u64>().ok()?;
+    let end = end_s.trim().parse::<u64>().ok()?;
+    if end < start {
+        return None;
+    }
+
+    let total = if total_part.trim() == "*" {
+        None
+    } else {
+        Some(total_part.trim().parse::<u64>().ok()?)
+    };
+
+    if let Some(t) = total {
+        if t == 0 || start >= t || end >= t {
+            return None;
+        }
+    }
+
+    Some(ContentRangeBounds { start, end, total })
+}

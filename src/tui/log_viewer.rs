@@ -18,7 +18,8 @@ const MAX_LOGS_SIZE_BYTES: usize = 5 * 1024 * 1024;
 pub struct LogViewer {
     pub logs: Arc<RwLock<VecDeque<LogEntry>>>,
     approx_size_bytes: AtomicUsize,
-    filtered_cache: Mutex<Option<Vec<LogEntry>>>,
+    // Optimisation: store filtered logs in a separate Arc-wrapped Vec to avoid re-cloning and re-filtering
+    filtered_cache: RwLock<Arc<Vec<LogEntry>>>,
     cache_dirty: AtomicBool,
     filter_level: RwLock<Option<Level>>,
     category_filter: RwLock<Option<String>>,
@@ -47,7 +48,7 @@ impl LogViewer {
         Self {
             logs: Arc::new(RwLock::new(VecDeque::with_capacity(10_000))),
             approx_size_bytes: AtomicUsize::new(0),
-            filtered_cache: Mutex::new(None),
+            filtered_cache: RwLock::new(Arc::new(Vec::new())),
             cache_dirty: AtomicBool::new(true),
             filter_level: RwLock::new(None),
             category_filter: RwLock::new(None),
@@ -60,78 +61,93 @@ impl LogViewer {
 
     pub fn add_log(&self, entry: LogEntry) {
         let entry_size = entry.approx_size();
+        
+        // 1. Add to the global log buffer
         let mut logs = self.logs.write();
-
         let mut current_size = self.approx_size_bytes.load(Ordering::Relaxed);
+        
+        let mut removed_any = false;
         while current_size + entry_size > MAX_LOGS_SIZE_BYTES && !logs.is_empty() {
             if let Some(oldest) = logs.pop_front() {
                 current_size = current_size.saturating_sub(oldest.approx_size());
+                removed_any = true;
             }
         }
 
         current_size += entry_size;
-        logs.push_back(entry);
-        self.approx_size_bytes
-            .store(current_size, Ordering::Relaxed);
-        self.cache_dirty.store(true, Ordering::Relaxed);
+        logs.push_back(entry.clone());
+        self.approx_size_bytes.store(current_size, Ordering::Relaxed);
+
+        // 2. Incremental update of the filtered cache if cache isn't already fully dirty
+        if !self.cache_dirty.load(Ordering::Relaxed) && !removed_any {
+            if self.entry_matches_filters(&entry) {
+                let mut cache = self.filtered_cache.write();
+                let mut new_vec = (**cache).clone();
+                new_vec.push(entry);
+                *cache = Arc::new(new_vec);
+            }
+        } else {
+            self.cache_dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn entry_matches_filters(&self, entry: &LogEntry) -> bool {
+        let filter_level = *self.filter_level.read();
+        let category_filter = self.category_filter.read();
+        let search_query = self.search_query.read();
+        
+        if let Some(level) = filter_level {
+            if level_rank(entry.level) > level_rank(level) {
+                return false;
+            }
+        }
+        if let Some(tag) = category_filter.as_ref() {
+            if !entry.message.contains(tag) && !entry.target.contains(tag) {
+                return false;
+            }
+        }
+        if search_query.is_empty() {
+            return true;
+        }
+        
+        if self.use_regex.load(Ordering::Relaxed) {
+            if let Ok(re) = Regex::new(&search_query) {
+                return re.is_match(&entry.message) || re.is_match(&entry.target);
+            }
+        }
+        
+        entry.message.contains(&*search_query) || entry.target.contains(&*search_query)
     }
 
     pub fn clear(&self) {
         self.logs.write().clear();
         self.approx_size_bytes.store(0, Ordering::Relaxed);
-        self.cache_dirty.store(true, Ordering::Relaxed);
+        {
+            let mut cache = self.filtered_cache.write();
+            *cache = Arc::new(Vec::new());
+        }
+        self.cache_dirty.store(false, Ordering::Relaxed);
         self.selected_line.store(0, Ordering::Relaxed);
     }
 
-    pub fn filtered_logs(&self) -> Vec<LogEntry> {
+    pub fn filtered_logs(&self) -> Arc<Vec<LogEntry>> {
         if !self.cache_dirty.load(Ordering::Relaxed) {
-            let cache = self.cache_guard();
-            if let Some(cached) = cache.as_ref() {
-                return cached.clone();
-            }
+            return self.filtered_cache.read().clone();
         }
 
+        // Full re-filter (slow path, only happens on filter change or buffer wrap)
         let logs = self.logs.read();
-        let filter_level = *self.filter_level.read();
-        let category_filter = self.category_filter.read().clone();
-        let search_query = self.search_query.read().clone();
-        let use_regex = self.use_regex.load(Ordering::Relaxed);
-        let regex = if use_regex && !search_query.is_empty() {
-            Regex::new(&search_query).ok()
-        } else {
-            None
-        };
-
         let filtered = logs
             .iter()
-            .filter(|entry| {
-                if let Some(level) = filter_level {
-                    if level_rank(entry.level) > level_rank(level) {
-                        return false;
-                    }
-                }
-                if let Some(tag) = category_filter.as_ref() {
-                    if !entry.message.contains(tag) && !entry.target.contains(tag) {
-                        return false;
-                    }
-                }
-                if search_query.is_empty() {
-                    return true;
-                }
-                if let Some(re) = regex.as_ref() {
-                    re.is_match(&entry.message) || re.is_match(&entry.target)
-                } else {
-                    entry.message.contains(&search_query) || entry.target.contains(&search_query)
-                }
-            })
+            .filter(|entry| self.entry_matches_filters(entry))
             .cloned()
             .collect::<Vec<_>>();
 
-        let mut cache = self.cache_guard();
-        *cache = Some(filtered.clone());
+        let mut cache = self.filtered_cache.write();
+        *cache = Arc::new(filtered);
         self.cache_dirty.store(false, Ordering::Relaxed);
 
-        filtered
+        cache.clone()
     }
 
     pub fn visible_logs(&self, max_lines: usize) -> Vec<LogEntry> {
@@ -142,7 +158,7 @@ impl LogViewer {
 
         let auto_scroll = self.auto_scroll.load(Ordering::Relaxed);
         let selected_line = self.selected_line.load(Ordering::Relaxed);
-        if auto_scroll || selected_line == 0 {
+        if auto_scroll {
             let skip = all.len().saturating_sub(max_lines);
             all[skip..].to_vec()
         } else {
@@ -251,7 +267,7 @@ impl LogViewer {
         writeln!(file, "------------------------------------")?;
         writeln!(file)?;
 
-        for entry in self.filtered_logs() {
+        for entry in self.filtered_logs().iter() {
             let ts = format_timestamp(entry.timestamp);
             writeln!(
                 file,
@@ -260,13 +276,6 @@ impl LogViewer {
             )?;
         }
         Ok(())
-    }
-
-    fn cache_guard(&self) -> MutexGuard<'_, Option<Vec<LogEntry>>> {
-        match self.filtered_cache.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
     }
 }
 

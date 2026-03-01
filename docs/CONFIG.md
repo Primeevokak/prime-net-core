@@ -206,7 +206,7 @@
 ### `[blocklist]`
 
 - `enabled = true`
-- `source = "https://github.com/zapret-info/z-i/raw/master/dump.csv"`
+- `source = "https://antifilter.download/list/domains.lst"`
 - `auto_update = true`
 - `update_interval_hours = 24`
 - `cache_path = <platform cache dir>/prime-net-engine/blocklist.json`

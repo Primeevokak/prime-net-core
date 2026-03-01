@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_RANGE, RANGE};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RANGE};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -282,6 +282,8 @@ fn chunk_retry_delay(attempt: usize) -> Duration {
     Duration::from_millis((100u64.saturating_mul(exp)).min(2_000))
 }
 
+use crate::core::request::parse_content_range_bounds;
+
 async fn download_range(
     client: &reqwest::Client,
     request: &RequestData,
@@ -306,7 +308,7 @@ async fn download_range(
         )));
     }
 
-    let parsed = parse_content_range(response.headers()).ok_or_else(|| {
+    let parsed = parse_content_range_bounds(response.headers()).ok_or_else(|| {
         EngineError::Internal("missing or invalid Content-Range for chunk response".to_owned())
     })?;
     if parsed.start != chunk.start || parsed.end != chunk.end {
@@ -327,43 +329,16 @@ async fn download_range(
     Ok(bytes)
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ParsedContentRange {
-    start: u64,
-    end: u64,
-    total: Option<u64>,
-}
-
-fn parse_content_range(headers: &HeaderMap) -> Option<ParsedContentRange> {
-    let v = headers.get(CONTENT_RANGE)?.to_str().ok()?.trim();
-    let (unit, rest) = v.split_once(' ')?;
-    if !unit.eq_ignore_ascii_case("bytes") {
-        return None;
-    }
-    let (range_part, total_part) = rest.split_once('/')?;
-    let (start_s, end_s) = range_part.split_once('-')?;
-    let start = start_s.trim().parse::<u64>().ok()?;
-    let end = end_s.trim().parse::<u64>().ok()?;
-    let total = if total_part.trim() == "*" {
-        None
-    } else {
-        total_part.trim().parse::<u64>().ok()
-    };
-    if end < start {
-        return None;
-    }
-    Some(ParsedContentRange { start, end, total })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::CONTENT_RANGE;
 
     #[test]
     fn parse_content_range_accepts_valid_bytes_range() {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 10-19/100"));
-        let parsed = parse_content_range(&headers).expect("valid content-range");
+        let parsed = parse_content_range_bounds(&headers).expect("valid content-range");
         assert_eq!(parsed.start, 10);
         assert_eq!(parsed.end, 19);
     }
@@ -372,7 +347,7 @@ mod tests {
     fn parse_content_range_rejects_invalid_header() {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_RANGE, HeaderValue::from_static("items 10-19/100"));
-        assert!(parse_content_range(&headers).is_none());
+        assert!(parse_content_range_bounds(&headers).is_none());
     }
 
     #[test]

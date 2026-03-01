@@ -129,6 +129,7 @@ async fn probe_front_domain(
     };
 
     let mut builder = reqwest::Client::builder()
+        .no_proxy()
         .connect_timeout(Duration::from_secs(
             cfg.download.connect_timeout_secs.max(1),
         ))
@@ -168,7 +169,9 @@ async fn probe_doh_provider(
         .ok_or_else(|| EngineError::InvalidInput("DoH endpoint missing host".to_owned()))?
         .to_owned();
 
-    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(8));
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(8));
     if !bootstrap_ips.is_empty() {
         let addrs: Vec<SocketAddr> = bootstrap_ips
             .iter()

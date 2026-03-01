@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::EngineConfig;
 
 pub(super) async fn handle_http_proxy(
     conn_id: u64,
@@ -6,6 +7,7 @@ pub(super) async fn handle_http_proxy(
     peer: SocketAddr,
     client: String,
     outbound: DynOutbound,
+    cfg: Arc<EngineConfig>,
     first_two: [u8; 2],
     relay_opts: RelayOptions,
 ) -> Result<()> {
@@ -72,14 +74,15 @@ pub(super) async fn handle_http_proxy(
             addr: target_addr,
             port,
         };
-        let target_label = route_decision_key(&destination, &target_endpoint.addr);
+        let target_label = route_decision_key(&destination, &target_endpoint.addr, &cfg);
         let candidates = select_route_candidates(
             &relay_opts,
             &target_endpoint.addr,
             target_endpoint.port,
             &target_label,
+            &cfg,
         );
-        let ordered = ordered_route_candidates(&target_label, candidates);
+        let ordered = ordered_route_candidates(&target_label, candidates, &cfg);
 
         debug!(target: "socks5", conn_id, peer = %peer, client = %client, destination = %destination, "HTTP CONNECT requested");
 
@@ -90,104 +93,27 @@ pub(super) async fn handle_http_proxy(
             ordered,
             outbound.clone(),
             &relay_opts,
+            &cfg,
+            None,
         )
         .await
         {
             Ok(v) => v,
             Err(e) => {
                 warn!(target: "socks5", conn_id, peer = %peer, client = %client, destination = %destination, error = %e, "HTTP CONNECT upstream failed");
-                let _ = tcp
-                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
-                    .await;
+                let _ = tcp.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n").await;
                 let _ = tcp.shutdown().await;
                 return Ok(());
             }
         };
-        let service_bucket = host_service_bucket(&destination);
-        let high_signal_bucket = matches!(
-            service_bucket.as_str(),
-            "meta-group:youtube" | "meta-group:google" | "meta-group:discord"
-        );
-        if connected.candidate.kind == RouteKind::Bypass {
-            info!(
-                target: "socks5",
-                conn_id,
-                peer = %peer,
-                client = %client,
-                destination = %destination,
-                route = connected.candidate.route_label(),
-                source = connected.candidate.source,
-                bypass = ?connected.candidate.bypass_addr,
-                bypass_profile = connected.candidate.bypass_profile_idx + 1,
-                bypass_profiles = connected.candidate.bypass_profile_total,
-                raced = connected.raced,
-                "HTTP CONNECT route selected"
-            );
-        } else if high_signal_bucket {
-            info!(
-                target: "socks5",
-                conn_id,
-                peer = %peer,
-                client = %client,
-                destination = %destination,
-                bucket = %service_bucket,
-                route = connected.candidate.route_label(),
-                source = connected.candidate.source,
-                raced = connected.raced,
-                "HTTP CONNECT route selected"
-            );
-        } else {
-            debug!(
-                target: "socks5",
-                conn_id,
-                peer = %peer,
-                client = %client,
-                destination = %destination,
-                route = connected.candidate.route_label(),
-                source = connected.candidate.source,
-                raced = connected.raced,
-                "HTTP CONNECT route selected"
-            );
+
+        // Send 200 OK only after successful connect.
+        if let Err(e) = tcp.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await {
+            warn!(target: "socks5", conn_id, error = %e, "failed to send HTTP 200 OK to client");
+            return Ok(());
         }
 
-        if let Err(e) = tcp
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await
-        {
-            if is_expected_disconnect(&e) {
-                complete_route_outcome_event(
-                    connected.decision_id,
-                    &connected.route_key,
-                    Some(&connected.candidate),
-                    true,
-                    false,
-                    0,
-                    0,
-                    "client-disconnect-before-confirm",
-                );
-                debug!(
-                    target: "socks5",
-                    conn_id,
-                    peer = %peer,
-                    client = %client,
-                    destination = %destination,
-                    error = %e,
-                    "HTTP CONNECT client disconnected before tunnel confirmation"
-                );
-                return Ok(());
-            }
-            complete_route_outcome_event(
-                connected.decision_id,
-                &connected.route_key,
-                Some(&connected.candidate),
-                true,
-                false,
-                0,
-                0,
-                "client-confirm-io",
-            );
-            return Err(e.into());
-        }
+        let _service_bucket = host_service_bucket(&destination, &cfg);
 
         if connected.candidate.kind == RouteKind::Bypass {
             debug!(
@@ -201,8 +127,11 @@ pub(super) async fn handle_http_proxy(
             );
             let bypass_tunnel_started = Instant::now();
             let noisy_tls_destination = is_noise_probe_https_destination(&destination);
-            let tuned = tune_relay_for_target(relay_opts.clone(), port, &destination, false, true);
-            match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options.clone()).await
+            let mut tuned = tune_relay_for_target(relay_opts.clone(), port, &destination, false, true);
+            if connected.candidate.kind == RouteKind::Bypass {
+                tuned.options.fragment_client_hello = false;
+            }
+            match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options.clone(), Vec::new()).await
             {
                 Ok((c2u, u2c)) => {
                     let lifetime_ms = bypass_tunnel_started.elapsed().as_millis() as u64;
@@ -236,6 +165,7 @@ pub(super) async fn handle_http_proxy(
                                 &connected.route_key,
                                 &connected.candidate,
                                 "zero-reply-soft",
+                                &cfg,
                             );
                             outcome_error_class = "zero-reply-soft";
                         } else {
@@ -248,6 +178,7 @@ pub(super) async fn handle_http_proxy(
                             &connected.route_key,
                             &connected.candidate,
                             "zero-reply-soft",
+                            &cfg,
                         );
                         warn!(
                             target: "socks5.route",
@@ -269,11 +200,13 @@ pub(super) async fn handle_http_proxy(
                                 connected.candidate.bypass_profile_idx,
                                 connected.candidate.bypass_profile_total,
                                 "suspicious-zero-reply",
+                                &cfg,
                             );
                             record_route_failure(
                                 &connected.route_key,
                                 &connected.candidate,
                                 "suspicious-zero-reply",
+                                &cfg,
                             );
                             warn!(
                                 target: "socks5",
@@ -293,6 +226,7 @@ pub(super) async fn handle_http_proxy(
                                 &connected.route_key,
                                 &connected.candidate,
                                 "zero-reply-soft",
+                                &cfg,
                             );
                             warn!(
                                 target: "socks5.route",
@@ -311,8 +245,9 @@ pub(super) async fn handle_http_proxy(
                         record_bypass_profile_success(
                             &destination,
                             connected.candidate.bypass_profile_idx,
+                            &cfg,
                         );
-                        record_route_success(&connected.route_key, &connected.candidate);
+                        record_route_success(&connected.route_key, &connected.candidate, &cfg);
                         outcome_error_class = "ok";
                     }
                     complete_route_outcome_event(
@@ -324,9 +259,10 @@ pub(super) async fn handle_http_proxy(
                         u2c,
                         lifetime_ms,
                         outcome_error_class,
+                        &cfg,
                     );
                 }
-                Err(e) if is_expected_disconnect(&e) => {
+                Err(e) if crate::pt::socks5_server::route_connection::is_expected_disconnect(&e) => {
                     let lifetime_ms = bypass_tunnel_started.elapsed().as_millis() as u64;
                     let mut outcome_error_class = "client-disconnect";
                     if !noisy_tls_destination
@@ -334,12 +270,14 @@ pub(super) async fn handle_http_proxy(
                             &connected.route_key,
                             &connected.candidate,
                             lifetime_ms,
+                            &cfg,
                         )
                     {
                         record_route_failure(
                             &connected.route_key,
                             &connected.candidate,
                             "zero-reply-soft",
+                            &cfg,
                         );
                         warn!(
                             target: "socks5.route",
@@ -361,10 +299,12 @@ pub(super) async fn handle_http_proxy(
                         0,
                         lifetime_ms,
                         outcome_error_class,
+                        &cfg,
                     );
                     let _ = e;
                 }
                 Err(e) => {
+                    let outcome_error_class = "relay-error";
                     warn!(
                         target: "socks5",
                         conn_id,
@@ -378,11 +318,13 @@ pub(super) async fn handle_http_proxy(
                             connected.candidate.bypass_profile_idx,
                             connected.candidate.bypass_profile_total,
                             "io-error",
+                            &cfg,
                         );
                         record_route_failure(
                             &connected.route_key,
                             &connected.candidate,
                             "io-error",
+                            &cfg,
                         );
                     }
                     complete_route_outcome_event(
@@ -393,7 +335,8 @@ pub(super) async fn handle_http_proxy(
                         false,
                         0,
                         bypass_tunnel_started.elapsed().as_millis() as u64,
-                        "io-error",
+                        outcome_error_class,
+                        &cfg,
                     );
                 }
             }
@@ -403,7 +346,7 @@ pub(super) async fn handle_http_proxy(
         let tuned = tune_relay_for_target(relay_opts, port, &destination, false, false);
 
         let direct_tunnel_started = Instant::now();
-        match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options.clone()).await {
+        match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options.clone(), Vec::new()).await {
             Ok((bytes_client_to_upstream, bytes_upstream_to_client)) => {
                 let mut outcome_error_class = "ok";
                 if should_skip_empty_session_scoring(
@@ -431,6 +374,7 @@ pub(super) async fn handle_http_proxy(
                             BlockingSignal::SuspiciousZeroReply,
                             tuned.options.classifier_emit_interval_secs,
                             tuned.stage,
+                            &cfg,
                         );
                         warn!(
                             target: "socks5",
@@ -446,6 +390,7 @@ pub(super) async fn handle_http_proxy(
                             &connected.route_key,
                             &connected.candidate,
                             "suspicious-zero-reply",
+                            &cfg,
                         );
                         outcome_error_class = "suspicious-zero-reply";
                     }
@@ -459,6 +404,7 @@ pub(super) async fn handle_http_proxy(
                             &connected.route_key,
                             &connected.candidate,
                             "zero-reply-soft",
+                            &cfg,
                         );
                         warn!(
                             target: "socks5.route",
@@ -473,8 +419,8 @@ pub(super) async fn handle_http_proxy(
                     }
                     outcome_error_class = "zero-reply-soft";
                 } else {
-                    record_destination_success(&destination, tuned.stage, tuned.source);
-                    record_route_success(&connected.route_key, &connected.candidate);
+                    record_destination_success(&destination, tuned.stage, tuned.source, &cfg);
+                    record_route_success(&connected.route_key, &connected.candidate, &cfg);
                     outcome_error_class = "ok";
                 }
                 complete_route_outcome_event(
@@ -486,6 +432,7 @@ pub(super) async fn handle_http_proxy(
                     bytes_upstream_to_client,
                     direct_tunnel_started.elapsed().as_millis() as u64,
                     outcome_error_class,
+                    &cfg,
                 );
                 debug!(
                     target: "socks5",
@@ -498,21 +445,24 @@ pub(super) async fn handle_http_proxy(
                     "HTTP CONNECT session closed"
                 );
             }
-            Err(e) if is_expected_disconnect(&e) => {
+            Err(e) if crate::pt::socks5_server::route_connection::is_expected_disconnect(&e) => {
                 let lifetime_ms = direct_tunnel_started.elapsed().as_millis() as u64;
                 let mut outcome_error_class = "client-disconnect";
 
                 // For censored services, a client disconnect with zero data from upstream
                 // is almost certainly a blocked connection that we should penalize.
-                let bucket = host_service_bucket(route_destination_key(&connected.route_key));
-                let is_censored =
-                    matches!(bucket.as_str(), "meta-group:youtube" | "meta-group:discord");
+                let bucket = host_service_bucket(route_destination_key(&connected.route_key), &cfg);
+                let is_censored = matches!(
+                    bucket.as_str(),
+                    "meta-group:youtube" | "meta-group:discord" | "meta-group:google"
+                );
 
                 if is_censored && lifetime_ms > 1000 {
                     record_route_failure(
                         &connected.route_key,
                         &connected.candidate,
                         "zero-reply-soft",
+                        &cfg,
                     );
                     outcome_error_class = "zero-reply-soft";
                 }
@@ -526,6 +476,7 @@ pub(super) async fn handle_http_proxy(
                     0,
                     lifetime_ms,
                     outcome_error_class,
+                    &cfg,
                 );
                 debug!(
                     target: "socks5",
@@ -544,11 +495,13 @@ pub(super) async fn handle_http_proxy(
                     signal,
                     tuned.options.classifier_emit_interval_secs,
                     tuned.stage,
+                    &cfg,
                 );
                 record_route_failure(
                     &connected.route_key,
                     &connected.candidate,
                     blocking_signal_label(signal),
+                    &cfg,
                 );
                 complete_route_outcome_event(
                     connected.decision_id,
@@ -559,6 +512,7 @@ pub(super) async fn handle_http_proxy(
                     0,
                     direct_tunnel_started.elapsed().as_millis() as u64,
                     blocking_signal_label(signal),
+                    &cfg,
                 );
                 warn!(
                     target: "socks5",
@@ -629,7 +583,7 @@ pub(super) async fn handle_http_proxy(
     }
 
     let tuned = tune_relay_for_target(relay_opts, parsed.port, &destination, false, false);
-    match relay_bidirectional(&mut tcp, &mut out, tuned.options.clone()).await {
+    match relay_bidirectional(&mut tcp, &mut out, tuned.options.clone(), Vec::new()).await {
         Ok((bytes_client_to_upstream, bytes_upstream_to_client)) => {
             if should_skip_empty_session_scoring(bytes_client_to_upstream, bytes_upstream_to_client)
             {
@@ -652,6 +606,7 @@ pub(super) async fn handle_http_proxy(
                     BlockingSignal::SuspiciousZeroReply,
                     tuned.options.classifier_emit_interval_secs,
                     tuned.stage,
+                    &cfg,
                 );
                 warn!(
                     target: "socks5",
@@ -664,7 +619,7 @@ pub(super) async fn handle_http_proxy(
                     "HTTP proxy forward suspicious early close (no upstream bytes) classified as potential blocking"
                 );
             } else {
-                record_destination_success(&destination, tuned.stage, tuned.source);
+                record_destination_success(&destination, tuned.stage, tuned.source, &cfg);
             }
             debug!(
                 target: "socks5",
@@ -677,7 +632,7 @@ pub(super) async fn handle_http_proxy(
                 "HTTP proxy forward session closed"
             );
         }
-        Err(e) if is_expected_disconnect(&e) => {
+        Err(e) if crate::pt::socks5_server::route_connection::is_expected_disconnect(&e) => {
             debug!(
                 target: "socks5",
                 conn_id,
@@ -696,6 +651,7 @@ pub(super) async fn handle_http_proxy(
                 signal,
                 tuned.options.classifier_emit_interval_secs,
                 tuned.stage,
+                &cfg,
             );
             if is_noise_probe_http_destination(&destination) {
                 debug!(
@@ -740,7 +696,7 @@ fn is_noise_probe_http_destination(destination: &str) -> bool {
         || host.contains("captive")
 }
 
-pub(super) fn is_noise_probe_https_destination(destination: &str) -> bool {
+pub fn is_noise_probe_https_destination(destination: &str) -> bool {
     let host = destination
         .split_once(':')
         .map(|(h, _)| h)
@@ -759,7 +715,7 @@ pub(super) fn is_noise_probe_https_destination(destination: &str) -> bool {
         || host.starts_with("adservice.")
 }
 
-pub(super) fn tune_relay_for_target(
+pub fn tune_relay_for_target(
     mut base: RelayOptions,
     port: u16,
     destination: &str,
@@ -952,14 +908,6 @@ pub(super) fn route_family_for_ip(ip: std::net::IpAddr) -> RouteIpFamily {
     }
 }
 
-pub(super) fn route_decision_key(destination: &str, target: &TargetAddr) -> String {
-    format!(
-        "{}|{}",
-        route_state_key(destination),
-        route_family_for_target(target).label()
-    )
-}
-
 pub(super) fn route_destination_key(route_key: &str) -> &str {
     route_key
         .split_once('|')
@@ -967,20 +915,20 @@ pub(super) fn route_destination_key(route_key: &str) -> &str {
         .unwrap_or(route_key)
 }
 
-pub(super) fn route_service_key(route_key: &str) -> Option<String> {
+pub(super) fn route_service_key(route_key: &str, _cfg: &EngineConfig) -> Option<String> {
     let (destination_key, family) = route_key.split_once('|')?;
     let service_destination = route_service_state_key(destination_key)?;
     Some(format!("{service_destination}|{family}"))
 }
 
-pub(super) fn route_meta_service_key(route_key: &str) -> Option<String> {
+pub(super) fn route_meta_service_key(route_key: &str, cfg: &EngineConfig) -> Option<String> {
     let (destination_key, family) = route_key.split_once('|')?;
     let (host, port) = split_host_port_for_connect(destination_key)?;
     let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
     if normalized_host.is_empty() || parse_ip_literal(&normalized_host).is_some() {
         return None;
     }
-    let bucket = host_service_bucket(&normalized_host);
+    let bucket = host_service_bucket(&normalized_host, cfg);
     if !bucket.starts_with("meta-group:") {
         return None;
     }
@@ -1051,7 +999,7 @@ pub(super) fn registrable_domain_bucket(host: &str) -> Option<String> {
     Some(format!("{sld}.{tld}"))
 }
 
-pub(super) fn route_state_key(destination: &str) -> String {
+pub(super) fn route_state_key(destination: &str, cfg: &EngineConfig) -> String {
     if let Some((host, port)) = split_host_port_for_connect(destination) {
         let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
         if normalized_host.is_empty() {
@@ -1059,6 +1007,10 @@ pub(super) fn route_state_key(destination: &str) -> String {
         }
         if let Some(ip) = parse_ip_literal(&normalized_host) {
             return format!("{ip}:{port}");
+        }
+        let bucket = host_service_bucket(&normalized_host, cfg);
+        if bucket.starts_with("meta-group:") {
+            return format!("{bucket}:{port}");
         }
         return format!("{normalized_host}:{port}");
     }

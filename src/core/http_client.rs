@@ -279,50 +279,10 @@ fn collect_headers(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
+use crate::core::request::parse_content_range_bounds;
+
 fn parse_total_length_from_content_range(headers: &HeaderMap) -> Option<u64> {
     parse_content_range_bounds(headers).and_then(|v| v.total)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ContentRangeBounds {
-    start: u64,
-    end: u64,
-    total: Option<u64>,
-}
-
-fn parse_content_range_bounds(headers: &HeaderMap) -> Option<ContentRangeBounds> {
-    // Content-Range: bytes 0-0/12345
-    let v = headers
-        .get(reqwest::header::CONTENT_RANGE)?
-        .to_str()
-        .ok()?
-        .trim();
-    let (unit, rest) = v.split_once(' ')?;
-    if !unit.eq_ignore_ascii_case("bytes") {
-        return None;
-    }
-
-    let (range_part, total_part) = rest.split_once('/')?;
-    let (start_s, end_s) = range_part.split_once('-')?;
-    let start = start_s.trim().parse::<u64>().ok()?;
-    let end = end_s.trim().parse::<u64>().ok()?;
-    if end < start {
-        return None;
-    }
-
-    let total = if total_part.trim() == "*" {
-        None
-    } else {
-        Some(total_part.trim().parse::<u64>().ok()?)
-    };
-
-    if let Some(t) = total {
-        if t == 0 || start >= t || end >= t {
-            return None;
-        }
-    }
-
-    Some(ContentRangeBounds { start, end, total })
 }
 
 fn retry_delay(attempt: usize) -> Duration {

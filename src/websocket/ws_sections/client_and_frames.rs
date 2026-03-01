@@ -179,7 +179,7 @@ impl WebSocketClient {
         }
 
         let dns = std::sync::Arc::new(PrimeReqwestDnsResolver::new(self.resolver_chain.clone()));
-        let probe_client = match reqwest::Client::builder().dns_resolver(dns).build() {
+        let probe_client = match reqwest::Client::builder().no_proxy().dns_resolver(dns).build() {
             Ok(v) => v,
             Err(_) => {
                 // Best-effort: if probe client can't be built, disable v2 (v1 still works).

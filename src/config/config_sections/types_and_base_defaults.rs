@@ -32,6 +32,8 @@ pub struct EngineConfig {
     pub transport: TransportConfig,
     #[serde(default)]
     pub tls: TlsConfig,
+    #[serde(default)]
+    pub routing: RoutingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

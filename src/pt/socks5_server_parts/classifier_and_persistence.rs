@@ -61,6 +61,7 @@ pub(super) fn record_destination_failure(
     signal: BlockingSignal,
     classifier_emit_interval_secs: u64,
     stage: u8,
+    cfg: &EngineConfig,
 ) {
     let now = now_unix_secs();
     let failures_after_update = {
@@ -76,7 +77,7 @@ pub(super) fn record_destination_failure(
                 let promotable = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
                     should_bypass_by_classifier_ip(ip, port)
                 } else {
-                    should_bypass_by_classifier_host(&host, port)
+                    should_bypass_by_classifier_host(&host, port, cfg)
                 };
                 if promotable {
                     info!(
@@ -118,15 +119,16 @@ pub(super) fn record_destination_failure(
         stats.last_seen_unix = now;
     }
     record_stage_outcome(stage, false);
-    maybe_prune_runtime_classifier_state(now);
-    maybe_flush_classifier_store(false);
-    maybe_emit_classifier_summary(classifier_emit_interval_secs.max(5));
+    maybe_prune_runtime_classifier_state(now, Arc::new(cfg.clone()));
+    maybe_flush_classifier_store(false, Arc::new(cfg.clone()));
+    maybe_emit_classifier_summary(classifier_emit_interval_secs.max(5), cfg);
 }
 
 pub(super) fn record_destination_success(
     destination: &str,
     stage: u8,
     _source: StageSelectionSource,
+    _cfg: &EngineConfig,
 ) {
     let now = now_unix_secs();
     {
@@ -150,8 +152,8 @@ pub(super) fn record_destination_success(
         stats.last_seen_unix = now;
     }
     record_stage_outcome(stage, true);
-    maybe_prune_runtime_classifier_state(now);
-    maybe_flush_classifier_store(false);
+    maybe_prune_runtime_classifier_state(now, Arc::new(_cfg.clone()));
+    maybe_flush_classifier_store(false, Arc::new(_cfg.clone()));
 }
 
 pub(super) fn record_stage_outcome(stage: u8, success: bool) {
@@ -202,7 +204,7 @@ pub(super) fn should_mark_suspicious_zero_reply(
 
 pub(super) static LAST_CLASSIFIER_EMIT_UNIX: AtomicU64 = AtomicU64::new(0);
 
-pub(super) fn maybe_emit_classifier_summary(interval_secs: u64) {
+pub(super) fn maybe_emit_classifier_summary(interval_secs: u64, cfg: &EngineConfig) {
     let now = now_unix_secs();
     let last = LAST_CLASSIFIER_EMIT_UNIX.load(Ordering::Relaxed);
     if now.saturating_sub(last) < interval_secs {
@@ -349,15 +351,15 @@ pub(super) fn maybe_emit_classifier_summary(interval_secs: u64) {
                 .map(|r| (r.key().clone(), r.value().clone()))
                 .collect();
             profiles.sort_by(|a, b| {
-                let a_score = bypass_profile_score_from_health(&a.1, now);
-                let b_score = bypass_profile_score_from_health(&b.1, now);
+                let a_score = bypass_profile_score_from_health(&a.1, now, cfg);
+                let b_score = bypass_profile_score_from_health(&b.1, now, cfg);
                 b_score.cmp(&a_score).then_with(|| a.0.cmp(&b.0))
             });
             for (route_id, health) in profiles.into_iter().take(3) {
                 info!(
                     target: "socks5.classifier",
                     route = %route_id,
-                    score = bypass_profile_score_from_health(&health, now),
+                    score = bypass_profile_score_from_health(&health, now, cfg),
                     successes = health.successes,
                     failures = health.failures,
                     connect_failures = health.connect_failures,
@@ -368,7 +370,7 @@ pub(super) fn maybe_emit_classifier_summary(interval_secs: u64) {
             }
         }
     }
-    maybe_flush_classifier_store(false);
+    maybe_flush_classifier_store(false, Arc::new(cfg.clone()));
 }
 
 pub(super) static CLASSIFIER_RUNTIME_LAST_PRUNE_UNIX: AtomicU64 = AtomicU64::new(0);
@@ -378,30 +380,31 @@ pub(super) const CLASSIFIER_RUNTIME_KEEP_DEST_ENTRIES: usize = 4500;
 pub(super) const CLASSIFIER_RUNTIME_MAX_GLOBAL_BYPASS_ENTRIES: usize = 256;
 pub(super) const CLASSIFIER_RUNTIME_KEEP_GLOBAL_BYPASS_ENTRIES: usize = 192;
 
-pub(super) fn maybe_prune_runtime_classifier_state(now: u64) {
+pub(super) fn maybe_prune_runtime_classifier_state(now: u64, cfg: Arc<EngineConfig>) {
     let last = CLASSIFIER_RUNTIME_LAST_PRUNE_UNIX.load(Ordering::Relaxed);
     if now.saturating_sub(last) < CLASSIFIER_RUNTIME_PRUNE_INTERVAL_SECS {
         return;
     }
     if CLASSIFIER_RUNTIME_LAST_PRUNE_UNIX
         .compare_exchange(last, now, Ordering::SeqCst, Ordering::Relaxed)
-        .is_err()
+        .is_ok()
     {
-        return;
-    }
-    let (removed_destinations, removed_global_profiles) = prune_runtime_classifier_state_with_caps(
-        CLASSIFIER_RUNTIME_MAX_DEST_ENTRIES,
-        CLASSIFIER_RUNTIME_KEEP_DEST_ENTRIES,
-        CLASSIFIER_RUNTIME_MAX_GLOBAL_BYPASS_ENTRIES,
-        CLASSIFIER_RUNTIME_KEEP_GLOBAL_BYPASS_ENTRIES,
-    );
-    if removed_destinations > 0 || removed_global_profiles > 0 {
-        info!(
-            target: "socks5.classifier",
-            removed_destinations,
-            removed_global_profiles,
-            "runtime classifier cache pruned"
-        );
+        let (removed_destinations, removed_global_profiles) =
+            prune_runtime_classifier_state_with_caps(
+                CLASSIFIER_RUNTIME_MAX_DEST_ENTRIES,
+                CLASSIFIER_RUNTIME_KEEP_DEST_ENTRIES,
+                CLASSIFIER_RUNTIME_MAX_GLOBAL_BYPASS_ENTRIES,
+                CLASSIFIER_RUNTIME_KEEP_GLOBAL_BYPASS_ENTRIES,
+                &cfg,
+            );
+        if removed_destinations > 0 || removed_global_profiles > 0 {
+            info!(
+                target: "socks5.classifier",
+                removed_destinations,
+                removed_global_profiles,
+                "runtime classifier cache pruned"
+            );
+        }
     }
 }
 
@@ -410,14 +413,15 @@ fn prune_runtime_classifier_state_with_caps(
     keep_dest_entries: usize,
     max_global_bypass_entries: usize,
     keep_global_bypass_entries: usize,
+    cfg: &EngineConfig,
 ) -> (usize, usize) {
-    let removed_destinations = prune_destination_runtime_state(max_dest_entries, keep_dest_entries);
+    let removed_destinations = prune_destination_runtime_state(max_dest_entries, keep_dest_entries, cfg);
     let removed_global_profiles =
-        prune_global_bypass_runtime_state(max_global_bypass_entries, keep_global_bypass_entries);
+        prune_global_bypass_runtime_state(max_global_bypass_entries, keep_global_bypass_entries, cfg);
     (removed_destinations, removed_global_profiles)
 }
 
-fn prune_destination_runtime_state(max_entries: usize, keep_entries: usize) -> usize {
+fn prune_destination_runtime_state(max_entries: usize, keep_entries: usize, _cfg: &EngineConfig) -> usize {
     if max_entries == 0 {
         return 0;
     }
@@ -484,10 +488,13 @@ fn prune_destination_runtime_state(max_entries: usize, keep_entries: usize) -> u
         route_winner.remove(key);
         route_health.remove(key);
     }
+    
+    ml_shadow::prune_ml_state(now_unix_secs());
+
     evict_keys.len()
 }
 
-fn prune_global_bypass_runtime_state(max_entries: usize, keep_entries: usize) -> usize {
+fn prune_global_bypass_runtime_state(max_entries: usize, keep_entries: usize, _cfg: &EngineConfig) -> usize {
     if max_entries == 0 {
         return 0;
     }
@@ -532,6 +539,7 @@ pub(super) fn prune_runtime_classifier_state_for_test(
         keep_dest_entries,
         max_global_bypass_entries,
         keep_global_bypass_entries,
+        &EngineConfig::default(),
     )
 }
 
@@ -539,10 +547,13 @@ pub(super) static CLASSIFIER_STORE_CFG: OnceLock<Option<ClassifierStoreConfig>> 
 pub(super) static CLASSIFIER_STORE_LOADED: AtomicBool = AtomicBool::new(false);
 pub(super) static CLASSIFIER_STORE_DIRTY: AtomicBool = AtomicBool::new(false);
 pub(super) static CLASSIFIER_STORE_LAST_FLUSH_UNIX: AtomicU64 = AtomicU64::new(0);
+use super::*;
+use crate::config::EngineConfig;
+
 pub(super) const CLASSIFIER_PERSIST_DEBOUNCE_SECS: u64 = 30;
 pub(super) const CLASSIFIER_PERSIST_MAX_ENTRIES: usize = 5000;
 
-pub(super) fn init_classifier_store(relay_opts: &RelayOptions) {
+pub(super) fn init_classifier_store(relay_opts: &RelayOptions, cfg: Arc<EngineConfig>) {
     let _ = CLASSIFIER_STORE_CFG.get_or_init(|| {
         if !relay_opts.classifier_persist_enabled {
             return None;
@@ -556,10 +567,10 @@ pub(super) fn init_classifier_store(relay_opts: &RelayOptions) {
         Some(ClassifierStoreConfig {
             path,
             entry_ttl_secs: relay_opts.classifier_entry_ttl_secs.max(60),
+            cfg,
         })
     });
 }
-
 pub(super) fn default_classifier_store_path() -> PathBuf {
     if let Some(dir) = dirs::cache_dir() {
         return dir.join("prime-net-engine").join("relay-classifier.json");
@@ -567,7 +578,7 @@ pub(super) fn default_classifier_store_path() -> PathBuf {
     expand_tilde("~/.cache/prime-net-engine/relay-classifier.json")
 }
 
-pub(super) fn load_classifier_store_if_needed() {
+pub(super) fn load_classifier_store_if_needed(cfg_arg: Arc<EngineConfig>) {
     if CLASSIFIER_STORE_LOADED.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -660,7 +671,7 @@ pub(super) fn load_classifier_store_if_needed() {
             "restored persisted relay classifier entries"
         );
     }
-    maybe_prune_runtime_classifier_state(now);
+    maybe_prune_runtime_classifier_state(now, cfg_arg);
 }
 
 pub(super) fn destination_classifier_is_empty(stats: &DestinationClassifier) -> bool {
@@ -710,7 +721,7 @@ pub(super) fn read_classifier_snapshot(path: &Path) -> std::io::Result<Option<Cl
     Ok(Some(parsed))
 }
 
-pub(super) fn maybe_flush_classifier_store(force: bool) {
+pub(super) fn maybe_flush_classifier_store(force: bool, _cfg: Arc<EngineConfig>) {
     let Some(cfg) = CLASSIFIER_STORE_CFG.get().and_then(Clone::clone) else {
         return;
     };

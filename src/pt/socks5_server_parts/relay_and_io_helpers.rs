@@ -3,64 +3,16 @@ use super::*;
 pub async fn relay_bidirectional(
     client: &mut TcpStream,
     upstream: &mut BoxStream,
-    relay_opts: RelayOptions,
+    _relay_opts: RelayOptions,
+    initial_upstream_to_client: Vec<u8>,
 ) -> std::io::Result<(u64, u64)> {
-    if relay_opts.tcp_window_trick {
-        let _ = apply_tcp_window_size(client, relay_opts.tcp_window_size.into());
+    if !initial_upstream_to_client.is_empty() {
+        client.write_all(&initial_upstream_to_client).await?;
+        client.flush().await?;
     }
 
-    let (mut client_r, mut client_w) = tokio::io::split(client);
-    let (mut upstream_r, mut upstream_w) = tokio::io::split(upstream);
-
-    let upstream_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let upstream_seen_c2u = upstream_seen.clone();
-
-    let c2u = async {
-        let mut total = 0u64;
-        if relay_opts.fragment_client_hello {
-            let mut first_buf = vec![0u8; relay_opts.fragment_budget_bytes.max(1024)];
-            let n = client_r.read(&mut first_buf).await?;
-            if n > 0 {
-                let data = &first_buf[..n];
-                if is_tls_client_hello(data) {
-                    total +=
-                        fragment_and_send_tls_hello(data, &mut upstream_w, &relay_opts).await?;
-                } else {
-                    upstream_w.write_all(data).await?;
-                    total += n as u64;
-                }
-                upstream_seen_c2u.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let mut buf = vec![0u8; 65536];
-        loop {
-            let n = client_r.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            upstream_w.write_all(&buf[..n]).await?;
-            total += n as u64;
-            upstream_seen_c2u.store(true, Ordering::SeqCst);
-        }
-        Ok::<u64, std::io::Error>(total)
-    };
-
-    let u2c = async {
-        let mut total = 0u64;
-        let mut buf = vec![0u8; 65536];
-        loop {
-            let n = upstream_r.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            client_w.write_all(&buf[..n]).await?;
-            total += n as u64;
-        }
-        Ok::<u64, std::io::Error>(total)
-    };
-
-    tokio::try_join!(c2u, u2c)
+    let (c2u, u2c) = tokio::io::copy_bidirectional(client, upstream).await?;
+    Ok((c2u, u2c + initial_upstream_to_client.len() as u64))
 }
 
 pub(super) fn is_tls_client_hello(data: &[u8]) -> bool {
@@ -326,29 +278,6 @@ pub fn is_expected_disconnect(e: &std::io::Error) -> bool {
     )
 }
 
-pub(super) fn apply_tcp_window_size(stream: &TcpStream, size: u32) -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawSocket;
-        let socket = stream.as_raw_socket();
-        unsafe {
-            let res = windows_sys::Win32::Networking::WinSock::setsockopt(
-                socket as _,
-                windows_sys::Win32::Networking::WinSock::SOL_SOCKET as _,
-                windows_sys::Win32::Networking::WinSock::SO_RCVBUF as _,
-                &size as *const _ as *const _,
-                std::mem::size_of::<u32>() as _,
-            );
-            if res == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-    }
-    let _ = stream;
-    let _ = size;
-    Ok(())
-}
-
 pub fn route_capability_slot_mut(
     caps: &mut RouteCapabilities,
     kind: RouteKind,
@@ -426,6 +355,7 @@ pub fn should_penalize_disconnect_as_soft_zero_reply(
     route_key: &str,
     candidate: &RouteCandidate,
     lifetime_ms: u64,
+    cfg: &EngineConfig,
 ) -> bool {
     if candidate.kind != RouteKind::Bypass {
         return false;
@@ -434,15 +364,15 @@ pub fn should_penalize_disconnect_as_soft_zero_reply(
         return false;
     }
     matches!(
-        host_service_bucket(route_destination_key(route_key)).as_str(),
+        host_service_bucket(crate::pt::socks5_server::route_connection::route_destination_key(route_key), cfg).as_str(),
         "meta-group:youtube" | "meta-group:discord" | "meta-group:google"
     )
 }
 
-pub fn record_bypass_profile_success(destination: &str, idx: u8) {
-    let key = bypass_profile_key(destination);
-    let service_key = bypass_profile_legacy_service_key(destination);
-    let meta_key = bypass_profile_meta_service_key(destination);
+pub fn record_bypass_profile_success(destination: &str, idx: u8, cfg: &EngineConfig) {
+    let key = bypass_profile_key(destination, cfg);
+    let service_key = bypass_profile_legacy_service_key(destination, cfg);
+    let meta_key = bypass_profile_meta_service_key(destination, cfg);
     if let Some(map) = DEST_BYPASS_PROFILE_IDX.get() {
         if let Some(mut entry) = map.get_mut(&key) {
             *entry = idx;

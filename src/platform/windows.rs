@@ -102,10 +102,10 @@ impl WindowsProxyManager {
     }
 
     fn broadcast_settings_change() {
-        let mut param = "Internet Settings\0".encode_utf16().collect::<Vec<u16>>();
-        if param.is_empty() || *param.last().unwrap_or(&0) != 0 {
-            param.push(0);
-        }
+        // Use a static-like buffer or ensure it lives long enough for the synchronous call.
+        let mut param: Vec<u16> = "Internet Settings".encode_utf16().collect();
+        param.push(0);
+
         unsafe {
             let _ = SendMessageTimeoutW(
                 HWND_BROADCAST,

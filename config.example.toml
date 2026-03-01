@@ -211,7 +211,7 @@ socks_endpoint = "127.0.0.1:1080"
 
 [blocklist]
 enabled = true
-source = "https://github.com/zapret-info/z-i/raw/master/dump.csv"
+source = "https://antifilter.download/list/domains.lst"
 auto_update = true
 update_interval_hours = 24
 cache_path = "~/.cache/prime-net-engine/blocklist.json"

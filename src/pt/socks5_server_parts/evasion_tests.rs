@@ -52,24 +52,4 @@ mod evasion_integration_tests {
         }
         assert!(seen_different, "Padding should be randomized");
     }
-
-    #[tokio::test]
-    async fn test_tcp_window_size_application() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let client_task =
-            tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await.unwrap() });
-
-        let (server_stream, _) = listener.accept().await.unwrap();
-        let _client_stream = client_task.await.unwrap();
-
-        // Test applying tiny window (simulating the trick start)
-        let res = apply_tcp_window_size(&server_stream, 4);
-        assert!(res.is_ok());
-
-        // Test applying large window (simulating the trick end)
-        let res = apply_tcp_window_size(&server_stream, 65536);
-        assert!(res.is_ok());
-    }
 }

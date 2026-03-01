@@ -116,8 +116,13 @@ pub async fn initialize_runtime_blocklist(cfg: &BlocklistConfig) -> Result<Runti
 
     let mut cache_updated = false;
 
+    let mut source = cfg.source.clone();
+    if source.contains("zapret-info") || source.contains("z-i") {
+        source = prime_net_engine_core::blocklist::DEFAULT_BLOCKLIST_SOURCE.to_owned();
+    }
+
     if cfg.auto_update && should_refresh_cache(cache.as_ref(), cfg.update_interval_hours) {
-        match update_blocklist(&cfg.source, &cache_path).await {
+        match update_blocklist(&source, &cache_path).await {
             Ok(updated) => {
                 cache = Some(updated);
                 cache_updated = true;
@@ -126,7 +131,7 @@ pub async fn initialize_runtime_blocklist(cfg: &BlocklistConfig) -> Result<Runti
                 warn!(
                     target: "socks_cmd",
                     error = %e,
-                    source = %cfg.source,
+                    source = %source,
                     cache = %cache_path.display(),
                     "failed to auto-update blocklist feed; continuing with cached domains"
                 );
@@ -170,7 +175,7 @@ pub async fn initialize_runtime_blocklist(cfg: &BlocklistConfig) -> Result<Runti
 
     Ok(RuntimeBlocklistStats {
         enabled: true,
-        source: cfg.source.clone(),
+        source,
         domains_loaded,
         ips_loaded,
         cache_updated,

@@ -138,7 +138,11 @@ impl ResolverChain {
 
             match joined {
                 Ok((_kind, Ok(ips))) if !ips.is_empty() => {
-                    merged_ips.extend(ips);
+                    for ip in ips {
+                        if !merged_ips.contains(&ip) {
+                            merged_ips.push(ip);
+                        }
+                    }
                     if collect_deadline.is_none() {
                         collect_deadline = Some(
                             Instant::now() + Duration::from_millis(DNS_PARALLEL_COLLECT_WINDOW_MS),

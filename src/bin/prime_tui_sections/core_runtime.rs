@@ -711,12 +711,13 @@ fn init_tui_tracing(log_viewer: Arc<LogViewer>) -> Result<()> {
     Ok(())
 }
 
-fn filtered_logs(app: &App) -> Vec<LogEntry> {
+fn filtered_logs(app: &App) -> Arc<Vec<LogEntry>> {
     app.log_viewer.filtered_logs()
 }
 fn export_filtered_logs(app: &App, path: &Path) -> Result<()> {
     let mut file = std::fs::File::create(path)?;
-    for entry in filtered_logs(app) {
+    let logs = filtered_logs(app);
+    for entry in logs.iter() {
         writeln!(
             file,
             "{} {:5} {:<24} {}",

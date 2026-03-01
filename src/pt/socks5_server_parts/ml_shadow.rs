@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::EngineConfig;
 
 pub(super) static NEXT_ROUTE_DECISION_ID: AtomicU64 = AtomicU64::new(1);
 pub(super) static ROUTE_DECISION_EVENTS_PENDING: OnceLock<DashMap<u64, RouteDecisionEvent>> =
@@ -173,12 +174,13 @@ pub(super) fn next_route_decision_id() -> u64 {
     NEXT_ROUTE_DECISION_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-pub(super) fn apply_phase3_ml_override(
+pub fn apply_phase3_ml_override(
     route_key: &str,
     candidates: Vec<RouteCandidate>,
+    cfg: &EngineConfig,
 ) -> (Vec<RouteCandidate>, ShadowCanaryDecision) {
     if !PHASE3_ML_CONTROL_ENABLED {
-        return apply_phase2_canary_override(route_key, candidates);
+        return apply_phase2_canary_override(route_key, candidates, cfg);
     }
     if candidates.is_empty() {
         return (
@@ -193,7 +195,7 @@ pub(super) fn apply_phase3_ml_override(
     }
 
     let host = route_destination_host(route_key);
-    let bucket = shadow_bucket_name(route_key, &host);
+    let bucket = shadow_bucket_name(route_key, &host, cfg);
     let mut decision = ShadowCanaryDecision {
         applied: false,
         route_arm: candidates[0].route_id(),
@@ -239,7 +241,7 @@ pub(super) fn apply_phase3_ml_override(
     }
 
     if let Some(reason) =
-        shadow_phase3_safety_override_reason(route_key, &bucket, &selected_arm, &candidates, now)
+        shadow_phase3_safety_override_reason(route_key, &bucket, &selected_arm, &candidates, now, cfg)
     {
         decision.reason = reason;
         return (candidates, decision);
@@ -267,9 +269,10 @@ pub(super) fn apply_phase3_ml_override(
     (reordered, decision)
 }
 
-pub(super) fn apply_phase2_canary_override(
+pub fn apply_phase2_canary_override(
     route_key: &str,
     candidates: Vec<RouteCandidate>,
+    cfg: &EngineConfig,
 ) -> (Vec<RouteCandidate>, ShadowCanaryDecision) {
     if candidates.is_empty() {
         return (
@@ -284,7 +287,7 @@ pub(super) fn apply_phase2_canary_override(
     }
 
     let host = route_destination_host(route_key);
-    let bucket = shadow_bucket_name(route_key, &host);
+    let bucket = shadow_bucket_name(route_key, &host, cfg);
     let mut decision = ShadowCanaryDecision {
         applied: false,
         route_arm: candidates[0].route_id(),
@@ -294,7 +297,9 @@ pub(super) fn apply_phase2_canary_override(
     if !PHASE2_CANARY_ENABLED {
         return (candidates, decision);
     }
-    if !matches!(bucket.as_str(), "youtube" | "discord") {
+    
+    let is_censored = cfg.routing.censored_groups.keys().any(|g| bucket == *g || bucket == format!("meta-group:{}", g));
+    if !is_censored {
         decision.reason = "bucket-not-allowed";
         return (candidates, decision);
     }
@@ -353,25 +358,26 @@ pub(super) fn apply_phase2_canary_override(
     (reordered, decision)
 }
 
-#[cfg(test)]
-pub(super) fn begin_route_decision_event(
+pub fn begin_route_decision_event(
     route_key: &str,
     candidates: &[RouteCandidate],
-    raced: bool,
+    _explore: bool,
+    cfg: &EngineConfig,
 ) -> u64 {
-    begin_route_decision_event_with_canary(route_key, candidates, raced, None)
+    begin_route_decision_event_with_canary(route_key, candidates, false, None, cfg)
 }
 
-pub(super) fn begin_route_decision_event_with_canary(
+pub fn begin_route_decision_event_with_canary(
     route_key: &str,
     candidates: &[RouteCandidate],
     raced: bool,
     canary: Option<ShadowCanaryDecision>,
+    cfg: &EngineConfig,
 ) -> u64 {
     let decision_id = next_route_decision_id();
     let now = now_unix_secs();
     let host = route_destination_host(route_key);
-    let bucket = shadow_bucket_name(route_key, &host);
+    let bucket = shadow_bucket_name(route_key, &host, cfg);
     let planned = candidates
         .first()
         .map(|candidate| candidate.route_id())
@@ -435,7 +441,7 @@ pub(super) fn begin_route_decision_event_with_canary(
     decision_id
 }
 
-pub(super) fn complete_route_outcome_event(
+pub fn complete_route_outcome_event(
     decision_id: u64,
     route_key: &str,
     candidate: Option<&RouteCandidate>,
@@ -444,13 +450,17 @@ pub(super) fn complete_route_outcome_event(
     bytes_u2c: u64,
     lifetime_ms: u64,
     error_class: &str,
+    cfg: &EngineConfig,
 ) {
     let now = now_unix_secs();
     let pending = ROUTE_DECISION_EVENTS_PENDING.get_or_init(DashMap::new);
     let decision = pending.remove(&decision_id).map(|(_, event)| event);
 
-    let fallback_host = route_destination_host(route_key);
-    let fallback_bucket = shadow_bucket_name(route_key, &fallback_host);
+    let fallback_bucket = "default".to_owned();
+    let fallback_host = "unknown".to_owned();
+
+    let host = route_destination_host(route_key);
+    let bucket = shadow_bucket_name(route_key, &host, cfg);
     let route_arm = candidate
         .map(|route| route.route_id())
         .or_else(|| decision.as_ref().map(|event| event.route_arm.clone()))
@@ -690,6 +700,7 @@ fn shadow_phase3_safety_override_reason(
     selected_arm: &str,
     candidates: &[RouteCandidate],
     now: u64,
+    cfg: &EngineConfig,
 ) -> Option<&'static str> {
     if !shadow_phase3_bucket_allowed(bucket) && selected_arm != "direct" {
         return Some("a-ads-noise-override");
@@ -703,7 +714,7 @@ fn shadow_phase3_safety_override_reason(
         .find(|candidate| candidate.route_id() == selected_arm);
     if let Some(candidate) = selected {
         if candidate.kind == RouteKind::Bypass
-            && global_bypass_profile_score(candidate, now) <= GLOBAL_BYPASS_HARD_WEAK_SCORE
+            && global_bypass_profile_score(candidate, now, cfg) <= GLOBAL_BYPASS_HARD_WEAK_SCORE
         {
             return Some("a-global-weak-override");
         }
@@ -805,15 +816,39 @@ fn shadow_update_canary_slo(
     }
 }
 
-pub(super) fn note_phase2_profile_rotation(destination: &str) {
-    let host = split_host_port_for_connect(route_destination_key(destination))
+pub(super) fn note_phase2_profile_rotation(destination: &str, cfg: &EngineConfig) {
+    let host = split_host_port_for_connect(crate::pt::socks5_server::route_connection::route_destination_key(destination))
         .map(|(host, _)| host)
-        .unwrap_or_else(|| route_destination_key(destination).to_owned());
-    let bucket = shadow_bucket_name(destination, &host);
+        .unwrap_or_else(|| crate::pt::socks5_server::route_connection::route_destination_key(destination).to_owned());
+    let bucket = shadow_bucket_name(destination, &host, cfg);
+    
+    let key = bypass_profile_key(destination, cfg);
+    let service_key = bypass_profile_legacy_service_key(destination, cfg);
+    let meta_key = bypass_profile_meta_service_key(destination, cfg);
+    
+    let mut keys = vec![key, service_key];
+    if let Some(m) = meta_key {
+        keys.push(m);
+    }
+    
+    let map = SHADOW_CANARY_SWITCH_GUARD.get_or_init(DashMap::new);
+    let now = now_unix_secs();
+    for k in keys {
+        let mut entry = map.entry(k).or_insert(ShadowCanarySwitchGuard {
+            window_started_unix: now,
+            switches_in_window: 0,
+            last_arm: String::new(),
+        });
+        if now.saturating_sub(entry.window_started_unix) > 3600 {
+            entry.window_started_unix = now;
+            entry.switches_in_window = 0;
+        }
+        entry.switches_in_window = entry.switches_in_window.saturating_add(1);
+    }
+
     if !matches!(bucket.as_str(), "youtube" | "discord") {
         return;
     }
-    let now = now_unix_secs();
     let until = now.saturating_add(PHASE2_CANARY_PROFILE_ROTATION_COOLDOWN_SECS);
     SHADOW_CANARY_BUCKET_COOLDOWN_UNTIL
         .get_or_init(DashMap::new)
@@ -824,6 +859,37 @@ pub(super) fn note_phase2_profile_rotation(destination: &str) {
         cooldown_until = until,
         "phase2 canary bucket cooldown armed after profile rotation"
     );
+}
+
+pub fn prune_ml_state(now: u64) {
+    if let Some(map) = ROUTE_OUTCOME_EVENTS.get() {
+        if map.len() > 1000 {
+            let mut keys: Vec<u64> = map.iter().map(|entry| *entry.key()).collect();
+            keys.sort_unstable();
+            let to_remove = keys.len().saturating_sub(1000);
+            for key in keys.iter().take(to_remove) {
+                map.remove(key);
+            }
+        }
+    }
+    if let Some(map) = SHADOW_BANDIT_ARMS.get() {
+        let mut stale_keys = Vec::new();
+        for entry in map.iter() {
+            if now.saturating_sub(entry.value().last_seen_unix) > 86400 {
+                stale_keys.push(entry.key().clone());
+            }
+        }
+        for key in stale_keys { map.remove(&key); }
+    }
+    if let Some(map) = ROUTE_DECISION_EVENTS_PENDING.get() {
+        let mut stale_keys = Vec::new();
+        for entry in map.iter() {
+            if now.saturating_sub(entry.value().timestamp_unix) > 600 {
+                stale_keys.push(*entry.key());
+            }
+        }
+        for key in stale_keys { map.remove(&key); }
+    }
 }
 
 fn update_shadow_bandit(bucket: &str, arm: &str, reward: i64, now: u64) {
@@ -990,11 +1056,11 @@ fn shadow_arm_prior(bucket: &str, arm: &str) -> ShadowArmPrior {
     }
 }
 
-fn shadow_bucket_name(route_key: &str, host: &str) -> String {
-    if is_noise_probe_https_destination(route_destination_key(route_key)) {
+fn shadow_bucket_name(route_key: &str, host: &str, cfg: &EngineConfig) -> String {
+    if crate::pt::socks5_server::is_noise_probe_https_destination(crate::pt::socks5_server::route_connection::route_destination_key(route_key)) {
         return "ads-noise".to_owned();
     }
-    match host_service_bucket(host).as_str() {
+    match host_service_bucket(host, cfg).as_str() {
         "meta-group:youtube" => "youtube".to_owned(),
         "meta-group:discord" => "discord".to_owned(),
         "meta-group:google" => "google-common".to_owned(),
@@ -1011,7 +1077,7 @@ pub(super) fn shadow_exploration_enabled(bucket: &str, decision_id: u64, route_k
 }
 
 fn route_destination_host(route_key: &str) -> String {
-    let destination = route_destination_key(route_key);
+    let destination = crate::pt::socks5_server::route_connection::route_destination_key(route_key);
     split_host_port_for_connect(destination)
         .map(|(host, _)| host)
         .unwrap_or_else(|| destination.to_owned())
@@ -1081,7 +1147,7 @@ pub(super) fn shadow_bandit_stats_for_test(
 
 #[cfg(test)]
 pub(super) fn shadow_bucket_name_for_test(route_key: &str, host: &str) -> String {
-    shadow_bucket_name(route_key, host)
+    shadow_bucket_name(route_key, host, &EngineConfig::default())
 }
 
 #[cfg(test)]

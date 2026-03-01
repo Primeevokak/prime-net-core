@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::EngineConfig;
 
 pub(super) static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 pub(super) static WARNED_SOCKS4_LIMITATIONS: AtomicBool = AtomicBool::new(false);
@@ -358,6 +359,7 @@ pub(super) fn validate_relay_topology(
 pub async fn start_socks5_server(
     bind: &str,
     outbound: Arc<dyn OutboundConnector>,
+    cfg: Arc<EngineConfig>,
     silent_drop: bool,
     relay_opts: RelayOptions,
 ) -> Result<Socks5ServerGuard> {
@@ -368,8 +370,8 @@ pub async fn start_socks5_server(
 
     let relay_opts = Arc::new(relay_opts);
 
-    init_classifier_store(&relay_opts);
-    load_classifier_store_if_needed();
+    init_classifier_store(&relay_opts, cfg.clone());
+    load_classifier_store_if_needed(cfg.clone());
 
     tokio::spawn(async move {
         info!(target: "socks5", listen_addr = %listen_addr, silent_drop, "SOCKS5 server started");
@@ -383,8 +385,9 @@ pub async fn start_socks5_server(
                             let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::SeqCst);
                             let relay_opts_val = (*relay_opts).clone();
                             let outbound_handle = outbound.clone();
+                            let cfg_handle = cfg.clone();
                             join_set.spawn(async move {
-                                if let Err(e) = handle_client(conn_id, tcp, peer, listen_addr, outbound_handle, silent_drop, relay_opts_val).await {
+                                if let Err(e) = handle_client(conn_id, tcp, peer, listen_addr, outbound_handle, cfg_handle, silent_drop, relay_opts_val).await {
                                     debug!(target: "socks5", conn_id, error = %e, "client session failed");
                                 }
                             });
@@ -417,9 +420,11 @@ pub(super) async fn connect_bypass_upstream(
     bypass_profile_idx: u8,
     bypass_profile_total: u8,
     resolver: Option<Arc<ResolverChain>>,
+    cfg: Arc<EngineConfig>,
+    _relay_opts: RelayOptions,
 ) -> Result<TcpStream> {
     let noisy_tls_destination =
-        is_noise_probe_https_destination(route_destination_key(target_label));
+        crate::pt::socks5_server::is_noise_probe_https_destination(crate::pt::socks5_server::route_connection::route_destination_key(target_label));
     // 1. Try to get a connection from the pool
     let mut pooled_bypass = None;
     let pool_map = BYPASS_POOL.get_or_init(DashMap::new);
@@ -523,6 +528,7 @@ pub(super) async fn connect_bypass_upstream(
                             bypass_profile_idx,
                             bypass_profile_total,
                             "handshake-io",
+                            &cfg,
                         );
                     }
                     return Err(e.into());
@@ -535,6 +541,7 @@ pub(super) async fn connect_bypass_upstream(
                             bypass_profile_idx,
                             bypass_profile_total,
                             "handshake-io",
+                            &cfg,
                         );
                     }
                     return Err(e.into());
@@ -545,7 +552,8 @@ pub(super) async fn connect_bypass_upstream(
                             target_label,
                             bypass_profile_idx,
                             bypass_profile_total,
-                            "auth-rejected",
+                            "handshake-auth-failed",
+                            &cfg,
                         );
                     }
                     return Err(EngineError::Internal(format!(
@@ -566,6 +574,7 @@ pub(super) async fn connect_bypass_upstream(
                         bypass_profile_idx,
                         bypass_profile_total,
                         "connect-failed",
+                        &cfg,
                     );
                 }
                 return Err(e.into());
@@ -577,7 +586,7 @@ pub(super) async fn connect_bypass_upstream(
         if let Some(r) = &resolver {
             match r.resolve(host).await {
                 Ok(ips) if !ips.is_empty() => {
-                    if let Some(picked_ip) = pick_bypass_resolved_ip(host, &ips) {
+                    if let Some(picked_ip) = pick_bypass_resolved_ip(host, &ips, &cfg) {
                         debug!(target: "socks5", conn_id, host, ip = %picked_ip, "resolved domain for bypass via internal resolver");
                         Some(TargetAddr::Ip(picked_ip))
                     } else {
@@ -623,6 +632,7 @@ pub(super) async fn connect_bypass_upstream(
                 bypass_profile_idx,
                 bypass_profile_total,
                 "handshake-io",
+                &cfg,
             );
         }
         return Err(e.into());
@@ -636,6 +646,7 @@ pub(super) async fn connect_bypass_upstream(
                 bypass_profile_idx,
                 bypass_profile_total,
                 "handshake-io",
+                &cfg,
             );
         }
         return Err(e.into());
@@ -647,6 +658,7 @@ pub(super) async fn connect_bypass_upstream(
                 bypass_profile_idx,
                 bypass_profile_total,
                 "invalid-reply-version",
+                &cfg,
             );
         }
         return Err(EngineError::Internal(format!(
@@ -661,6 +673,7 @@ pub(super) async fn connect_bypass_upstream(
                 bypass_profile_idx,
                 bypass_profile_total,
                 "rep-nonzero",
+                &cfg,
             );
         }
         return Err(EngineError::Internal(format!(
@@ -678,6 +691,7 @@ pub(super) async fn connect_bypass_upstream(
                         bypass_profile_idx,
                         bypass_profile_total,
                         "handshake-io",
+                        &cfg,
                     );
                 }
                 return Err(e.into());
@@ -692,6 +706,7 @@ pub(super) async fn connect_bypass_upstream(
                         bypass_profile_idx,
                         bypass_profile_total,
                         "handshake-io",
+                        &cfg,
                     );
                 }
                 return Err(e.into());
@@ -704,6 +719,7 @@ pub(super) async fn connect_bypass_upstream(
                         bypass_profile_idx,
                         bypass_profile_total,
                         "handshake-io",
+                        &cfg,
                     );
                 }
                 return Err(e.into());
@@ -718,6 +734,7 @@ pub(super) async fn connect_bypass_upstream(
                         bypass_profile_idx,
                         bypass_profile_total,
                         "handshake-io",
+                        &cfg,
                     );
                 }
                 return Err(e.into());
@@ -730,6 +747,7 @@ pub(super) async fn connect_bypass_upstream(
                     bypass_profile_idx,
                     bypass_profile_total,
                     "invalid-addr-type",
+                    &cfg,
                 );
             }
             return Err(EngineError::Internal(format!(
@@ -744,14 +762,10 @@ pub(super) async fn connect_bypass_upstream(
 pub(super) fn pick_bypass_resolved_ip(
     host: &str,
     ips: &[std::net::IpAddr],
+    cfg: &EngineConfig,
 ) -> Option<std::net::IpAddr> {
     let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    let bucket = host_service_bucket(&host);
-    // Keep domain-based SOCKS CONNECT for fragile groups; pinning a single DNS answer
-    // can lock us to a bad edge and trigger repeated resets.
-    if matches!(bucket.as_str(), "meta-group:youtube" | "meta-group:google") {
-        return None;
-    }
+    let bucket = host_service_bucket(&host, cfg);
     let mut public_ips: Vec<std::net::IpAddr> = ips
         .iter()
         .copied()
@@ -760,7 +774,10 @@ pub(super) fn pick_bypass_resolved_ip(
     if public_ips.is_empty() {
         return None;
     }
-    if bucket == "meta-group:discord" {
+    
+    // Always prefer DoH IP over domain name for strictly censored or likely-hijacked services.
+    // This prevents the upstream bypass proxy (ciadpi) from querying the system DNS and hitting a stub.
+    if matches!(bucket.as_str(), "meta-group:youtube" | "meta-group:discord" | "meta-group:google" | "youtube" | "discord" | "google") {
         if let Some(v4) = public_ips.iter().find(|ip| ip.is_ipv4()).copied() {
             return Some(v4);
         }

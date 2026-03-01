@@ -262,7 +262,7 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                 "--split".into(), "1+s".into(),
                 "--disorder".into(), "3+s".into(),
                 "--auto=torst".into(),
-                "--timeout".into(), "10".into(),
+                "--timeout".into(), "15".into(),
             ],
         },
         PacketBypassProfile {
@@ -271,7 +271,7 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                 "--disorder".into(), "1".into(),
                 "--fake".into(), "-1".into(),
                 "--auto=torst".into(),
-                "--timeout".into(), "10".into(),
+                "--timeout".into(), "15".into(),
             ],
         },
         PacketBypassProfile {
@@ -280,8 +280,26 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                 "--split".into(), "1+s".into(),
                 "--disorder".into(), "3+s".into(),
                 "--auto=torst".into(),
-                "--timeout".into(), "3".into(),
+                "--timeout".into(), "15".into(), // Increased from 3
                 "--tlsrec".into(), "3+s".into(),
+            ],
+        },
+        PacketBypassProfile {
+            name: "aggressive-fake-ttl-5".to_owned(),
+            args: vec![
+                "--fake".into(), "-1".into(),
+                "--ttl".into(), "5".into(),
+                "--auto=torst".into(),
+                "--timeout".into(), "15".into(),
+            ],
+        },
+        PacketBypassProfile {
+            name: "aggressive-fake-ttl-10".to_owned(),
+            args: vec![
+                "--fake".into(), "-1".into(),
+                "--ttl".into(), "10".into(),
+                "--auto=torst".into(),
+                "--timeout".into(), "15".into(),
             ],
         },
         PacketBypassProfile {
@@ -290,7 +308,7 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                 "--split".into(), "2".into(),
                 "--disorder".into(), "1".into(),
                 "--auto=torst".into(),
-                "--timeout".into(), "5".into(),
+                "--timeout".into(), "15".into(),
             ],
         },
         PacketBypassProfile {
@@ -299,7 +317,7 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                 "--fake".into(), "-1".into(),
                 "--ttl".into(), "3".into(),
                 "--auto=torst".into(),
-                "--timeout".into(), "5".into(),
+                "--timeout".into(), "15".into(),
             ],
         },
         PacketBypassProfile {
@@ -308,7 +326,7 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
                 "--split".into(), "1+s".into(),
                 "--oob".into(), "1".into(),
                 "--auto=torst".into(),
-                "--timeout".into(), "5".into(),
+                "--timeout".into(), "15".into(),
             ],
         },
     ];

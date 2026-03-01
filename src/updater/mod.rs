@@ -163,6 +163,7 @@ impl AutoUpdater {
         validate_update_api_url(url)?;
         let client = reqwest::Client::builder()
             .redirect(Policy::none())
+            .no_proxy()
             .build()
             .map_err(|e| EngineError::Internal(format!("failed to build updater client: {e}")))?;
         let resp = client
@@ -185,6 +186,7 @@ impl AutoUpdater {
         validate_update_api_url(url)?;
         let client = reqwest::Client::builder()
             .redirect(Policy::none())
+            .no_proxy()
             .build()
             .map_err(|e| EngineError::Internal(format!("failed to build updater client: {e}")))?;
         let resp = client
@@ -275,6 +277,7 @@ impl AutoUpdater {
         validate_update_download_url(url)?;
         let client = reqwest::Client::builder()
             .redirect(Policy::none())
+            .no_proxy()
             .build()
             .map_err(|e| EngineError::Internal(format!("failed to build updater client: {e}")))?;
         let response = client.get(url).send().await?;

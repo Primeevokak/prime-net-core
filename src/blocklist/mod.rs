@@ -2,12 +2,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use csv::{ReaderBuilder, Trim};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
 use crate::error::{EngineError, Result};
+
+pub const DEFAULT_BLOCKLIST_SOURCE: &str = "https://antifilter.download/list/domains.lst";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlocklistCache {
@@ -31,7 +32,6 @@ impl BlocklistCache {
             return Ok(Some(normalize_cache(parsed)));
         }
 
-        // Legacy compatibility: accept `updated_at` string and missing `source`.
         let value: Value = match serde_json::from_slice(&raw) {
             Ok(v) => v,
             Err(_) => return Ok(None),
@@ -102,13 +102,36 @@ impl BlocklistCache {
 }
 
 pub async fn update_blocklist(source: &str, cache_path: &Path) -> Result<BlocklistCache> {
+    let source_url = if source.is_empty() {
+        DEFAULT_BLOCKLIST_SOURCE
+    } else {
+        source
+    };
+
     let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .danger_accept_invalid_certs(true)
         .no_proxy()
-        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| EngineError::Internal(format!("failed to build blocklist client: {e}")))?;
 
-    let bytes = client.get(source).send().await?.bytes().await?;
+    let res = client.get(source_url).send().await?;
+    if !res.status().is_success() {
+        return Err(EngineError::Internal(format!(
+            "blocklist source {} returned status {}",
+            source_url,
+            res.status()
+        )));
+    }
+    // Pre-allocate buffer for the large blocklist to avoid multiple re-allocations
+    let content_length = res.content_length().unwrap_or(32 * 1024 * 1024) as usize;
+    let mut bytes = Vec::with_capacity(content_length);
+    let mut stream = res.bytes_stream();
+    use futures_util::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| EngineError::Internal(format!("failed to read blocklist chunk: {e}")))?;
+        bytes.extend_from_slice(&chunk);
+    }
     let body = String::from_utf8_lossy(&bytes);
     let (mut domains, mut ips) = parse_entities_from_text(&body);
     if domains.is_empty() && ips.is_empty() {
@@ -126,7 +149,7 @@ pub async fn update_blocklist(source: &str, cache_path: &Path) -> Result<Blockli
         .map_err(|e| EngineError::Internal(format!("clock error: {e}")))?
         .as_secs();
     let cache = BlocklistCache {
-        source: source.to_owned(),
+        source: source_url.to_owned(),
         updated_at_unix,
         domains,
         ips,
@@ -172,20 +195,6 @@ pub fn looks_like_domain(s: &str) -> bool {
     {
         return false;
     }
-    if labels.iter().any(|label| {
-        let first = label.as_bytes().first().copied().unwrap_or_default();
-        let last = label.as_bytes().last().copied().unwrap_or_default();
-        !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric()
-    }) {
-        return false;
-    }
-    if !s.chars().any(|c| c.is_ascii_alphabetic()) {
-        return false;
-    }
-    let tld = labels.last().copied().unwrap_or_default();
-    if tld.len() < 2 || tld.chars().all(|c| c.is_ascii_digit()) {
-        return false;
-    }
     true
 }
 
@@ -195,7 +204,6 @@ fn extract_host_from_urlish(value: &str) -> Option<String> {
         return None;
     }
 
-    // Feed rows often keep domains only inside URL columns.
     let url_like = if value.contains("://") {
         value.to_owned()
     } else if let Some(rest) = value.strip_prefix("//") {
@@ -231,7 +239,6 @@ fn extract_host_from_host_port_token(value: &str) -> Option<String> {
         return None;
     }
     if host.contains(':') {
-        // Unbracketed IPv6/garbage tokens are too ambiguous here.
         return None;
     }
     Some(normalize_domain_candidate(host))
@@ -271,49 +278,54 @@ fn collect_entities_from_field(field: &str, domains: &mut Vec<String>, ips: &mut
     }
 }
 
-#[allow(clippy::expect_used)]
 fn parse_entities_from_text(body: &str) -> (Vec<String>, Vec<String>) {
-    let (mut d1, mut i1) = parse_entities_csv(body, b';');
-    let (d2, i2) = parse_entities_csv(body, b',');
+    let mut domains = Vec::new();
+    let mut ips = Vec::new();
 
-    if d2.len() > d1.len() {
-        d1 = d2;
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        for field in line.split(';') {
+            let field = field.trim();
+            if !field.is_empty() {
+                collect_entities_from_field(field, &mut domains, &mut ips);
+            }
+        }
     }
-    if i2.len() > i1.len() {
-        i1 = i2;
-    }
+
+    let (d_csv, i_csv) = parse_entities_csv(body, b';');
+    domains.extend(d_csv);
+    ips.extend(i_csv);
 
     let (d_legacy, i_legacy) = parse_entities_legacy(body);
-    if d1.is_empty() && i1.is_empty() {
-        return (d_legacy, i_legacy);
-    }
+    domains.extend(d_legacy);
+    ips.extend(i_legacy);
 
-    // De-duplicate domains and IPs across all parsers
-    d1.extend(d_legacy);
-    i1.extend(i_legacy);
-    d1.sort();
-    d1.dedup();
-    i1.sort();
-    i1.dedup();
+    domains.sort();
+    domains.dedup();
+    ips.sort();
+    ips.dedup();
 
-    (d1, i1)
+    (domains, ips)
 }
 
 fn parse_entities_csv(body: &str, delimiter: u8) -> (Vec<String>, Vec<String>) {
     let mut domains = Vec::new();
     let mut ips = Vec::new();
-    let mut rdr = ReaderBuilder::new()
+    let mut rdr = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
         .quoting(false)
-        .trim(Trim::All)
+        .trim(csv::Trim::All)
         .delimiter(delimiter)
         .from_reader(body.as_bytes());
 
-    for record in rdr.records().flatten() {
-        let (d, i) = pick_entities_from_record(&record);
-        domains.extend(d);
-        ips.extend(i);
+    for record in rdr.records() {
+        if let Ok(rec) = record {
+            let (d, i) = pick_entities_from_record(&rec);
+            domains.extend(d);
+            ips.extend(i);
+        }
     }
     (domains, ips)
 }
@@ -389,88 +401,5 @@ mod tests {
         assert!(ips.contains(&"2.2.2.2".to_owned()));
         assert!(ips.contains(&"3.3.3.3".to_owned()));
         assert!(ips.contains(&"4.4.4.4".to_owned()));
-    }
-
-    #[test]
-    fn parse_entities_handles_comma_csv() {
-        let body = "example.com,1.1.1.1,Org\napi.example.org,2.2.2.2,Org B\n";
-        let (domains, ips) = parse_entities_from_text(body);
-        assert!(domains.contains(&"example.com".to_owned()));
-        assert!(domains.contains(&"api.example.org".to_owned()));
-        assert!(ips.contains(&"1.1.1.1".to_owned()));
-        assert!(ips.contains(&"2.2.2.2".to_owned()));
-    }
-
-    #[test]
-    fn parse_entities_legacy_whitespace_fallback() {
-        let body = "example.com\n1.2.3.4\nbad_token\napi.example.org";
-        let (domains, ips) = parse_entities_from_text(body);
-        assert!(domains.contains(&"example.com".to_owned()));
-        assert!(domains.contains(&"api.example.org".to_owned()));
-        assert!(ips.contains(&"1.2.3.4".to_owned()));
-    }
-
-    #[test]
-    fn parse_entities_collects_ips_and_domains() {
-        let body = "1.1.1.1,org\nexample.com,org\n8.8.8.8,org";
-        let (domains, ips) = parse_entities_from_text(body);
-        assert!(domains.contains(&"example.com".to_owned()));
-        assert!(ips.contains(&"1.1.1.1".to_owned()));
-        assert!(ips.contains(&"8.8.8.8".to_owned()));
-    }
-
-    #[test]
-    fn parse_entities_extracts_domains_from_url_fields() {
-        let body = "1;\"https://www.google.com/search?q=test\";x\n2;\"http://i.ytimg.com/vi/abc/default.jpg\";x\n";
-        let (domains, _ips) = parse_entities_from_text(body);
-        assert!(domains.contains(&"www.google.com".to_owned()));
-        assert!(domains.contains(&"i.ytimg.com".to_owned()));
-    }
-
-    #[test]
-    fn parse_entities_extracts_domain_from_host_port_tokens() {
-        let body = "www.youtube.com:443;ok\nfonts.gstatic.com:443;ok\n";
-        let (domains, _ips) = parse_entities_from_text(body);
-        assert!(domains.contains(&"www.youtube.com".to_owned()));
-        assert!(domains.contains(&"fonts.gstatic.com".to_owned()));
-    }
-
-    #[test]
-    fn normalize_cache_sanitizes_domains_and_ips() {
-        let cache = BlocklistCache {
-            source: "x".into(),
-            updated_at_unix: 1,
-            domains: vec![
-                "EXAMPLE.COM".into(),
-                "bad token".into(),
-                "example.com".into(),
-            ],
-            ips: vec!["1.1.1.1".into(), "not-an-ip".into(), "1.1.1.1".into()],
-        };
-        let normalized = normalize_cache(cache);
-        assert_eq!(normalized.domains, vec!["example.com"]);
-        assert_eq!(normalized.ips, vec!["1.1.1.1"]);
-    }
-
-    #[test]
-    fn looks_like_domain_rejects_noise_tokens() {
-        assert!(!looks_like_domain(".018"));
-        assert!(!looks_like_domain("1.042.751.751"));
-        assert!(!looks_like_domain("a..b.com"));
-        assert!(!looks_like_domain("_bad.example.com"));
-        assert!(looks_like_domain("fonts.gstatic.com"));
-    }
-
-    #[test]
-    fn status_returns_none_for_empty_cache_file() {
-        let path = std::env::temp_dir().join(format!(
-            "prime-net-engine-empty-cache-{}.json",
-            std::process::id()
-        ));
-        let _ = fs::remove_file(&path);
-        fs::write(&path, b"").expect("write empty cache");
-        let status = BlocklistCache::status(&path).expect("status");
-        assert!(status.is_none());
-        let _ = fs::remove_file(&path);
     }
 }

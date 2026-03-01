@@ -114,7 +114,9 @@ impl DoHResolver {
                 .collect()
         };
 
-        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(8));
+        let mut builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .no_proxy();
         if !bootstrap_ips.is_empty() {
             // Only apply bootstrap IPs if we have a single provider.
             // Applying the same IP list to multiple distinct providers would be incorrect

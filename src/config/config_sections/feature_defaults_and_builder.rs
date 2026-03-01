@@ -17,6 +17,44 @@ pub struct DomainFrontingRule {
     pub provider: FrontingProvider,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingConfig {
+    /// Service groups that require forced route racing and aggressive bypass.
+    /// Format: "bucket_name" -> ["pattern1", "pattern2"]
+    #[serde(default = "default_censored_groups")]
+    pub censored_groups: std::collections::HashMap<String, Vec<String>>,
+    /// Global enable switch for ML-driven adaptive routing.
+    #[serde(default = "default_ml_routing_enabled")]
+    pub ml_routing_enabled: bool,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            censored_groups: default_censored_groups(),
+            ml_routing_enabled: default_ml_routing_enabled(),
+        }
+    }
+}
+
+fn default_censored_groups() -> std::collections::HashMap<String, Vec<String>> {
+    let mut map = std::collections::HashMap::new();
+    map.insert("youtube".to_owned(), vec![
+        "youtube".to_owned(), "ytimg".to_owned(), "googlevideo".to_owned(), "ggpht".to_owned()
+    ]);
+    map.insert("discord".to_owned(), vec![
+        "discord".to_owned(), "discordapp".to_owned(), "discord.gg".to_owned()
+    ]);
+    map.insert("google".to_owned(), vec![
+        "google".to_owned(), "gstatic".to_owned(), "googleapis".to_owned(), "googleusercontent".to_owned()
+    ]);
+    map
+}
+
+fn default_ml_routing_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum FrontingProvider {
@@ -397,9 +435,8 @@ fn default_blocklist_enabled() -> bool {
 }
 
 fn default_blocklist_source() -> String {
-    "https://github.com/zapret-info/z-i/raw/master/dump.csv".to_owned()
+    crate::blocklist::DEFAULT_BLOCKLIST_SOURCE.to_owned()
 }
-
 fn default_blocklist_auto_update() -> bool {
     true
 }

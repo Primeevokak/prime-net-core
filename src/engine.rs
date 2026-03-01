@@ -89,6 +89,7 @@ impl PrimeEngine {
         let guard = start_socks5_server(
             &pt.local_socks5_bind,
             outbound,
+            Arc::new(config.clone()),
             pt.silent_drop,
             RelayOptions::default(),
         )
