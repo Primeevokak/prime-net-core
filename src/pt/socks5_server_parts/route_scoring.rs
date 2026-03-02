@@ -97,7 +97,7 @@ pub(super) fn bypass_profile_score_from_health(
 ) -> i64 {
     let mut score = (health.successes as i64 * 5) - (health.failures as i64 * 6);
     score -= health.connect_failures as i64 * 8;
-    score -= health.soft_zero_replies as i64 * 50; // Increased to 50 for faster rotation
+    score -= health.soft_zero_replies as i64 * 50;
     score -= health.io_errors as i64 * 25;
     if health.last_success_unix > 0 && now.saturating_sub(health.last_success_unix) <= 5 * 60 {
         score += 3;
@@ -136,8 +136,6 @@ fn bypass_profile_matches_bucket_preference(
         return false;
     }
     match bucket {
-        // Discord profiles are ordered by conservativeness. Keep preferring the first
-        // two profiles, prioritizing profile #2 on Windows (disorder+fake style).
         "meta-group:youtube" | "meta-group:discord" => {
             if candidate.bypass_profile_total <= 1 {
                 return candidate.bypass_profile_idx == 0;
@@ -153,7 +151,6 @@ fn bypass_bucket_bonus(bucket: &str, candidate: &RouteCandidate, _cfg: &EngineCo
         return 0;
     }
     match bucket {
-        // Prefer profile #2 for Discord if available, keep profile #1 as fallback.
         "meta-group:youtube" | "meta-group:discord" => {
             if candidate.bypass_profile_total <= 1 {
                 return if candidate.bypass_profile_idx == 0 {
@@ -204,7 +201,6 @@ pub(super) fn ordered_route_candidates(
     candidates: Vec<RouteCandidate>,
     cfg: &EngineConfig,
 ) -> Vec<RouteCandidate> {
-    // Safety check: always use direct for PAC server port to avoid recursive proxying hangs.
     if route_key.contains(":8888|") {
         return vec![RouteCandidate::direct_with_family("noise-bypass", RouteIpFamily::Any)];
     }
@@ -222,10 +218,6 @@ pub(super) fn ordered_route_candidates(
                 if score > GLOBAL_BYPASS_HARD_WEAK_SCORE {
                     return true;
                 }
-
-                // Keep the currently cached winner in the candidate set even when its
-                // global profile score temporarily dips. Otherwise a transient global
-                // downgrade can force a direct-only decision for this destination.
                 if winner
                     .as_ref()
                     .map(|w| w.route_id == c.route_id())
@@ -233,7 +225,6 @@ pub(super) fn ordered_route_candidates(
                 {
                     return true;
                 }
-
                 let bucket = host_service_bucket(route_key, cfg);
                 if bypass_profile_matches_bucket_preference(&bucket, c, cfg) {
                     return true;
@@ -284,10 +275,8 @@ pub(super) fn ordered_route_candidates(
             .then_with(|| a.route_label().cmp(&b.route_label()))
     });
 
-    // Integrated ML Adaptive Routing
     if cfg.routing.ml_routing_enabled {
         let (final_list, _canary) = apply_phase3_ml_override(route_key, filtered, cfg);
-
         return final_list;
     }
 
@@ -352,6 +341,17 @@ pub(super) fn route_race_decision(
 pub(super) fn record_route_success(
     route_key: &str,
     candidate: &RouteCandidate,
+    _cfg: &EngineConfig,
+) {
+    send_telemetry(TelemetryEvent::RouteSuccess {
+        route_key: route_key.to_owned(),
+        candidate: candidate.clone(),
+    });
+}
+
+pub(super) fn record_route_success_sync(
+    route_key: &str,
+    candidate: &RouteCandidate,
     cfg: &EngineConfig,
 ) {
     let now = now_unix_secs();
@@ -387,7 +387,7 @@ pub(super) fn record_route_success(
     }
 
     if matches!(candidate.kind, RouteKind::Bypass) {
-        record_global_bypass_profile_success(candidate, now, cfg);
+        record_global_bypass_profile_success_sync(candidate, cfg);
     }
     let m = ROUTE_METRICS.get_or_init(RouteMetrics::default);
     match candidate.kind {
@@ -399,16 +399,22 @@ pub(super) fn record_route_success(
         }
     }
     mark_route_capability_healthy(candidate.kind, candidate.family);
-    debug!(
-        target: "socks5.route",
-        route_key = %route_key,
-        route = %route_id,
-        "adaptive route marked healthy"
-    );
-    maybe_flush_classifier_store(false, Arc::new(cfg.clone()));
 }
 
 pub(super) fn record_route_failure(
+    route_key: &str,
+    candidate: &RouteCandidate,
+    reason: &'static str,
+    _cfg: &EngineConfig,
+) {
+    send_telemetry(TelemetryEvent::RouteFailure {
+        route_key: route_key.to_owned(),
+        candidate: candidate.clone(),
+        reason,
+    });
+}
+
+pub(super) fn record_route_failure_sync(
     route_key: &str,
     candidate: &RouteCandidate,
     reason: &'static str,
@@ -426,8 +432,6 @@ pub(super) fn record_route_failure(
 
     let is_soft_failure = matches!(reason, "zero-reply-soft" | "suspicious-zero-reply");
 
-    // Aggressive learning for direct connections: if it connects but fails to deliver data,
-    // it's almost certainly DPI. Mark it weak immediately.
     if candidate.kind == RouteKind::Direct && is_soft_failure {
         entry.consecutive_failures = entry.consecutive_failures.max(ROUTE_FAILS_BEFORE_WEAK);
     } else {
@@ -435,7 +439,6 @@ pub(super) fn record_route_failure(
     }
 
     entry.last_failure_unix = now;
-    let consecutive = entry.consecutive_failures;
     if entry.consecutive_failures >= ROUTE_FAILS_BEFORE_WEAK {
         let penalty = ROUTE_WEAK_BASE_SECS
             .saturating_mul(u64::from(entry.consecutive_failures))
@@ -494,16 +497,7 @@ pub(super) fn record_route_failure(
     }
 
     if matches!(candidate.kind, RouteKind::Bypass) {
-        record_global_bypass_profile_failure(candidate, reason, now, cfg);
-        if reason == "zero-reply-soft" && candidate.bypass_profile_total > 1 {
-            record_bypass_profile_failure(
-                crate::pt::socks5_server::route_connection::route_destination_key(route_key),
-                candidate.bypass_profile_idx,
-                candidate.bypass_profile_total,
-                "route-soft-zero-reply",
-                cfg,
-            );
-        }
+        record_global_bypass_profile_failure_sync(candidate, reason, now, cfg);
     }
     let m = ROUTE_METRICS.get_or_init(RouteMetrics::default);
     match candidate.kind {
@@ -513,8 +507,7 @@ pub(super) fn record_route_failure(
                 m.connect_failure_direct.fetch_add(1, Ordering::Relaxed);
             }
             if matches!(reason, "zero-reply-soft" | "suspicious-zero-reply") {
-                m.route_soft_zero_reply_direct
-                    .fetch_add(1, Ordering::Relaxed);
+                m.route_soft_zero_reply_direct.fetch_add(1, Ordering::Relaxed);
             }
         }
         RouteKind::Bypass => {
@@ -523,31 +516,30 @@ pub(super) fn record_route_failure(
                 m.connect_failure_bypass.fetch_add(1, Ordering::Relaxed);
             }
             if matches!(reason, "zero-reply-soft" | "suspicious-zero-reply") {
-                m.route_soft_zero_reply_bypass
-                    .fetch_add(1, Ordering::Relaxed);
+                m.route_soft_zero_reply_bypass.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
-    warn!(
-        target: "socks5.route",
-        route_key = %route_key,
-        route = %route_id,
-        reason,
-        consecutive_failures = consecutive,
-        "adaptive route marked weak"
-    );
-    maybe_flush_classifier_store(false, Arc::new(cfg.clone()));
 }
 
 pub(super) fn record_global_bypass_profile_success(
     candidate: &RouteCandidate,
-    now: u64,
-    cfg: &EngineConfig,
+    _cfg: &EngineConfig,
+) {
+    send_telemetry(TelemetryEvent::GlobalBypassSuccess {
+        candidate: candidate.clone(),
+    });
+}
+
+pub(super) fn record_global_bypass_profile_success_sync(
+    candidate: &RouteCandidate,
+    _cfg: &EngineConfig,
 ) {
     let route_id = candidate.route_id();
     if !route_id.starts_with("bypass:") {
         return;
     }
+    let now = now_unix_secs();
     let key = bypass_profile_health_key(&route_id, candidate.family);
     let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(DashMap::new);
     let mut entry = map.entry(key).or_default();
@@ -555,17 +547,24 @@ pub(super) fn record_global_bypass_profile_success(
     entry.last_success_unix = now;
     entry.failures = entry.failures.saturating_sub(1);
     entry.connect_failures = entry.connect_failures.saturating_sub(1);
-    entry.soft_zero_replies = entry.soft_zero_replies.saturating_sub(1);
-    entry.io_errors = entry.io_errors.saturating_sub(1);
-    drop(entry);
-    maybe_prune_runtime_classifier_state(now, Arc::new(cfg.clone()));
 }
 
 pub(super) fn record_global_bypass_profile_failure(
     candidate: &RouteCandidate,
     reason: &'static str,
+    _cfg: &EngineConfig,
+) {
+    send_telemetry(TelemetryEvent::GlobalBypassFailure {
+        candidate: candidate.clone(),
+        reason,
+    });
+}
+
+pub(super) fn record_global_bypass_profile_failure_sync(
+    candidate: &RouteCandidate,
+    reason: &'static str,
     now: u64,
-    cfg: &EngineConfig,
+    _cfg: &EngineConfig,
 ) {
     let route_id = candidate.route_id();
     if !route_id.starts_with("bypass:") {
@@ -585,8 +584,6 @@ pub(super) fn record_global_bypass_profile_failure(
     if reason == "io-error" {
         entry.io_errors = entry.io_errors.saturating_add(1);
     }
-    drop(entry);
-    maybe_prune_runtime_classifier_state(now, Arc::new(cfg.clone()));
 }
 
 pub(super) fn select_route_candidates(
@@ -696,16 +693,15 @@ pub(super) fn destination_bypass_profile_idx_known(
     None
 }
 
-#[cfg(test)]
+pub(super) fn destination_bypass_profile_idx(destination: &str, total: u8) -> u8 {
+    destination_bypass_profile_idx_known(destination, total, &EngineConfig::default()).unwrap_or(0)
+}
+
 pub(super) fn record_route_connected(
     route_key: &str,
     candidate: &RouteCandidate,
     cfg: &EngineConfig,
 ) {
-    // Do not pre-pin adaptive winners: TCP connect can succeed while
-    // TLS still gets blocked, which causes temporary route stickiness.
-    // This is especially harmful for YouTube/Discord where a transient direct
-    // TCP connect would suppress route racing for a short window.
     if candidate.source == "adaptive-race"
         || candidate.source == "builtin"
         || candidate.source == "learned-domain"
@@ -736,16 +732,11 @@ pub(super) fn record_route_connected(
     }
 }
 
-#[cfg(test)]
-pub(super) fn destination_bypass_profile_idx(destination: &str, total: u8) -> u8 {
-    destination_bypass_profile_idx_known(destination, total, &EngineConfig::default()).unwrap_or(0)
-}
-
 pub(super) fn record_bypass_profile_failure(
     destination: &str,
     current_idx: u8,
     total: u8,
-    reason: &'static str,
+    _reason: &'static str,
     cfg: &EngineConfig,
 ) {
     if total == 0 {
@@ -785,8 +776,6 @@ pub(super) fn record_bypass_profile_failure(
         }
     }
     note_phase2_profile_rotation(destination, cfg);
-    info!(target: "socks5.bypass", destination, profile_key = %key, reason, next_profile = next_idx + 1, failures, "bypass profile rotated");
-    maybe_flush_classifier_store(false, Arc::new(cfg.clone()));
 }
 
 pub(super) fn should_bypass_by_classifier_host(host: &str, port: u16, cfg: &EngineConfig) -> bool {
@@ -1005,8 +994,6 @@ pub fn route_race_candidate_delay_ms(
 
     let mut delay = (idx as u64) * ROUTE_RACE_BASE_DELAY_MS;
     
-    // For non-censored domains, we give 'direct' a small headstart to avoid unnecessary bypass usage.
-    // For censored domains, we want true parallel probing without delays.
     if !is_censored && direct_present && candidate.kind == RouteKind::Bypass {
         delay += ROUTE_RACE_DIRECT_HEADSTART_MS;
         if candidate.source == "builtin"
@@ -1083,17 +1070,6 @@ pub(super) fn mark_route_capability_weak(
             *slot = (*slot).max(until);
         }
     }
-    warn!(
-        target: "socks5.route",
-        route = match kind {
-            RouteKind::Direct => "direct",
-            RouteKind::Bypass => "bypass",
-        },
-        family = family.label(),
-        reason,
-        weak_for_secs = penalty_secs,
-        "route capability temporarily downgraded"
-    );
 }
 
 pub(super) fn mark_route_capability_healthy(kind: RouteKind, family: RouteIpFamily) {

@@ -372,6 +372,7 @@ pub async fn start_socks5_server(
 
     let relay_opts = Arc::new(relay_opts);
 
+    init_telemetry_bus(cfg.clone());
     init_classifier_store(&relay_opts, cfg.clone());
     load_classifier_store_if_needed(cfg.clone());
 
@@ -389,11 +390,10 @@ pub async fn start_socks5_server(
                             let outbound_handle = outbound.clone();
                             let cfg_handle = cfg.clone();
                             join_set.spawn(async move {
-                                if let Err(e) = handle_client(conn_id, tcp, peer, listen_addr, outbound_handle, cfg_handle, silent_drop, relay_opts_val).await {
+                                if let Err(e) = handle_socks5_connection(conn_id, tcp, peer, "client", outbound_handle, cfg_handle, silent_drop, relay_opts_val).await {
                                     warn!(target: "socks5", conn_id, error = %e, "client session failed");
                                 }
-                            });
-                        }
+                            });                        }
                         Err(e) => {
                             error!(target: "socks5", error = %e, "failed to accept connection");
                         }

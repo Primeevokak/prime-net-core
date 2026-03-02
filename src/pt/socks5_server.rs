@@ -24,8 +24,6 @@ use crate::config::EngineConfig;
 use crate::error::{EngineError, Result};
 use crate::pt::{BoxStream, DynOutbound, OutboundConnector, TargetAddr, TargetEndpoint};
 
-// use super::{BoxStream, DynOutbound, TargetAddr, TargetEndpoint};
-
 pub const ROUTE_WINNER_TTL_SECS: u64 = 15 * 60;
 pub const ROUTE_FAILS_BEFORE_WEAK: u8 = 2;
 pub const ROUTE_WEAK_BASE_SECS: u64 = 45;
@@ -33,7 +31,7 @@ pub const ROUTE_WEAK_MAX_SECS: u64 = 300;
 pub const ROUTE_SOFT_ZERO_REPLY_MIN_C2U: u64 = 256;
 pub const ROUTE_SOFT_ZERO_REPLY_MIN_LIFETIME_MS: u64 = 2000;
 pub const GLOBAL_BYPASS_HARD_WEAK_SCORE: i64 = -80;
-pub const LEARNED_BYPASS_MIN_FAILURES_DOMAIN: u8 = 1; // Reduced from 2
+pub const LEARNED_BYPASS_MIN_FAILURES_DOMAIN: u8 = 1;
 pub const LEARNED_BYPASS_MIN_FAILURES_IP: u8 = 3;
 pub const ROUTE_CAPABILITY_BYPASS_REP03_SECS: u64 = 120;
 pub const ROUTE_RACE_MAX_CANDIDATES: usize = 4;
@@ -90,7 +88,8 @@ pub struct UdpDestinationPolicy {
     pub block_quic: bool,
 }
 
-// Semantically grouped sections for SOCKS5 PT server.
+#[path = "socks5_server_parts/telemetry_bus.rs"]
+pub mod telemetry_bus;
 #[path = "socks5_server_parts/classifier_and_persistence.rs"]
 mod classifier_and_persistence;
 #[cfg(test)]
@@ -122,6 +121,7 @@ use relay_and_io_helpers::*;
 use route_connection::*;
 use route_scoring::*;
 use state_and_startup::*;
+pub use telemetry_bus::*;
 
 pub(super) use ml_shadow::{begin_route_decision_event, complete_route_outcome_event};
 pub(super) use protocol_handlers::tune_relay_for_target;

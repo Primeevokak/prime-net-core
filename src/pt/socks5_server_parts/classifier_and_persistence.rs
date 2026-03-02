@@ -59,7 +59,20 @@ pub(super) fn record_stage_source_selected(source: StageSelectionSource) {
 pub(super) fn record_destination_failure(
     destination: &str,
     signal: BlockingSignal,
-    classifier_emit_interval_secs: u64,
+    _classifier_emit_interval_secs: u64,
+    stage: u8,
+    _cfg: &EngineConfig,
+) {
+    send_telemetry(TelemetryEvent::DestinationFailure {
+        destination: destination.to_owned(),
+        signal,
+        stage,
+    });
+}
+
+pub(super) fn record_destination_failure_sync(
+    destination: &str,
+    signal: BlockingSignal,
     stage: u8,
     cfg: &EngineConfig,
 ) {
@@ -119,15 +132,23 @@ pub(super) fn record_destination_failure(
         stats.last_seen_unix = now;
     }
     record_stage_outcome(stage, false);
-    maybe_prune_runtime_classifier_state(now, Arc::new(cfg.clone()));
-    maybe_flush_classifier_store(false, Arc::new(cfg.clone()));
-    maybe_emit_classifier_summary(classifier_emit_interval_secs.max(5), cfg);
 }
 
 pub(super) fn record_destination_success(
     destination: &str,
     stage: u8,
     _source: StageSelectionSource,
+    _cfg: &EngineConfig,
+) {
+    send_telemetry(TelemetryEvent::DestinationSuccess {
+        destination: destination.to_owned(),
+        stage,
+    });
+}
+
+pub(super) fn record_destination_success_sync(
+    destination: &str,
+    stage: u8,
     _cfg: &EngineConfig,
 ) {
     let now = now_unix_secs();
@@ -152,8 +173,6 @@ pub(super) fn record_destination_success(
         stats.last_seen_unix = now;
     }
     record_stage_outcome(stage, true);
-    maybe_prune_runtime_classifier_state(now, Arc::new(_cfg.clone()));
-    maybe_flush_classifier_store(false, Arc::new(_cfg.clone()));
 }
 
 pub(super) fn record_stage_outcome(stage: u8, success: bool) {

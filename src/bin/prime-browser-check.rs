@@ -45,12 +45,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .spawn()?;
 
     let stderr = engine_child.stderr.take().unwrap();
-    let mut reader = BufReader::new(stderr).lines();
+    let reader = BufReader::new(stderr);
+    let mut lines = reader.lines();
 
-    // Give engine a moment to start
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let test_url = "https://www.google.com/search?q=prime+net+engine+test";
+    let args: Vec<String> = env::args().collect();
+    let test_url = args.get(1).map(|s| s.as_str()).unwrap_or("https://www.google.com/search?q=prime+net+engine+test");
     println!("Launching Chrome to visit: {}", test_url);
 
     let user_data_dir = current_dir.join("target").join("chrome-test-profile");
@@ -77,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut data_flowing = false;
 
     loop {
-        let timeout_check = tokio::time::timeout(Duration::from_millis(100), reader.next_line());
+        let timeout_check = tokio::time::timeout(Duration::from_millis(100), lines.next_line());
         
         match timeout_check.await {
             Ok(Ok(Some(line))) => {

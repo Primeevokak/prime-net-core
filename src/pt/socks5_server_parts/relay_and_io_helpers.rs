@@ -24,12 +24,24 @@ pub async fn relay_bidirectional(
         } else {
             upstream.write_all(&initial_client_to_upstream).await?;
         }
+        // CRITICAL: Flush mandatory here to ensure Client Hello is sent before copy_bidirectional.
+        // Without flush, data might sit in OS buffer while relay waits for response that won't come.
         upstream.flush().await?;
     }
     if !initial_upstream_to_client.is_empty() {
         warn!(target: "socks5.relay", bytes = initial_upstream_to_client.len(), "injecting initial upstream data into client");
         client.write_all(&initial_upstream_to_client).await?;
         client.flush().await?;
+    }
+
+    // DEBUG: Peek first response bytes from upstream to see why it closes
+    let mut peek_res = [0u8; 16];
+    if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(500), upstream.read(&mut peek_res)).await {
+        if n > 0 {
+            info!(target: "socks5.relay", bytes = n, data = ?&peek_res[..n], "peeked first bytes from upstream");
+            client.write_all(&peek_res[..n]).await?;
+            let _ = client.flush().await;
+        }
     }
 
     let (c2u, u2c) = tokio::io::copy_bidirectional(client, upstream).await?;
@@ -71,12 +83,12 @@ pub async fn relay_bidirectional_with_first_byte_timeout(
     }
 
     if initial_u2c_len == 0 {
-        let mut first_byte = [0u8; 1];
-        match tokio::time::timeout(timeout_duration, upstream.read(&mut first_byte)).await {
+        let mut first_bytes = [0u8; 16];
+        match tokio::time::timeout(timeout_duration, upstream.read(&mut first_bytes)).await {
             Ok(Ok(0)) => return Ok((initial_c2u_len, 0)),
             Ok(Ok(n)) => {
-                info!(target: "socks5.relay", "first byte received from upstream");
-                client.write_all(&first_byte[..n]).await?;
+                info!(target: "socks5.relay", bytes = n, data = ?&first_bytes[..n], "first bytes received from upstream");
+                client.write_all(&first_bytes[..n]).await?;
                 client.flush().await?;
                 let (c2u, u2c) = tokio::io::copy_bidirectional(client, upstream).await?;
                 return Ok((c2u + initial_c2u_len, u2c + n as u64));

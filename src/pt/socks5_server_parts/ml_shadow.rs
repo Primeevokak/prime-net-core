@@ -44,7 +44,7 @@ struct ShadowArmPrior {
     pseudo_reward_sum: i64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ShadowCanaryDecision {
     pub applied: bool,
     pub route_arm: String,
@@ -105,9 +105,6 @@ impl RouteDecisionEvent {
         if self.shadow_route_arm.trim().is_empty() {
             return Err("shadow_route_arm must not be empty");
         }
-        if matches!(self.profile, Some(0)) {
-            return Err("profile index is 1-based");
-        }
         Ok(())
     }
 }
@@ -150,9 +147,6 @@ impl RouteOutcomeEvent {
         }
         if self.shadow_route_arm.trim().is_empty() {
             return Err("shadow_route_arm must not be empty");
-        }
-        if matches!(self.profile, Some(0)) {
-            return Err("profile index is 1-based");
         }
         Ok(())
     }
@@ -384,6 +378,24 @@ pub fn begin_route_decision_event_with_canary(
     cfg: &EngineConfig,
 ) -> u64 {
     let decision_id = next_route_decision_id();
+    send_telemetry(TelemetryEvent::MlDecision {
+        route_key: route_key.to_owned(),
+        candidates: candidates.to_vec(),
+        raced,
+        canary,
+        decision_id,
+    });
+    decision_id
+}
+
+pub(super) fn begin_route_decision_event_sync(
+    route_key: &str,
+    candidates: &[RouteCandidate],
+    raced: bool,
+    canary: Option<ShadowCanaryDecision>,
+    decision_id: u64,
+    cfg: &EngineConfig,
+) {
     let now = now_unix_secs();
     let host = route_destination_host(route_key);
     let bucket = shadow_bucket_name(route_key, &host, cfg);
@@ -412,7 +424,7 @@ pub fn begin_route_decision_event_with_canary(
             validation_error = err,
             "route decision event validation failed"
         );
-        return decision_id;
+        return;
     }
 
     let pending = ROUTE_DECISION_EVENTS_PENDING.get_or_init(DashMap::new);
@@ -447,7 +459,6 @@ pub fn begin_route_decision_event_with_canary(
         shadow_explore,
         "route decision event"
     );
-    decision_id
 }
 
 pub fn complete_route_outcome_event(
@@ -461,25 +472,44 @@ pub fn complete_route_outcome_event(
     error_class: &str,
     _cfg: &EngineConfig,
 ) {
+    send_telemetry(TelemetryEvent::MlOutcome {
+        decision_id,
+        candidate: candidate.cloned(),
+        connect_ok,
+        tls_ok_proxy,
+        bytes_u2c,
+        lifetime_ms,
+        error_class: error_class.to_owned(),
+    });
+}
+
+pub(super) fn complete_route_outcome_event_sync(
+    decision_id: u64,
+    candidate: Option<&RouteCandidate>,
+    connect_ok: bool,
+    tls_ok_proxy: bool,
+    bytes_u2c: u64,
+    lifetime_ms: u64,
+    error_class: &str,
+    cfg: &EngineConfig,
+) {
     let now = now_unix_secs();
     let pending = ROUTE_DECISION_EVENTS_PENDING.get_or_init(DashMap::new);
-    let decision = pending.remove(&decision_id).map(|(_, event)| event);
+    let Some((_, mut event)) = pending.remove(&decision_id) else {
+        return;
+    };
 
     let fallback_bucket = "default".to_owned();
     let fallback_host = "unknown".to_owned();
 
     let route_arm = candidate
         .map(|route| route.route_id())
-        .or_else(|| decision.as_ref().map(|event| event.route_arm.clone()))
-        .unwrap_or_else(|| "none".to_owned());
+        .unwrap_or_else(|| event.route_arm.clone());
     let profile = candidate
         .and_then(profile_from_candidate)
-        .or_else(|| decision.as_ref().and_then(|event| event.profile))
+        .or_else(|| event.profile)
         .or_else(|| profile_from_route_arm(&route_arm));
-    let shadow_route_arm = decision
-        .as_ref()
-        .map(|event| event.shadow_route_arm.clone())
-        .unwrap_or_else(|| route_arm.clone());
+    
     let reward = shadow_reward_from_outcome(
         connect_ok,
         tls_ok_proxy,
@@ -490,24 +520,18 @@ pub fn complete_route_outcome_event(
     let outcome = RouteOutcomeEvent {
         decision_id,
         timestamp_unix: now,
-        bucket: decision
-            .as_ref()
-            .map(|event| event.bucket.clone())
-            .unwrap_or(fallback_bucket),
-        host: decision
-            .as_ref()
-            .map(|event| event.host.clone())
-            .unwrap_or(fallback_host),
+        bucket: event.bucket.clone(),
+        host: event.host.clone(),
         route_arm,
         profile,
-        raced: decision.as_ref().map(|event| event.raced).unwrap_or(false),
+        raced: event.raced,
         winner: connect_ok && candidate.is_some(),
         connect_ok,
         tls_ok_proxy,
         bytes_u2c,
         lifetime_ms,
         error_class: error_class.to_owned(),
-        shadow_route_arm: shadow_route_arm.clone(),
+        shadow_route_arm: event.shadow_route_arm.clone(),
         shadow_reward: reward,
     };
     if let Err(err) = outcome.validate() {
@@ -528,10 +552,10 @@ pub fn complete_route_outcome_event(
         .map(|(_, value)| value)
         .unwrap_or_default();
     let posterior_arm = outcome.route_arm.clone();
-    update_shadow_bandit(&outcome.bucket, &posterior_arm, outcome.shadow_reward, now);
+    update_shadow_bandit_sync(&outcome.bucket, &posterior_arm, outcome.shadow_reward, now);
     let shadow_match = outcome.shadow_route_arm == outcome.route_arm;
     if canary.applied {
-        shadow_update_canary_slo(
+        shadow_update_canary_slo_sync(
             &outcome.bucket,
             outcome.connect_ok,
             outcome.tls_ok_proxy,
@@ -581,8 +605,6 @@ pub(super) fn shadow_reward_from_outcome(
         reward -= 10;
     }
 
-    // A plain TCP connect without any usable upstream bytes is not a real success.
-    // Treat this as negative evidence so direct "phantom connects" don't dominate.
     if connect_ok && !tls_ok_proxy && bytes_u2c <= 7 {
         reward -= 60;
     }
@@ -768,7 +790,7 @@ fn shadow_switch_guard_allows(route_key: &str, selected_arm: &str, now: u64) -> 
     true
 }
 
-fn shadow_update_canary_slo(
+fn shadow_update_canary_slo_sync(
     bucket: &str,
     connect_ok: bool,
     tls_ok_proxy: bool,
@@ -907,21 +929,21 @@ pub fn prune_ml_state(now: u64) {
     }
 }
 
-fn update_shadow_bandit(bucket: &str, arm: &str, reward: i64, now: u64) {
+fn update_shadow_bandit_sync(bucket: &str, arm: &str, reward: i64, now: u64) {
     let key = format!("{bucket}|{arm}");
     let map = SHADOW_BANDIT_ARMS.get_or_init(DashMap::new);
     let mut entry = map.entry(key).or_default();
-    apply_shadow_decay(&mut entry, now);
+    apply_shadow_decay_sync(&mut entry, now);
 
     entry.pulls = entry.pulls.saturating_add(1);
     let reward = reward.clamp(-200, 200);
     entry.reward_sum = entry.reward_sum.saturating_add(reward);
     entry.last_reward = reward;
-    update_shadow_drift_state(&mut entry, reward);
+    update_shadow_drift_state_sync(&mut entry, reward);
     entry.last_seen_unix = now;
 }
 
-fn apply_shadow_decay(entry: &mut ShadowBanditArmStats, now: u64) {
+fn apply_shadow_decay_sync(entry: &mut ShadowBanditArmStats, now: u64) {
     let (decayed_pulls, decayed_reward_sum) = shadow_decayed_stats_view(entry, now);
     if decayed_pulls == entry.pulls && decayed_reward_sum == entry.reward_sum {
         return;
@@ -938,7 +960,7 @@ fn apply_shadow_decay(entry: &mut ShadowBanditArmStats, now: u64) {
     }
 }
 
-fn update_shadow_drift_state(entry: &mut ShadowBanditArmStats, reward: i64) {
+fn update_shadow_drift_state_sync(entry: &mut ShadowBanditArmStats, reward: i64) {
     let reward_milli = reward.saturating_mul(1000);
     if entry.pulls <= 1 || entry.ema_reward_milli == 0 {
         entry.ema_reward_milli = reward_milli;
@@ -1048,8 +1070,6 @@ fn shadow_arm_prior(bucket: &str, arm: &str) -> ShadowArmPrior {
             _ => ShadowArmPrior::with_mean(0),
         },
         "google" => match arm {
-            // In blocked regions, direct often "connects" but dies before usable TLS traffic.
-            // Biasing towards bypass reduces long cold-start degradation.
             "direct" => ShadowArmPrior::with_mean(-20),
             "bypass:1" => ShadowArmPrior::with_mean(55),
             "bypass:2" => ShadowArmPrior::with_mean(40),
@@ -1195,7 +1215,7 @@ pub(super) fn replay_route_outcomes_for_test(outcomes: &[RouteOutcomeEvent]) -> 
         if event.validate().is_err() {
             continue;
         }
-        update_shadow_bandit(
+        update_shadow_bandit_sync(
             &event.bucket,
             &event.route_arm,
             event.shadow_reward,
