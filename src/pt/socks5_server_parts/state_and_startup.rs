@@ -301,8 +301,10 @@ pub struct ConnectedRoute {
     pub stream: BoxStream,
     pub candidate: RouteCandidate,
     pub route_key: String,
-    pub raced: bool,
     pub decision_id: u64,
+    pub initial_client_data: Vec<u8>,
+    pub initial_upstream_data: Vec<u8>,
+    pub client_data_sent: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,7 +390,7 @@ pub async fn start_socks5_server(
                             let cfg_handle = cfg.clone();
                             join_set.spawn(async move {
                                 if let Err(e) = handle_client(conn_id, tcp, peer, listen_addr, outbound_handle, cfg_handle, silent_drop, relay_opts_val).await {
-                                    debug!(target: "socks5", conn_id, error = %e, "client session failed");
+                                    warn!(target: "socks5", conn_id, error = %e, "client session failed");
                                 }
                             });
                         }
@@ -423,8 +425,9 @@ pub(super) async fn connect_bypass_upstream(
     cfg: Arc<EngineConfig>,
     _relay_opts: RelayOptions,
 ) -> Result<TcpStream> {
-    let noisy_tls_destination =
-        crate::pt::socks5_server::is_noise_probe_https_destination(crate::pt::socks5_server::route_connection::route_destination_key(target_label));
+    let noisy_tls_destination = crate::pt::socks5_server::is_noise_probe_https_destination(
+        crate::pt::socks5_server::route_connection::route_destination_key(target_label),
+    );
     // 1. Try to get a connection from the pool
     let mut pooled_bypass = None;
     let pool_map = BYPASS_POOL.get_or_init(DashMap::new);
@@ -774,10 +777,18 @@ pub(super) fn pick_bypass_resolved_ip(
     if public_ips.is_empty() {
         return None;
     }
-    
+
     // Always prefer DoH IP over domain name for strictly censored or likely-hijacked services.
     // This prevents the upstream bypass proxy (ciadpi) from querying the system DNS and hitting a stub.
-    if matches!(bucket.as_str(), "meta-group:youtube" | "meta-group:discord" | "meta-group:google" | "youtube" | "discord" | "google") {
+    if matches!(
+        bucket.as_str(),
+        "meta-group:youtube"
+            | "meta-group:discord"
+            | "meta-group:google"
+            | "youtube"
+            | "discord"
+            | "google"
+    ) {
         if let Some(v4) = public_ips.iter().find(|ip| ip.is_ipv4()).copied() {
             return Some(v4);
         }

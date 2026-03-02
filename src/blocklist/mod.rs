@@ -129,7 +129,8 @@ pub async fn update_blocklist(source: &str, cache_path: &Path) -> Result<Blockli
     let mut stream = res.bytes_stream();
     use futures_util::StreamExt;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| EngineError::Internal(format!("failed to read blocklist chunk: {e}")))?;
+        let chunk = chunk
+            .map_err(|e| EngineError::Internal(format!("failed to read blocklist chunk: {e}")))?;
         bytes.extend_from_slice(&chunk);
     }
     let body = String::from_utf8_lossy(&bytes);
@@ -284,7 +285,9 @@ fn parse_entities_from_text(body: &str) -> (Vec<String>, Vec<String>) {
 
     for line in body.lines() {
         let line = line.trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
         for field in line.split(';') {
             let field = field.trim();
             if !field.is_empty() {

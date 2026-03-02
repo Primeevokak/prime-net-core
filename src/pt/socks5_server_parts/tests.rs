@@ -128,7 +128,6 @@ mod tests {
         assert!(!rewritten.contains("\r\nProxy-Connection:"));
     }
 
-
     #[test]
     fn parse_ip_literal_accepts_bracketed_ipv6() {
         assert_eq!(
@@ -171,7 +170,10 @@ mod tests {
 
     #[test]
     fn host_service_bucket_uses_registrable_bucket_for_multitenant_suffixes() {
-        assert_eq!(host_service_bucket("api.user.github.io", &EngineConfig::default()), "user.github.io");
+        assert_eq!(
+            host_service_bucket("api.user.github.io", &EngineConfig::default()),
+            "user.github.io"
+        );
         assert_eq!(
             host_service_bucket("x.myapp.vercel.app", &EngineConfig::default()),
             "myapp.vercel.app"
@@ -188,7 +190,6 @@ mod tests {
         let err = validate_relay_topology(listen, &opts).expect_err("must reject loop");
         assert!(format!("{err}").contains("forwarding loop"));
     }
-
 
     #[test]
     fn stage4_fragmentation_is_not_one_byte_on_non_windows() {
@@ -260,7 +261,6 @@ mod tests {
         assert!(key_collector.starts_with("collector.github.com:443|"));
     }
 
-
     #[test]
     fn route_service_key_groups_subdomains_by_registrable_domain() {
         let api_key = route_decision_key(
@@ -273,8 +273,10 @@ mod tests {
             &TargetAddr::Domain("rr3---sn-gvnuxaxjvh-88vz.googlevideo.com".to_owned()),
             &EngineConfig::default(),
         );
-        let api_service = route_service_key(&api_key, &EngineConfig::default()).expect("service key");
-        let collector_service = route_service_key(&collector_key, &EngineConfig::default()).expect("service key");
+        let api_service =
+            route_service_key(&api_key, &EngineConfig::default()).expect("service key");
+        let collector_service =
+            route_service_key(&collector_key, &EngineConfig::default()).expect("service key");
         assert_eq!(api_service, collector_service);
         assert!(api_service.starts_with("googlevideo.com:443|"));
     }
@@ -293,7 +295,8 @@ mod tests {
         );
         clear_route_state_for_test(&winner_route_key);
         clear_route_state_for_test(&probe_route_key);
-        let service_key = route_service_key(&winner_route_key, &EngineConfig::default()).expect("service key");
+        let service_key =
+            route_service_key(&winner_route_key, &EngineConfig::default()).expect("service key");
         let winner_map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
         winner_map.insert(
             service_key,
@@ -307,7 +310,8 @@ mod tests {
             RouteCandidate::direct("test"),
             RouteCandidate::bypass("test", "127.0.0.1:19080".parse().expect("addr"), 0, 1),
         ];
-        let decision = route_race_decision(443, &probe_route_key, &candidates, &EngineConfig::default());
+        let decision =
+            route_race_decision(443, &probe_route_key, &candidates, &EngineConfig::default());
         assert_eq!(decision, (false, RouteRaceReason::WinnerHealthy));
         clear_route_state_for_test(&winner_route_key);
         clear_route_state_for_test(&probe_route_key);
@@ -327,7 +331,8 @@ mod tests {
         );
         clear_route_state_for_test(&winner_route_key);
         clear_route_state_for_test(&probe_route_key);
-        let meta_key = route_meta_service_key(&winner_route_key, &EngineConfig::default()).expect("meta key");
+        let meta_key =
+            route_meta_service_key(&winner_route_key, &EngineConfig::default()).expect("meta key");
         let winner_map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
         winner_map.insert(
             meta_key,
@@ -342,12 +347,12 @@ mod tests {
             RouteCandidate::bypass("test", "127.0.0.1:19080".parse().expect("addr"), 0, 2),
             RouteCandidate::bypass("test", "127.0.0.1:19081".parse().expect("addr"), 1, 2),
         ];
-        let decision = route_race_decision(443, &probe_route_key, &candidates, &EngineConfig::default());
+        let decision =
+            route_race_decision(443, &probe_route_key, &candidates, &EngineConfig::default());
         assert_eq!(decision, (false, RouteRaceReason::WinnerHealthy));
         clear_route_state_for_test(&winner_route_key);
         clear_route_state_for_test(&probe_route_key);
     }
-
 
     #[test]
     fn learned_bypass_activates_after_failures_for_tls_domain() {
@@ -360,7 +365,11 @@ mod tests {
             443,
             &EngineConfig::default()
         ));
-        assert!(!should_bypass_by_classifier_host("127.0.0.1", 443, &EngineConfig::default()));
+        assert!(!should_bypass_by_classifier_host(
+            "127.0.0.1",
+            443,
+            &EngineConfig::default()
+        ));
         assert!(!should_bypass_by_classifier_host(
             "learned-bypass-test.invalid",
             80,
@@ -373,7 +382,13 @@ mod tests {
     #[test]
     fn bypass_profile_rotation_propagates_to_service() {
         clear_bypass_profile_state_for_test();
-        record_bypass_profile_failure("api.github.com:443", 0, 3, "unit-test", &EngineConfig::default());
+        record_bypass_profile_failure(
+            "api.github.com:443",
+            0,
+            3,
+            "unit-test",
+            &EngineConfig::default(),
+        );
         assert_eq!(destination_bypass_profile_idx("api.github.com:443", 3), 1);
         assert_eq!(
             destination_bypass_profile_idx("collector.github.com:443", 3),
@@ -385,7 +400,8 @@ mod tests {
     #[test]
     fn bypass_profile_index_uses_legacy_service_key_fallback() {
         clear_bypass_profile_state_for_test();
-        let service_key = bypass_profile_legacy_service_key("api.github.com:443", &EngineConfig::default());
+        let service_key =
+            bypass_profile_legacy_service_key("api.github.com:443", &EngineConfig::default());
         let idx_map = DEST_BYPASS_PROFILE_IDX.get_or_init(DashMap::new);
         idx_map.insert(service_key, 2);
 
@@ -399,7 +415,13 @@ mod tests {
     #[test]
     fn bypass_profile_rotation_normalizes_family_aware_route_keys() {
         clear_bypass_profile_state_for_test();
-        record_bypass_profile_failure("www.youtube.com:443|any", 0, 3, "handshake-io", &EngineConfig::default());
+        record_bypass_profile_failure(
+            "www.youtube.com:443|any",
+            0,
+            3,
+            "handshake-io",
+            &EngineConfig::default(),
+        );
         assert_eq!(destination_bypass_profile_idx("www.youtube.com:443", 3), 1);
         clear_bypass_profile_state_for_test();
     }
@@ -407,12 +429,17 @@ mod tests {
     #[test]
     fn bypass_profile_rotation_propagates_to_meta_service_group() {
         clear_bypass_profile_state_for_test();
-        record_bypass_profile_failure("www.youtube.com:443", 0, 3, "unit-test", &EngineConfig::default());
+        record_bypass_profile_failure(
+            "www.youtube.com:443",
+            0,
+            3,
+            "unit-test",
+            &EngineConfig::default(),
+        );
         assert_eq!(destination_bypass_profile_idx("i.ytimg.com:443", 3), 1);
         assert_eq!(destination_bypass_profile_idx("yt3.ggpht.com:443", 3), 1);
         clear_bypass_profile_state_for_test();
     }
-
 
     #[test]
     fn adaptive_bypass_multi_profile_success_pins_winner() {
@@ -481,12 +508,12 @@ mod tests {
         let candidates = vec![direct.clone(), bypass];
 
         record_route_connected(route_key, &direct, &EngineConfig::default());
-        let (race, reason) = route_race_decision(443, route_key, &candidates, &EngineConfig::default());
+        let (race, reason) =
+            route_race_decision(443, route_key, &candidates, &EngineConfig::default());
         assert!(race);
         assert_eq!(reason, RouteRaceReason::NoWinner);
         clear_route_state_for_test(route_key);
     }
-
 
     #[test]
     fn adaptive_route_candidates_include_bypass_for_public_tls_domain() {
@@ -528,7 +555,13 @@ mod tests {
         };
         let target = TargetAddr::Domain("i.ytimg.com".to_owned());
         let route_key = route_decision_key("i.ytimg.com:443", &target, &EngineConfig::default());
-        let candidates = select_route_candidates(&relay_opts, &target, 443, &route_key, &EngineConfig::default());
+        let candidates = select_route_candidates(
+            &relay_opts,
+            &target,
+            443,
+            &route_key,
+            &EngineConfig::default(),
+        );
         assert!(candidates.iter().any(|c| c.kind == RouteKind::Bypass));
     }
 
@@ -542,8 +575,15 @@ mod tests {
             ..RelayOptions::default()
         };
         let target = TargetAddr::Domain("www.gstatic.com".to_owned());
-        let route_key = route_decision_key("www.gstatic.com:443", &target, &EngineConfig::default());
-        let candidates = select_route_candidates(&relay_opts, &target, 443, &route_key, &EngineConfig::default());
+        let route_key =
+            route_decision_key("www.gstatic.com:443", &target, &EngineConfig::default());
+        let candidates = select_route_candidates(
+            &relay_opts,
+            &target,
+            443,
+            &route_key,
+            &EngineConfig::default(),
+        );
         assert!(candidates.iter().any(|c| c.kind == RouteKind::Bypass));
     }
 
@@ -554,8 +594,15 @@ mod tests {
             ..RelayOptions::default()
         };
         let target = TargetAddr::Domain("cdn.localizeapi.com".to_owned());
-        let route_key = route_decision_key("cdn.localizeapi.com:443", &target, &EngineConfig::default());
-        let candidates = select_route_candidates(&relay_opts, &target, 443, &route_key, &EngineConfig::default());
+        let route_key =
+            route_decision_key("cdn.localizeapi.com:443", &target, &EngineConfig::default());
+        let candidates = select_route_candidates(
+            &relay_opts,
+            &target,
+            443,
+            &route_key,
+            &EngineConfig::default(),
+        );
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].kind, RouteKind::Direct);
         assert_ne!(candidates[0].source, "noise-bypass");
@@ -569,16 +616,28 @@ mod tests {
         };
 
         let localhost = TargetAddr::Domain("localhost".to_owned());
-        let localhost_key = route_decision_key("localhost:443", &localhost, &EngineConfig::default());
-        let localhost_candidates =
-            select_route_candidates(&relay_opts, &localhost, 443, &localhost_key, &EngineConfig::default());
+        let localhost_key =
+            route_decision_key("localhost:443", &localhost, &EngineConfig::default());
+        let localhost_candidates = select_route_candidates(
+            &relay_opts,
+            &localhost,
+            443,
+            &localhost_key,
+            &EngineConfig::default(),
+        );
         assert_eq!(localhost_candidates.len(), 1);
         assert_eq!(localhost_candidates[0].kind, RouteKind::Direct);
         assert_eq!(localhost_candidates[0].source, "noise-bypass");
 
         let local = TargetAddr::Domain("printer.local".to_owned());
         let local_key = route_decision_key("printer.local:443", &local, &EngineConfig::default());
-        let local_candidates = select_route_candidates(&relay_opts, &local, 443, &local_key, &EngineConfig::default());
+        let local_candidates = select_route_candidates(
+            &relay_opts,
+            &local,
+            443,
+            &local_key,
+            &EngineConfig::default(),
+        );
         assert_eq!(local_candidates.len(), 1);
         assert_eq!(local_candidates[0].kind, RouteKind::Direct);
         assert_eq!(local_candidates[0].source, "noise-bypass");
@@ -595,7 +654,6 @@ mod tests {
             Some("162.159.129.233".parse().expect("ip"))
         );
     }
-
 
     #[test]
     fn route_capability_filter_skips_temporarily_weak_ipv6_bypass() {
@@ -629,8 +687,18 @@ mod tests {
         clear_route_state_for_test(route_key);
         let candidate =
             RouteCandidate::bypass("test", "127.0.0.1:19080".parse().expect("addr"), 0, 1);
-        record_route_failure(route_key, &candidate, "unit-failure", &EngineConfig::default());
-        record_route_failure(route_key, &candidate, "unit-failure", &EngineConfig::default());
+        record_route_failure(
+            route_key,
+            &candidate,
+            "unit-failure",
+            &EngineConfig::default(),
+        );
+        record_route_failure(
+            route_key,
+            &candidate,
+            "unit-failure",
+            &EngineConfig::default(),
+        );
         assert!(route_is_temporarily_weak(
             route_key,
             &candidate.route_id(),
@@ -702,4 +770,3 @@ mod tests {
         clear_route_state_for_test(route_key);
     }
 }
-

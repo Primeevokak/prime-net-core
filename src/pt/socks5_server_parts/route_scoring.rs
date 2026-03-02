@@ -1,7 +1,12 @@
 use super::*;
 use crate::config::EngineConfig;
 
-pub(super) fn route_health_score(route_key: &str, candidate: &RouteCandidate, now: u64, cfg: &EngineConfig) -> i64 {
+pub(super) fn route_health_score(
+    route_key: &str,
+    candidate: &RouteCandidate,
+    now: u64,
+    cfg: &EngineConfig,
+) -> i64 {
     let route_id = candidate.route_id();
     let mut bonus = 0i64;
 
@@ -51,7 +56,11 @@ pub(super) fn route_health_score(route_key: &str, candidate: &RouteCandidate, no
     local_score + global_bypass_profile_score(candidate, now, cfg) + bonus
 }
 
-pub(super) fn global_bypass_profile_score(candidate: &RouteCandidate, now: u64, cfg: &EngineConfig) -> i64 {
+pub(super) fn global_bypass_profile_score(
+    candidate: &RouteCandidate,
+    now: u64,
+    cfg: &EngineConfig,
+) -> i64 {
     let route_id = candidate.route_id();
     if !route_id.starts_with("bypass:") {
         return 0;
@@ -81,7 +90,11 @@ pub(super) fn global_bypass_profile_score(candidate: &RouteCandidate, now: u64, 
     0
 }
 
-pub(super) fn bypass_profile_score_from_health(health: &BypassProfileHealth, now: u64, _cfg: &EngineConfig) -> i64 {
+pub(super) fn bypass_profile_score_from_health(
+    health: &BypassProfileHealth,
+    now: u64,
+    _cfg: &EngineConfig,
+) -> i64 {
     let mut score = (health.successes as i64 * 5) - (health.failures as i64 * 6);
     score -= health.connect_failures as i64 * 8;
     score -= health.soft_zero_replies as i64 * 50; // Increased to 50 for faster rotation
@@ -95,7 +108,11 @@ pub(super) fn bypass_profile_score_from_health(health: &BypassProfileHealth, now
     score
 }
 
-pub(super) fn should_reset_bypass_profile_health(health: &BypassProfileHealth, now: u64, cfg: &EngineConfig) -> bool {
+pub(super) fn should_reset_bypass_profile_health(
+    health: &BypassProfileHealth,
+    now: u64,
+    cfg: &EngineConfig,
+) -> bool {
     if health.successes == 0
         && (health.failures > 20 || health.connect_failures > 10)
         && now.saturating_sub(health.last_failure_unix) > 600
@@ -110,7 +127,11 @@ pub(super) fn should_reset_bypass_profile_health(health: &BypassProfileHealth, n
     false
 }
 
-fn bypass_profile_matches_bucket_preference(bucket: &str, candidate: &RouteCandidate, _cfg: &EngineConfig) -> bool {
+fn bypass_profile_matches_bucket_preference(
+    bucket: &str,
+    candidate: &RouteCandidate,
+    _cfg: &EngineConfig,
+) -> bool {
     if candidate.kind != RouteKind::Bypass {
         return false;
     }
@@ -183,6 +204,11 @@ pub(super) fn ordered_route_candidates(
     candidates: Vec<RouteCandidate>,
     cfg: &EngineConfig,
 ) -> Vec<RouteCandidate> {
+    // Safety check: always use direct for PAC server port to avoid recursive proxying hangs.
+    if route_key.contains(":8888|") {
+        return vec![RouteCandidate::direct_with_family("noise-bypass", RouteIpFamily::Any)];
+    }
+
     let now = now_unix_secs();
     let winner = route_winner_for_key(route_key, cfg);
 
@@ -260,16 +286,20 @@ pub(super) fn ordered_route_candidates(
 
     // Integrated ML Adaptive Routing
     if cfg.routing.ml_routing_enabled {
-        let (final_list, _canary) = apply_phase3_ml_override(
-            route_key,
-            filtered,
-            cfg,
-        );
-        
+        let (final_list, _canary) = apply_phase3_ml_override(route_key, filtered, cfg);
+
         return final_list;
     }
 
     filtered
+}
+
+pub fn is_censored_domain(route_key: &str, cfg: &EngineConfig) -> bool {
+    let raw_bucket = host_service_bucket(
+        crate::pt::socks5_server::route_connection::route_destination_key(route_key),
+        cfg,
+    );
+    cfg.routing.censored_groups.keys().any(|g| raw_bucket == *g || raw_bucket == format!("meta-group:{}", g))
 }
 
 pub(super) fn route_race_decision(
@@ -287,13 +317,10 @@ pub(super) fn route_race_decision(
         };
     }
 
-    let bucket = host_service_bucket(crate::pt::socks5_server::route_connection::route_destination_key(route_key), cfg);
-    let is_strictly_censored = matches!(
-        bucket.as_str(),
-        "meta-group:youtube" | "meta-group:discord" | "youtube" | "discord"
-    );
+    let is_censored = is_censored_domain(route_key, cfg);
+    info!(target: "socks5.route", route_key, is_censored, "evaluating race decision");
 
-    if is_strictly_censored {
+    if is_censored {
         return (true, RouteRaceReason::NoWinner);
     }
 
@@ -305,11 +332,7 @@ pub(super) fn route_race_decision(
     if winner.route_id.is_empty() {
         return (true, RouteRaceReason::EmptyWinner);
     }
-    let winner_ttl_secs = if winner.route_id == "direct"
-        && matches!(
-            host_service_bucket(route_key, cfg).as_str(),
-            "meta-group:youtube" | "meta-group:discord"
-        ) {
+    let winner_ttl_secs = if winner.route_id == "direct" && is_censored {
         META_DIRECT_WINNER_TTL_SECS
     } else {
         ROUTE_WINNER_TTL_SECS
@@ -326,7 +349,11 @@ pub(super) fn route_race_decision(
     (false, RouteRaceReason::WinnerHealthy)
 }
 
-pub(super) fn record_route_success(route_key: &str, candidate: &RouteCandidate, cfg: &EngineConfig) {
+pub(super) fn record_route_success(
+    route_key: &str,
+    candidate: &RouteCandidate,
+    cfg: &EngineConfig,
+) {
     let now = now_unix_secs();
     let route_id = candidate.route_id();
     let service_key = route_service_key(route_key, cfg);
@@ -396,9 +423,9 @@ pub(super) fn record_route_failure(
     let per_route = health_map.entry(route_key.to_owned()).or_default();
     let mut entry = per_route.entry(route_id.clone()).or_default();
     entry.failures = entry.failures.saturating_add(1);
-    
+
     let is_soft_failure = matches!(reason, "zero-reply-soft" | "suspicious-zero-reply");
-    
+
     // Aggressive learning for direct connections: if it connects but fails to deliver data,
     // it's almost certainly DPI. Mark it weak immediately.
     if candidate.kind == RouteKind::Direct && is_soft_failure {
@@ -512,7 +539,11 @@ pub(super) fn record_route_failure(
     maybe_flush_classifier_store(false, Arc::new(cfg.clone()));
 }
 
-pub(super) fn record_global_bypass_profile_success(candidate: &RouteCandidate, now: u64, cfg: &EngineConfig) {
+pub(super) fn record_global_bypass_profile_success(
+    candidate: &RouteCandidate,
+    now: u64,
+    cfg: &EngineConfig,
+) {
     let route_id = candidate.route_id();
     if !route_id.starts_with("bypass:") {
         return;
@@ -526,6 +557,7 @@ pub(super) fn record_global_bypass_profile_success(candidate: &RouteCandidate, n
     entry.connect_failures = entry.connect_failures.saturating_sub(1);
     entry.soft_zero_replies = entry.soft_zero_replies.saturating_sub(1);
     entry.io_errors = entry.io_errors.saturating_sub(1);
+    drop(entry);
     maybe_prune_runtime_classifier_state(now, Arc::new(cfg.clone()));
 }
 
@@ -553,6 +585,7 @@ pub(super) fn record_global_bypass_profile_failure(
     if reason == "io-error" {
         entry.io_errors = entry.io_errors.saturating_add(1);
     }
+    drop(entry);
     maybe_prune_runtime_classifier_state(now, Arc::new(cfg.clone()));
 }
 
@@ -563,11 +596,15 @@ pub(super) fn select_route_candidates(
     destination: &str,
     cfg: &EngineConfig,
 ) -> Vec<RouteCandidate> {
-    let destination_key = crate::pt::socks5_server::route_connection::route_destination_key(destination);
+    let destination_key =
+        crate::pt::socks5_server::route_connection::route_destination_key(destination);
     let host_lower = split_host_port_for_connect(destination_key)
         .map(|(host, _)| host.trim().trim_end_matches('.').to_ascii_lowercase())
         .unwrap_or_else(|| destination_key.to_ascii_lowercase());
     let is_noise = host_lower == "localhost"
+        || host_lower == "127.0.0.1"
+        || host_lower == "::1"
+        || host_lower == "[::1]"
         || host_lower.ends_with(".local")
         || host_lower.ends_with(".lan")
         || host_lower.contains("msftconnecttest")
@@ -600,7 +637,7 @@ pub(super) fn select_route_candidates(
 
 pub(super) fn host_service_bucket(host: &str, cfg: &EngineConfig) -> String {
     let host = host.to_ascii_lowercase();
-    
+
     for (group_name, patterns) in &cfg.routing.censored_groups {
         for pattern in patterns {
             if host.contains(pattern) {
@@ -626,7 +663,11 @@ pub(super) fn host_service_bucket(host: &str, cfg: &EngineConfig) -> String {
     registrable_domain_bucket(&host).unwrap_or(host)
 }
 
-pub(super) fn destination_bypass_profile_idx_known(destination: &str, total: u8, cfg: &EngineConfig) -> Option<u8> {
+pub(super) fn destination_bypass_profile_idx_known(
+    destination: &str,
+    total: u8,
+    cfg: &EngineConfig,
+) -> Option<u8> {
     if total <= 1 {
         return Some(0);
     }
@@ -655,7 +696,12 @@ pub(super) fn destination_bypass_profile_idx_known(destination: &str, total: u8,
     None
 }
 
-pub(super) fn record_route_connected(route_key: &str, candidate: &RouteCandidate, cfg: &EngineConfig) {
+#[cfg(test)]
+pub(super) fn record_route_connected(
+    route_key: &str,
+    candidate: &RouteCandidate,
+    cfg: &EngineConfig,
+) {
     // Do not pre-pin adaptive winners: TCP connect can succeed while
     // TLS still gets blocked, which causes temporary route stickiness.
     // This is especially harmful for YouTube/Discord where a transient direct
@@ -793,11 +839,15 @@ pub(super) fn bypass_profile_health_key(route_id: &str, family: RouteIpFamily) -
 }
 
 pub(super) fn bypass_profile_key(destination: &str, cfg: &EngineConfig) -> String {
-    route_state_key(crate::pt::socks5_server::route_connection::route_destination_key(destination), cfg)
+    route_state_key(
+        crate::pt::socks5_server::route_connection::route_destination_key(destination),
+        cfg,
+    )
 }
 
 pub(super) fn bypass_profile_legacy_service_key(destination: &str, _cfg: &EngineConfig) -> String {
-    let destination = crate::pt::socks5_server::route_connection::route_destination_key(destination);
+    let destination =
+        crate::pt::socks5_server::route_connection::route_destination_key(destination);
     if let Some((host, port)) = split_host_port_for_connect(destination) {
         let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
         if !normalized_host.is_empty() {
@@ -812,8 +862,12 @@ pub(super) fn bypass_profile_legacy_service_key(destination: &str, _cfg: &Engine
     destination.trim().to_ascii_lowercase()
 }
 
-pub(super) fn bypass_profile_meta_service_key(destination: &str, cfg: &EngineConfig) -> Option<String> {
-    let destination = crate::pt::socks5_server::route_connection::route_destination_key(destination);
+pub(super) fn bypass_profile_meta_service_key(
+    destination: &str,
+    cfg: &EngineConfig,
+) -> Option<String> {
+    let destination =
+        crate::pt::socks5_server::route_connection::route_destination_key(destination);
     let (host, port) = split_host_port_for_connect(destination)?;
     let normalized_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
     if normalized_host.is_empty() || parse_ip_literal(&normalized_host).is_some() {
@@ -925,7 +979,9 @@ pub fn route_race_launch_candidates(
     cfg: &EngineConfig,
 ) -> Vec<RouteCandidate> {
     let bucket = host_service_bucket(route_key, cfg);
-    let limit = if matches!(bucket.as_str(), "meta-group:youtube" | "meta-group:discord") {
+    let is_censored = cfg.routing.censored_groups.keys().any(|g| bucket == *g || bucket == format!("meta-group:{}", g));
+    
+    let limit = if is_censored {
         8
     } else {
         ROUTE_RACE_MAX_CANDIDATES
@@ -937,15 +993,26 @@ pub fn route_race_candidate_delay_ms(
     idx: usize,
     candidate: &RouteCandidate,
     direct_present: bool,
-    _route_key: &str,
+    route_key: &str,
+    cfg: &EngineConfig,
 ) -> u64 {
     if idx == 0 {
         return 0;
     }
+
+    let bucket = host_service_bucket(route_key, cfg);
+    let is_censored = cfg.routing.censored_groups.keys().any(|g| bucket == *g || bucket == format!("meta-group:{}", g));
+
     let mut delay = (idx as u64) * ROUTE_RACE_BASE_DELAY_MS;
-    if direct_present && candidate.kind == RouteKind::Bypass {
+    
+    // For non-censored domains, we give 'direct' a small headstart to avoid unnecessary bypass usage.
+    // For censored domains, we want true parallel probing without delays.
+    if !is_censored && direct_present && candidate.kind == RouteKind::Bypass {
         delay += ROUTE_RACE_DIRECT_HEADSTART_MS;
-        if candidate.source == "builtin" || candidate.source == "learned-domain" || candidate.source == "learned-ip" {
+        if candidate.source == "builtin"
+            || candidate.source == "learned-domain"
+            || candidate.source == "learned-ip"
+        {
             delay += ROUTE_RACE_BYPASS_EXTRA_DELAY_BUILTIN_MS;
         } else {
             delay += ROUTE_RACE_BYPASS_EXTRA_DELAY_MS;
@@ -957,14 +1024,22 @@ pub fn route_race_candidate_delay_ms(
 pub fn maybe_mark_route_capability_failure(candidate: &RouteCandidate, e: &EngineError) {
     if let EngineError::Io(ref io_err) = e {
         if io_err.kind() == std::io::ErrorKind::ConnectionRefused {
-            mark_route_capability_weak(candidate.kind, candidate.family, "connection-refused", ROUTE_CAPABILITY_BYPASS_REP03_SECS);
+            mark_route_capability_weak(
+                candidate.kind,
+                candidate.family,
+                "connection-refused",
+                ROUTE_CAPABILITY_BYPASS_REP03_SECS,
+            );
         }
     }
 }
 
 pub fn should_ignore_route_failure(_candidate: &RouteCandidate, e: &EngineError) -> bool {
     let msg = e.to_string().to_lowercase();
-    msg.contains("unreachable") || msg.contains("timeout") || msg.contains("sinkhole") || msg.contains("unspecified")
+    msg.contains("unreachable")
+        || msg.contains("timeout")
+        || msg.contains("sinkhole")
+        || msg.contains("unspecified")
 }
 
 pub(super) fn select_bypass_candidates(
@@ -974,8 +1049,8 @@ pub(super) fn select_bypass_candidates(
 ) -> Vec<(SocketAddr, u8, u8)> {
     if !relay_opts.bypass_socks5_pool.is_empty() {
         let total = relay_opts.bypass_socks5_pool.len().min(255) as u8;
-        let preferred =
-            destination_bypass_profile_idx_known(destination, total, cfg).unwrap_or_else(|| {
+        let preferred = destination_bypass_profile_idx_known(destination, total, cfg)
+            .unwrap_or_else(|| {
                 (NEXT_BYPASS_POOL_IDX.fetch_add(1, Ordering::Relaxed) % u64::from(total)) as u8
             });
         let mut out = Vec::with_capacity(total as usize);

@@ -415,13 +415,21 @@ fn prune_runtime_classifier_state_with_caps(
     keep_global_bypass_entries: usize,
     cfg: &EngineConfig,
 ) -> (usize, usize) {
-    let removed_destinations = prune_destination_runtime_state(max_dest_entries, keep_dest_entries, cfg);
-    let removed_global_profiles =
-        prune_global_bypass_runtime_state(max_global_bypass_entries, keep_global_bypass_entries, cfg);
+    let removed_destinations =
+        prune_destination_runtime_state(max_dest_entries, keep_dest_entries, cfg);
+    let removed_global_profiles = prune_global_bypass_runtime_state(
+        max_global_bypass_entries,
+        keep_global_bypass_entries,
+        cfg,
+    );
     (removed_destinations, removed_global_profiles)
 }
 
-fn prune_destination_runtime_state(max_entries: usize, keep_entries: usize, _cfg: &EngineConfig) -> usize {
+fn prune_destination_runtime_state(
+    max_entries: usize,
+    keep_entries: usize,
+    _cfg: &EngineConfig,
+) -> usize {
     if max_entries == 0 {
         return 0;
     }
@@ -488,13 +496,17 @@ fn prune_destination_runtime_state(max_entries: usize, keep_entries: usize, _cfg
         route_winner.remove(key);
         route_health.remove(key);
     }
-    
+
     ml_shadow::prune_ml_state(now_unix_secs());
 
     evict_keys.len()
 }
 
-fn prune_global_bypass_runtime_state(max_entries: usize, keep_entries: usize, _cfg: &EngineConfig) -> usize {
+fn prune_global_bypass_runtime_state(
+    max_entries: usize,
+    keep_entries: usize,
+    _cfg: &EngineConfig,
+) -> usize {
     if max_entries == 0 {
         return 0;
     }
@@ -547,7 +559,6 @@ pub(super) static CLASSIFIER_STORE_CFG: OnceLock<Option<ClassifierStoreConfig>> 
 pub(super) static CLASSIFIER_STORE_LOADED: AtomicBool = AtomicBool::new(false);
 pub(super) static CLASSIFIER_STORE_DIRTY: AtomicBool = AtomicBool::new(false);
 pub(super) static CLASSIFIER_STORE_LAST_FLUSH_UNIX: AtomicU64 = AtomicU64::new(0);
-use super::*;
 use crate::config::EngineConfig;
 
 pub(super) const CLASSIFIER_PERSIST_DEBOUNCE_SECS: u64 = 30;

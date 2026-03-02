@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use prime_net_engine_core::anticensorship::ResolverChain;
-use prime_net_engine_core::config::{AntiCensorshipConfig, TrojanPtConfig, EngineConfig};
+use prime_net_engine_core::config::{AntiCensorshipConfig, EngineConfig, TrojanPtConfig};
 use prime_net_engine_core::pt::socks5_server::start_socks5_server;
 use prime_net_engine_core::pt::trojan::TrojanOutbound;
 use prime_net_engine_core::pt::DynOutbound;

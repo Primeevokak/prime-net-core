@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
@@ -61,11 +61,11 @@ impl LogViewer {
 
     pub fn add_log(&self, entry: LogEntry) {
         let entry_size = entry.approx_size();
-        
+
         // 1. Add to the global log buffer
         let mut logs = self.logs.write();
         let mut current_size = self.approx_size_bytes.load(Ordering::Relaxed);
-        
+
         let mut removed_any = false;
         while current_size + entry_size > MAX_LOGS_SIZE_BYTES && !logs.is_empty() {
             if let Some(oldest) = logs.pop_front() {
@@ -76,7 +76,8 @@ impl LogViewer {
 
         current_size += entry_size;
         logs.push_back(entry.clone());
-        self.approx_size_bytes.store(current_size, Ordering::Relaxed);
+        self.approx_size_bytes
+            .store(current_size, Ordering::Relaxed);
 
         // 2. Incremental update of the filtered cache if cache isn't already fully dirty
         if !self.cache_dirty.load(Ordering::Relaxed) && !removed_any {
@@ -95,7 +96,7 @@ impl LogViewer {
         let filter_level = *self.filter_level.read();
         let category_filter = self.category_filter.read();
         let search_query = self.search_query.read();
-        
+
         if let Some(level) = filter_level {
             if level_rank(entry.level) > level_rank(level) {
                 return false;
@@ -109,13 +110,13 @@ impl LogViewer {
         if search_query.is_empty() {
             return true;
         }
-        
+
         if self.use_regex.load(Ordering::Relaxed) {
             if let Ok(re) = Regex::new(&search_query) {
                 return re.is_match(&entry.message) || re.is_match(&entry.target);
             }
         }
-        
+
         entry.message.contains(&*search_query) || entry.target.contains(&*search_query)
     }
 

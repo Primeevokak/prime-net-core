@@ -3,16 +3,93 @@ use super::*;
 pub async fn relay_bidirectional(
     client: &mut TcpStream,
     upstream: &mut BoxStream,
-    _relay_opts: RelayOptions,
+    relay_opts: RelayOptions,
+    initial_client_to_upstream: Vec<u8>,
     initial_upstream_to_client: Vec<u8>,
+    client_data_already_sent: bool,
 ) -> std::io::Result<(u64, u64)> {
+    let initial_u2c_len = initial_upstream_to_client.len() as u64;
+    let initial_c2u_len = if client_data_already_sent {
+        0
+    } else {
+        initial_client_to_upstream.len() as u64
+    };
+
+    if !client_data_already_sent && !initial_client_to_upstream.is_empty() {
+        warn!(target: "socks5.relay", bytes = initial_client_to_upstream.len(), "injecting initial client data into upstream");
+        if relay_opts.fragment_client_hello && is_tls_client_hello(&initial_client_to_upstream) {
+            let _ =
+                fragment_and_send_tls_hello(&initial_client_to_upstream, upstream, &relay_opts)
+                    .await?;
+        } else {
+            upstream.write_all(&initial_client_to_upstream).await?;
+        }
+        upstream.flush().await?;
+    }
     if !initial_upstream_to_client.is_empty() {
+        warn!(target: "socks5.relay", bytes = initial_upstream_to_client.len(), "injecting initial upstream data into client");
         client.write_all(&initial_upstream_to_client).await?;
         client.flush().await?;
     }
 
     let (c2u, u2c) = tokio::io::copy_bidirectional(client, upstream).await?;
-    Ok((c2u, u2c + initial_upstream_to_client.len() as u64))
+    info!(target: "socks5.relay", c2u, u2c, "relay session finished");
+    Ok((c2u + initial_c2u_len, u2c + initial_u2c_len))
+}
+
+pub async fn relay_bidirectional_with_first_byte_timeout(
+    client: &mut TcpStream,
+    upstream: &mut BoxStream,
+    relay_opts: RelayOptions,
+    initial_client_to_upstream: Vec<u8>,
+    initial_upstream_to_client: Vec<u8>,
+    client_data_already_sent: bool,
+    timeout_duration: std::time::Duration,
+) -> std::io::Result<(u64, u64)> {
+    let initial_u2c_len = initial_upstream_to_client.len() as u64;
+    let initial_c2u_len = if client_data_already_sent {
+        0
+    } else {
+        initial_client_to_upstream.len() as u64
+    };
+
+    if !client_data_already_sent && !initial_client_to_upstream.is_empty() {
+        info!(target: "socks5.relay", bytes = initial_client_to_upstream.len(), "injecting initial client data into upstream (timeout mode)");
+        if relay_opts.fragment_client_hello && is_tls_client_hello(&initial_client_to_upstream) {
+            let _ =
+                fragment_and_send_tls_hello(&initial_client_to_upstream, upstream, &relay_opts)
+                    .await?;
+        } else {
+            upstream.write_all(&initial_client_to_upstream).await?;
+        }
+        upstream.flush().await?;
+    }
+    if initial_u2c_len > 0 {
+        info!(target: "socks5.relay", bytes = initial_u2c_len, "injecting initial upstream data into client (timeout mode)");
+        client.write_all(&initial_upstream_to_client).await?;
+        client.flush().await?;
+    }
+
+    if initial_u2c_len == 0 {
+        let mut first_byte = [0u8; 1];
+        match tokio::time::timeout(timeout_duration, upstream.read(&mut first_byte)).await {
+            Ok(Ok(0)) => return Ok((initial_c2u_len, 0)),
+            Ok(Ok(n)) => {
+                info!(target: "socks5.relay", "first byte received from upstream");
+                client.write_all(&first_byte[..n]).await?;
+                client.flush().await?;
+                let (c2u, u2c) = tokio::io::copy_bidirectional(client, upstream).await?;
+                return Ok((c2u + initial_c2u_len, u2c + n as u64));
+            }
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "first byte timeout"));
+            }
+        }
+    }
+
+    let (c2u, u2c) = tokio::io::copy_bidirectional(client, upstream).await?;
+    Ok((c2u + initial_c2u_len, u2c + initial_u2c_len))
 }
 
 pub(super) fn is_tls_client_hello(data: &[u8]) -> bool {
@@ -64,6 +141,7 @@ pub(super) async fn fragment_and_send_tls_hello(
         upstream_w.write_all(&data[pos..]).await?;
         sent += (data.len() - pos) as u64;
     }
+    upstream_w.flush().await?;
 
     Ok(sent)
 }
@@ -271,13 +349,6 @@ pub fn rewrite_http_forward_head(headers: &str, target: &HttpForwardTarget) -> S
     lines.join("\r\n")
 }
 
-pub fn is_expected_disconnect(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        ErrorKind::ConnectionReset | ErrorKind::BrokenPipe | ErrorKind::ConnectionAborted
-    )
-}
-
 pub fn route_capability_slot_mut(
     caps: &mut RouteCapabilities,
     kind: RouteKind,
@@ -364,7 +435,11 @@ pub fn should_penalize_disconnect_as_soft_zero_reply(
         return false;
     }
     matches!(
-        host_service_bucket(crate::pt::socks5_server::route_connection::route_destination_key(route_key), cfg).as_str(),
+        host_service_bucket(
+            crate::pt::socks5_server::route_connection::route_destination_key(route_key),
+            cfg
+        )
+        .as_str(),
         "meta-group:youtube" | "meta-group:discord" | "meta-group:google"
     )
 }

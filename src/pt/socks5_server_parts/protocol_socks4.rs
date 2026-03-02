@@ -89,7 +89,7 @@ pub(super) async fn handle_socks4(
         return Err(e.into());
     }
     let tuned = tune_relay_for_target(relay_opts, port, &destination, true, false);
-    match relay_bidirectional(&mut tcp, &mut out, tuned.options.clone(), Vec::new()).await {
+    match relay_bidirectional(&mut tcp, &mut out, tuned.options.clone(), Vec::new(), Vec::new(), false).await {
         Ok((bytes_client_to_upstream, bytes_upstream_to_client)) => {
             if should_skip_empty_session_scoring(bytes_client_to_upstream, bytes_upstream_to_client)
             {

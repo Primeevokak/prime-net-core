@@ -343,6 +343,11 @@ async fn start_packet_bypass_process(bin: &Path, profile: &PacketBypassProfile) 
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
+        .env("HTTP_PROXY", "")
+        .env("HTTPS_PROXY", "")
+        .env("ALL_PROXY", "")
+        .env("no_proxy", "localhost,127.0.0.1")
+        .env("NO_PROXY", "localhost,127.0.0.1")
         .kill_on_drop(true);
     let mut child = cmd.spawn().map_err(EngineError::Io)?;
     let mut log_tasks = Vec::new();

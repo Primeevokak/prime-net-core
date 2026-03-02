@@ -121,7 +121,14 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
     let outbound =
         Arc::new(DirectOutbound::new(resolver).with_first_packet_ttl(cfg.evasion.first_packet_ttl));
 
-    let guard = start_socks5_server(&opts.bind, outbound, Arc::new(cfg.clone()), opts.silent_drop, relay_opts).await?;
+    let guard = start_socks5_server(
+        &opts.bind,
+        outbound,
+        Arc::new(cfg.clone()),
+        opts.silent_drop,
+        relay_opts,
+    )
+    .await?;
     println!("SOCKS5 listening on {}", guard.listen_addr());
     println!("Hint (TUN): run tun2socks and point it to this SOCKS5 endpoint.");
 

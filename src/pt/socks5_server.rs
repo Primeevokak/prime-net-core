@@ -124,10 +124,10 @@ use route_scoring::*;
 use state_and_startup::*;
 
 pub(super) use ml_shadow::{begin_route_decision_event, complete_route_outcome_event};
+pub(super) use protocol_handlers::tune_relay_for_target;
 pub(super) use route_scoring::{
-    maybe_mark_route_capability_failure, route_race_candidate_delay_ms,
+    is_censored_domain, maybe_mark_route_capability_failure, route_race_candidate_delay_ms,
     route_race_launch_candidates, should_ignore_route_failure,
 };
-pub(super) use protocol_handlers::tune_relay_for_target;
 
 pub use state_and_startup::{start_socks5_server, RelayOptions, Socks5ServerGuard};

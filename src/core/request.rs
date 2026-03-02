@@ -95,7 +95,9 @@ pub struct ContentRangeBounds {
 /// Parses a `reqwest::header::HeaderMap` for `Content-Range`.
 ///
 /// Returns `None` if the header is missing, malformed, or if the unit is not `bytes`.
-pub fn parse_content_range_bounds(headers: &reqwest::header::HeaderMap) -> Option<ContentRangeBounds> {
+pub fn parse_content_range_bounds(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<ContentRangeBounds> {
     // Content-Range: bytes 0-0/12345
     let v = headers
         .get(reqwest::header::CONTENT_RANGE)?

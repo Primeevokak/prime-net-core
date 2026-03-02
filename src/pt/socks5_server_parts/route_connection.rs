@@ -13,17 +13,17 @@ pub async fn connect_route_candidate(
 ) -> Result<BoxStream> {
     match candidate.kind {
         RouteKind::Direct => {
-            let resolver = outbound.resolver().ok_or_else(|| EngineError::Internal("outbound resolver missing".to_owned()))?;
+            let resolver = outbound
+                .resolver()
+                .ok_or_else(|| EngineError::Internal("outbound resolver missing".to_owned()))?;
             let direct = DirectOutbound::new(resolver);
-            direct
-                .connect((*target).clone())
-                .await
+            direct.connect((*target).clone()).await
         }
         RouteKind::Bypass => {
             let bypass_addr = candidate
                 .bypass_addr
                 .ok_or_else(|| EngineError::Config("bypass address missing".to_owned()))?;
-            
+
             connect_bypass_upstream(
                 conn_id,
                 target,
@@ -31,7 +31,7 @@ pub async fn connect_route_candidate(
                 bypass_addr,
                 candidate.bypass_profile_idx,
                 candidate.bypass_profile_total,
-                None, 
+                None,
                 cfg,
                 relay_opts.clone(),
             )
@@ -61,27 +61,6 @@ pub fn is_expected_disconnect(e: &std::io::Error) -> bool {
     )
 }
 
-fn reap_route_race_losers_v2(
-    mut losers: JoinSet<Result<(RouteCandidate, BoxStream)>>,
-    conn_id: u64,
-    target_label: String,
-) {
-    tokio::spawn(async move {
-        while let Some(joined) = losers.join_next().await {
-            if let Ok(Ok((candidate, stream))) = joined {
-                drop(stream);
-                debug!(
-                    target: "socks5",
-                    conn_id,
-                    destination = %target_label,
-                    route = candidate.route_label(),
-                    "closed losing raced route connection"
-                );
-            }
-        }
-    });
-}
-
 pub async fn connect_via_best_route(
     conn_id: u64,
     target: &TargetEndpoint,
@@ -92,10 +71,21 @@ pub async fn connect_via_best_route(
     cfg: &EngineConfig,
     initial_client_data: Option<Vec<u8>>,
 ) -> Result<ConnectedRoute> {
-    let decision_id = begin_route_decision_event(target_label, &candidates, false, cfg);
+    let (race, reason) = route_race_decision(target.port, target_label, &candidates, cfg);
+    record_route_race_decision(race, reason);
+    let decision_id = begin_route_decision_event(target_label, &candidates, race, cfg);
     let initial_data_ref = initial_client_data.as_ref();
 
-    let (race, _reason) = route_race_decision(target.port, target_label, &candidates, cfg);
+    info!(
+        target: "socks5.route",
+        conn_id,
+        target_label,
+        candidates_count = candidates.len(),
+        race,
+        ?reason,
+        "starting route selection"
+    );
+
     if !race {
         // Sequential fallback
         let mut last_err = None;
@@ -112,22 +102,17 @@ pub async fn connect_via_best_route(
             )
             .await
             {
-                Ok(mut stream) => {
-                    if let Some(data) = initial_data_ref {
-                        if candidate.kind == RouteKind::Direct && relay_opts.fragment_client_hello && is_tls_client_hello(data) {
-                            let _ = fragment_and_send_tls_hello(data, &mut stream, relay_opts).await;
-                        } else {
-                            let _ = stream.write_all(data).await;
-                        }
-                    }
+                Ok(stream) => {
                     record_route_success(target_label, &candidate, cfg);
                     record_route_selected(&candidate, false);
                     return Ok(ConnectedRoute {
                         stream,
                         candidate: candidate.clone(),
                         route_key: target_label.to_owned(),
-                        raced: false,
                         decision_id,
+                        initial_client_data: initial_client_data.clone().unwrap_or_default(),
+                        initial_upstream_data: Vec::new(),
+                        client_data_sent: false,
                     });
                 }
                 Err(e) => {
@@ -158,18 +143,16 @@ pub async fn connect_via_best_route(
         }));
     }
 
-    let mut winners = JoinSet::new();
+    let mut winners: JoinSet<Result<(RouteCandidate, BoxStream, Vec<u8>, bool)>> = JoinSet::new();
     let launch = route_race_launch_candidates(&candidates, target_label, cfg);
     let launched_ids: std::collections::HashSet<String> = launch
         .iter()
         .map(|candidate| candidate.route_id())
         .collect();
     let direct_present = candidates.iter().any(|c| c.kind == RouteKind::Direct);
-    
-    let race_start = Instant::now();
 
     for (idx, cand) in launch.into_iter().enumerate() {
-        let delay = route_race_candidate_delay_ms(idx, &cand, direct_present, target_label);
+        let delay = route_race_candidate_delay_ms(idx, &cand, direct_present, target_label, cfg);
         let outbound_c = outbound.clone();
         let target_c = (*target).clone();
         let target_label_c = target_label.to_owned();
@@ -178,9 +161,11 @@ pub async fn connect_via_best_route(
         let cfg_c = cfg.clone();
 
         winners.spawn(async move {
+            let start = Instant::now();
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
+            let cfg_arc = Arc::new(cfg_c.clone());
             let res = connect_route_candidate(
                 conn_id,
                 &target_c,
@@ -188,22 +173,59 @@ pub async fn connect_via_best_route(
                 &cand,
                 outbound_c,
                 &relay_opts_c,
-                Arc::new(cfg_c),
+                cfg_arc,
             )
             .await;
 
+            let connect_elapsed = start.elapsed().as_millis();
+
             match res {
                 Ok(mut stream) => {
-                    if let Some(data) = initial_data_c {
-                        if cand.kind == RouteKind::Direct && relay_opts_c.fragment_client_hello && is_tls_client_hello(&data) {
-                            let _ = fragment_and_send_tls_hello(&data, &mut stream, &relay_opts_c).await;
-                        } else {
-                            let _ = stream.write_all(&data).await;
+                    let mut initial_u2c = Vec::new();
+                    let mut client_data_sent = false;
+
+                    if let Some(ref data) = initial_data_c {
+                        if !data.is_empty() {
+                            // Only perform Data Race verification for Direct routes.
+                            // Bypass routes (local proxies) are verified by TCP connection success only.
+                            if cand.kind == RouteKind::Direct && is_censored_domain(&target_label_c, &cfg_c) {
+                                if let Err(e) = stream.write_all(data).await {
+                                     info!(target: "socks5.route", conn_id, route = cand.route_label(), error = %e, "race worker failed to send initial data");
+                                     return Err(e.into());
+                                }
+                                let _ = stream.flush().await;
+                                client_data_sent = true;
+
+                                let mut buf = [0u8; 1];
+                                if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(2000), stream.read(&mut buf)).await {
+                                    if n > 0 {
+                                        initial_u2c.extend_from_slice(&buf[..n]);
+                                    }
+                                }
+                            }
                         }
                     }
-                    Ok((cand, stream))
+                    info!(
+                        target: "socks5.route",
+                        conn_id,
+                        route = cand.route_label(),
+                        connect_ms = connect_elapsed,
+                        has_initial_u2c = !initial_u2c.is_empty(),
+                        "race worker finished successfully"
+                    );
+                    Ok((cand, stream, initial_u2c, client_data_sent))
                 }
-                Err(e) => Err(e),
+                Err(e) => {
+                    info!(
+                        target: "socks5.route",
+                        conn_id,
+                        route = cand.route_label(),
+                        connect_ms = connect_elapsed,
+                        error = %e,
+                        "race worker connection failed"
+                    );
+                    Err(e)
+                }
             }
         });
     }
@@ -211,7 +233,7 @@ pub async fn connect_via_best_route(
     let mut last_err = None;
 
     while let Some(res) = winners.join_next().await {
-        let (candidate, stream) = match res {
+        let (candidate, stream, initial_u2c, client_data_sent) = match res {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 last_err = Some(e);
@@ -223,52 +245,28 @@ pub async fn connect_via_best_route(
             }
         };
 
-        let bucket = host_service_bucket(target_label, cfg);
-        let is_censored_or_google = matches!(
-            bucket.as_str(),
-            "meta-group:youtube" | "meta-group:discord" | "meta-group:google"
+        info!(
+            target: "socks5.route",
+            conn_id,
+            route = candidate.route_label(),
+            has_initial_data = !initial_u2c.is_empty(),
+            initial_data_len = initial_u2c.len(),
+            "selected race winner"
         );
 
-        if candidate.kind == RouteKind::Direct && is_censored_or_google {
-            let elapsed = race_start.elapsed().as_millis() as u64;
-            if elapsed < 250 {
-                let wait_more = 250 - elapsed;
-                match tokio::time::timeout(Duration::from_millis(wait_more), winners.join_next()).await {
-                    Ok(Some(joined)) => {
-                        if let Ok(Ok((next_cand, next_stream))) = joined {
-                            if next_cand.kind == RouteKind::Bypass {
-                                drop(stream); 
-                                winners.abort_all();
-                                reap_route_race_losers_v2(winners, conn_id, target_label.to_owned());
-                                record_route_success(target_label, &next_cand, cfg);
-                                record_route_selected(&next_cand, true);
-                                return Ok(ConnectedRoute {
-                                    stream: next_stream,
-                                    candidate: next_cand,
-                                    route_key: target_label.to_owned(),
-                                    raced: true,
-                                    decision_id,
-                                });
-                            } else {
-                                drop(next_stream);
-                            }
-                        }
-                    }
-                    _ => {} 
-                }
-            }
-        }
-
-        winners.abort_all();
-        reap_route_race_losers_v2(winners, conn_id, target_label.to_owned());
         record_route_success(target_label, &candidate, cfg);
         record_route_selected(&candidate, true);
+        
+        reap_route_race_losers_v3(winners, conn_id, target_label.to_owned());
+
         return Ok(ConnectedRoute {
             stream,
             candidate,
             route_key: target_label.to_owned(),
-            raced: true,
             decision_id,
+            initial_client_data: initial_client_data.clone().unwrap_or_default(),
+            initial_upstream_data: initial_u2c,
+            client_data_sent,
         });
     }
 
@@ -303,8 +301,10 @@ pub async fn connect_via_best_route(
                     stream,
                     candidate: candidate.clone(),
                     route_key: target_label.to_owned(),
-                    raced: false,
                     decision_id,
+                    initial_client_data: initial_client_data.clone().unwrap_or_default(),
+                    initial_upstream_data: Vec::new(),
+                    client_data_sent: false,
                 });
             }
             Err(e) => {
@@ -334,7 +334,7 @@ pub async fn connect_via_best_route(
     Err(last_err.unwrap_or_else(|| EngineError::Internal("all route candidates failed".to_owned())))
 }
 
-pub async fn handle_socks5_request(
+pub async fn handle_socks5_request_with_target(
     conn_id: u64,
     mut tcp: TcpStream,
     _peer: SocketAddr,
@@ -343,21 +343,12 @@ pub async fn handle_socks5_request(
     relay_opts: Arc<RelayOptions>,
     cfg: Arc<EngineConfig>,
     silent_drop: bool,
+    target: TargetEndpoint,
+    initial_client_data: Vec<u8>,
 ) -> Result<()> {
-    let mut header = [0u8; 3];
-    tcp.read_exact(&mut header).await?;
-    let ver = header[0];
-    let cmd = header[1];
-    if ver != 0x05 || cmd != 0x01 {
-        return silent_or_err(&mut tcp, silent_drop, "socks5 version/cmd mismatch").await;
-    }
-
-    let target = match read_socks5_target_endpoint(&mut tcp).await {
-        Ok(t) => t,
-        Err(e) => return silent_or_err(&mut tcp, silent_drop, &e.to_string()).await,
-    };
     let target_label = route_decision_key(&target.to_string(), &target.addr, &cfg);
-    let candidates = select_route_candidates(&relay_opts, &target.addr, target.port, &target_label, &cfg);
+    let candidates =
+        select_route_candidates(&relay_opts, &target.addr, target.port, &target_label, &cfg);
     let ordered = ordered_route_candidates(&target_label, candidates, &cfg);
 
     match connect_via_best_route(
@@ -368,13 +359,12 @@ pub async fn handle_socks5_request(
         outbound,
         &relay_opts,
         &cfg,
-        None,
+        Some(initial_client_data),
     )
     .await
     {
         Ok(mut connected) => {
-            tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.map_err(EngineError::from)?;
-
+            info!(target: "socks5.route", conn_id, "route connection established, preparing relay");
             let mut tuned = tune_relay_for_target(
                 (*relay_opts).clone(),
                 target.port,
@@ -387,7 +377,30 @@ pub async fn handle_socks5_request(
             }
 
             let relay_started = Instant::now();
-            match relay_bidirectional(&mut tcp, &mut connected.stream, tuned.options, Vec::new()).await {
+            let is_censored = is_censored_domain(&connected.route_key, &cfg);
+
+            let relay_res = if connected.candidate.kind == RouteKind::Direct && is_censored {
+                relay_bidirectional_with_first_byte_timeout(
+                    &mut tcp,
+                    &mut connected.stream,
+                    tuned.options.clone(),
+                    connected.initial_client_data,
+                    connected.initial_upstream_data,
+                    connected.client_data_sent,
+                    Duration::from_secs(7),
+                ).await
+            } else {
+                relay_bidirectional(
+                    &mut tcp, 
+                    &mut connected.stream, 
+                    tuned.options, 
+                    connected.initial_client_data, 
+                    connected.initial_upstream_data,
+                    connected.client_data_sent
+                ).await
+            };
+
+            match relay_res {
                 Ok((c2u, u2c)) => {
                     info!(target: "socks5", conn_id, bytes_c2u = c2u, bytes_u2c = u2c, duration_ms = relay_started.elapsed().as_millis(), "session finished normally");
                     complete_route_outcome_event(
@@ -399,6 +412,34 @@ pub async fn handle_socks5_request(
                         u2c,
                         relay_started.elapsed().as_millis() as u64,
                         "ok",
+                        &cfg,
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    let lifetime_ms = relay_started.elapsed().as_millis() as u64;
+                    warn!(
+                        target: "socks5.route",
+                        conn_id,
+                        route_key = %connected.route_key,
+                        route = connected.candidate.route_label(),
+                        lifetime_ms,
+                        "direct route timed out waiting for first byte; classifying as soft failure"
+                    );
+                    record_route_failure(
+                        &connected.route_key,
+                        &connected.candidate,
+                        "zero-reply-soft",
+                        &cfg,
+                    );
+                    complete_route_outcome_event(
+                        connected.decision_id,
+                        &connected.route_key,
+                        Some(&connected.candidate),
+                        true,
+                        false,
+                        0,
+                        lifetime_ms,
+                        "zero-reply-soft",
                         &cfg,
                     );
                 }
@@ -470,10 +511,12 @@ pub async fn handle_client(
 
     let mut hdr = [0u8; 2];
     if let Err(e) = tokio::time::timeout(Duration::from_secs(5), tcp.read_exact(&mut hdr)).await {
-        debug!(target: "socks5", conn_id, "failed to read SOCKS version/nmethods: {}", e);
+        info!(target: "socks5", conn_id, "failed to read SOCKS version/nmethods: {}", e);
         return Ok(());
     }
-    
+
+    info!(target: "socks5", conn_id, peer = %peer, "initial bytes received: {:02X?}", hdr);
+
     if hdr[0] != 0x05 {
         if hdr[0] == 0 {
             return Ok(());
@@ -493,7 +536,17 @@ pub async fn handle_client(
             .await;
         }
         if hdr[0].is_ascii_alphabetic() {
-            return handle_http_proxy(conn_id, tcp, peer, client_label, outbound, cfg, hdr, relay_opts).await;
+            return handle_http_proxy(
+                conn_id,
+                tcp,
+                peer,
+                client_label,
+                outbound,
+                cfg,
+                hdr,
+                relay_opts,
+            )
+            .await;
         }
         return silent_or_err(&mut tcp, silent_drop, "SOCKS5 invalid version").await;
     }
@@ -504,7 +557,7 @@ pub async fn handle_client(
         warn!(target: "socks5", conn_id, "failed to read auth methods: {}", e);
         return Ok(());
     }
-    
+
     tcp.write_all(&[0x05, 0x00])
         .await
         .map_err(EngineError::Io)?;
@@ -514,43 +567,35 @@ pub async fn handle_client(
         warn!(target: "socks5", conn_id, "failed to read request header: {}", e);
         return Ok(());
     }
-    
+
     if req_hdr[1] != 0x01 {
         warn!(target: "socks5", conn_id, cmd = req_hdr[1], "unsupported SOCKS5 command");
         return silent_or_err(&mut tcp, silent_drop, "SOCKS5 unsupported command").await;
     }
 
-    let target_addr = match req_hdr[3] {
-        0x01 => {
-            let mut ip = [0u8; 4];
-            tcp.read_exact(&mut ip).await.map_err(EngineError::Io)?;
-            TargetAddr::Ip(std::net::IpAddr::V4(ip.into()))
-        }
-        0x03 => {
-            let mut len = [0u8; 1];
-            tcp.read_exact(&mut len).await.map_err(EngineError::Io)?;
-            let mut host = vec![0u8; len[0] as usize];
-            tcp.read_exact(&mut host).await.map_err(EngineError::Io)?;
-            TargetAddr::Domain(String::from_utf8_lossy(&host).into_owned())
-        }
-        0x04 => {
-            let mut ip = [0u8; 16];
-            tcp.read_exact(&mut ip).await.map_err(EngineError::Io)?;
-            TargetAddr::Ip(std::net::IpAddr::V6(ip.into()))
-        }
-        _ => {
-            warn!(target: "socks5", conn_id, atyp = req_hdr[3], "invalid SOCKS5 atyp");
-            return silent_or_err(&mut tcp, silent_drop, "SOCKS5 invalid atyp").await;
-        }
+    let target = match read_socks5_target_endpoint_with_atyp(&mut tcp, req_hdr[3]).await {
+        Ok(t) => t,
+        Err(e) => return silent_or_err(&mut tcp, silent_drop, &e.to_string()).await,
     };
 
-    let mut port_bytes = [0u8; 2];
-    tcp.read_exact(&mut port_bytes).await.map_err(EngineError::Io)?;
-    let port = u16::from_be_bytes(port_bytes);
-    
-    let _target = TargetEndpoint { addr: target_addr, port };
+    // Break protocol deadlock: send SOCKS5 success reply immediately.
+    // This tells the browser it can start sending application data (like TLS Client Hello).
+    tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .map_err(EngineError::from)?;
 
-    handle_socks5_request(
+    // Peek/Read for initial client data (e.g. TLS Client Hello) after the SOCKS5 success is sent.
+    // This enables Data Race verification for the chosen route.
+    let mut peek_buf = [0u8; 2048];
+    let initial_client_data = match tokio::time::timeout(Duration::from_millis(100), tcp.read(&mut peek_buf)).await {
+        Ok(Ok(n)) if n > 0 => {
+            info!(target: "socks5.route", conn_id, bytes = n, "peeked initial client data");
+            peek_buf[..n].to_vec()
+        },
+        _ => Vec::new(),
+    };
+
+    handle_socks5_request_with_target(
         conn_id,
         tcp,
         peer,
@@ -559,7 +604,10 @@ pub async fn handle_client(
         Arc::new(relay_opts),
         cfg,
         silent_drop,
-    ).await
+        target,
+        initial_client_data,
+    )
+    .await
 }
 
 async fn silent_or_err(tcp: &mut TcpStream, silent: bool, msg: &str) -> Result<()> {
@@ -571,11 +619,11 @@ async fn silent_or_err(tcp: &mut TcpStream, silent: bool, msg: &str) -> Result<(
     Err(EngineError::Internal(msg.to_owned()))
 }
 
-pub async fn read_socks5_target_endpoint(tcp: &mut TcpStream) -> Result<TargetEndpoint> {
-    let mut atyp_buf = [0u8; 1];
-    tcp.read_exact(&mut atyp_buf).await.map_err(EngineError::Io)?;
-    
-    let addr = match atyp_buf[0] {
+pub async fn read_socks5_target_endpoint_with_atyp(
+    tcp: &mut TcpStream,
+    atyp: u8,
+) -> Result<TargetEndpoint> {
+    let addr = match atyp {
         0x01 => {
             let mut ip = [0u8; 4];
             tcp.read_exact(&mut ip).await.map_err(EngineError::Io)?;
@@ -597,12 +645,29 @@ pub async fn read_socks5_target_endpoint(tcp: &mut TcpStream) -> Result<TargetEn
     };
 
     let mut port_bytes = [0u8; 2];
-    tcp.read_exact(&mut port_bytes).await.map_err(EngineError::Io)?;
+    tcp.read_exact(&mut port_bytes)
+        .await
+        .map_err(EngineError::Io)?;
     let port = u16::from_be_bytes(port_bytes);
-    
+
     Ok(TargetEndpoint { addr, port })
 }
 
 pub async fn resolve_client_label(peer: SocketAddr, _listen_addr: SocketAddr) -> String {
     format!("client-{}", peer)
+}
+
+fn reap_route_race_losers_v3(
+    mut winners: JoinSet<Result<(RouteCandidate, BoxStream, Vec<u8>, bool)>>,
+    conn_id: u64,
+    target_label: String,
+) {
+    tokio::spawn(async move {
+        while let Some(res) = winners.join_next().await {
+            if let Ok(Ok((cand, stream, _, _))) = res {
+                debug!(target: "socks5", conn_id, route = cand.route_label(), target_label, "closing late race winner");
+                drop(stream);
+            }
+        }
+    });
 }

@@ -240,9 +240,14 @@ pub fn apply_phase3_ml_override(
         return (candidates, decision);
     }
 
-    if let Some(reason) =
-        shadow_phase3_safety_override_reason(route_key, &bucket, &selected_arm, &candidates, now, cfg)
-    {
+    if let Some(reason) = shadow_phase3_safety_override_reason(
+        route_key,
+        &bucket,
+        &selected_arm,
+        &candidates,
+        now,
+        cfg,
+    ) {
         decision.reason = reason;
         return (candidates, decision);
     }
@@ -297,8 +302,12 @@ pub fn apply_phase2_canary_override(
     if !PHASE2_CANARY_ENABLED {
         return (candidates, decision);
     }
-    
-    let is_censored = cfg.routing.censored_groups.keys().any(|g| bucket == *g || bucket == format!("meta-group:{}", g));
+
+    let is_censored = cfg
+        .routing
+        .censored_groups
+        .keys()
+        .any(|g| bucket == *g || bucket == format!("meta-group:{}", g));
     if !is_censored {
         decision.reason = "bucket-not-allowed";
         return (candidates, decision);
@@ -361,10 +370,10 @@ pub fn apply_phase2_canary_override(
 pub fn begin_route_decision_event(
     route_key: &str,
     candidates: &[RouteCandidate],
-    _explore: bool,
+    raced: bool,
     cfg: &EngineConfig,
 ) -> u64 {
-    begin_route_decision_event_with_canary(route_key, candidates, false, None, cfg)
+    begin_route_decision_event_with_canary(route_key, candidates, raced, None, cfg)
 }
 
 pub fn begin_route_decision_event_with_canary(
@@ -443,14 +452,14 @@ pub fn begin_route_decision_event_with_canary(
 
 pub fn complete_route_outcome_event(
     decision_id: u64,
-    route_key: &str,
+    _route_key: &str,
     candidate: Option<&RouteCandidate>,
     connect_ok: bool,
     tls_ok_proxy: bool,
     bytes_u2c: u64,
     lifetime_ms: u64,
     error_class: &str,
-    cfg: &EngineConfig,
+    _cfg: &EngineConfig,
 ) {
     let now = now_unix_secs();
     let pending = ROUTE_DECISION_EVENTS_PENDING.get_or_init(DashMap::new);
@@ -459,8 +468,6 @@ pub fn complete_route_outcome_event(
     let fallback_bucket = "default".to_owned();
     let fallback_host = "unknown".to_owned();
 
-    let host = route_destination_host(route_key);
-    let bucket = shadow_bucket_name(route_key, &host, cfg);
     let route_arm = candidate
         .map(|route| route.route_id())
         .or_else(|| decision.as_ref().map(|event| event.route_arm.clone()))
@@ -577,27 +584,27 @@ pub(super) fn shadow_reward_from_outcome(
     // A plain TCP connect without any usable upstream bytes is not a real success.
     // Treat this as negative evidence so direct "phantom connects" don't dominate.
     if connect_ok && !tls_ok_proxy && bytes_u2c <= 7 {
-        reward -= 45;
+        reward -= 60;
     }
 
     reward += (bytes_u2c.min(256 * 1024) / 16_384) as i64;
 
     if lifetime_ms > 0 && lifetime_ms < 250 && !tls_ok_proxy {
-        reward -= 10;
+        reward -= 15;
     }
 
     if error_class.contains("client-disconnect") && !tls_ok_proxy && bytes_u2c <= 7 {
-        reward -= 20;
+        reward -= 45;
     }
 
     if error_class.contains("timeout") {
-        reward -= 20;
-    } else if error_class.contains("connect-failed") {
         reward -= 30;
+    } else if error_class.contains("connect-failed") {
+        reward -= 40;
     } else if error_class.contains("suspicious-zero-reply")
         || error_class.contains("zero-reply-soft")
     {
-        reward -= 25;
+        reward -= 65;
     }
     reward
 }
@@ -817,20 +824,24 @@ fn shadow_update_canary_slo(
 }
 
 pub(super) fn note_phase2_profile_rotation(destination: &str, cfg: &EngineConfig) {
-    let host = split_host_port_for_connect(crate::pt::socks5_server::route_connection::route_destination_key(destination))
-        .map(|(host, _)| host)
-        .unwrap_or_else(|| crate::pt::socks5_server::route_connection::route_destination_key(destination).to_owned());
+    let host = split_host_port_for_connect(
+        crate::pt::socks5_server::route_connection::route_destination_key(destination),
+    )
+    .map(|(host, _)| host)
+    .unwrap_or_else(|| {
+        crate::pt::socks5_server::route_connection::route_destination_key(destination).to_owned()
+    });
     let bucket = shadow_bucket_name(destination, &host, cfg);
-    
+
     let key = bypass_profile_key(destination, cfg);
     let service_key = bypass_profile_legacy_service_key(destination, cfg);
     let meta_key = bypass_profile_meta_service_key(destination, cfg);
-    
+
     let mut keys = vec![key, service_key];
     if let Some(m) = meta_key {
         keys.push(m);
     }
-    
+
     let map = SHADOW_CANARY_SWITCH_GUARD.get_or_init(DashMap::new);
     let now = now_unix_secs();
     for k in keys {
@@ -879,7 +890,9 @@ pub fn prune_ml_state(now: u64) {
                 stale_keys.push(entry.key().clone());
             }
         }
-        for key in stale_keys { map.remove(&key); }
+        for key in stale_keys {
+            map.remove(&key);
+        }
     }
     if let Some(map) = ROUTE_DECISION_EVENTS_PENDING.get() {
         let mut stale_keys = Vec::new();
@@ -888,7 +901,9 @@ pub fn prune_ml_state(now: u64) {
                 stale_keys.push(*entry.key());
             }
         }
-        for key in stale_keys { map.remove(&key); }
+        for key in stale_keys {
+            map.remove(&key);
+        }
     }
 }
 
@@ -1032,13 +1047,13 @@ fn shadow_arm_prior(bucket: &str, arm: &str) -> ShadowArmPrior {
             _ if bypass_idx > 0 => ShadowArmPrior::with_mean(18),
             _ => ShadowArmPrior::with_mean(0),
         },
-        "google-common" => match arm {
+        "google" => match arm {
             // In blocked regions, direct often "connects" but dies before usable TLS traffic.
-            // Biasing a bit towards bypass reduces long cold-start degradation.
-            "direct" => ShadowArmPrior::with_mean(18),
-            "bypass:1" => ShadowArmPrior::with_mean(32),
-            "bypass:2" => ShadowArmPrior::with_mean(22),
-            _ if bypass_idx > 0 => ShadowArmPrior::with_mean(12),
+            // Biasing towards bypass reduces long cold-start degradation.
+            "direct" => ShadowArmPrior::with_mean(-20),
+            "bypass:1" => ShadowArmPrior::with_mean(55),
+            "bypass:2" => ShadowArmPrior::with_mean(40),
+            _ if bypass_idx > 0 => ShadowArmPrior::with_mean(15),
             _ => ShadowArmPrior::with_mean(0),
         },
         "ads-noise" => match arm {
@@ -1057,13 +1072,15 @@ fn shadow_arm_prior(bucket: &str, arm: &str) -> ShadowArmPrior {
 }
 
 fn shadow_bucket_name(route_key: &str, host: &str, cfg: &EngineConfig) -> String {
-    if crate::pt::socks5_server::is_noise_probe_https_destination(crate::pt::socks5_server::route_connection::route_destination_key(route_key)) {
+    if crate::pt::socks5_server::is_noise_probe_https_destination(
+        crate::pt::socks5_server::route_connection::route_destination_key(route_key),
+    ) {
         return "ads-noise".to_owned();
     }
     match host_service_bucket(host, cfg).as_str() {
         "meta-group:youtube" => "youtube".to_owned(),
         "meta-group:discord" => "discord".to_owned(),
-        "meta-group:google" => "google-common".to_owned(),
+        "meta-group:google" => "google".to_owned(),
         _ => "default".to_owned(),
     }
 }

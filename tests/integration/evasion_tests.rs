@@ -4,8 +4,8 @@ use tokio::net::TcpListener;
 use tokio::time::{timeout, Duration};
 
 use prime_net_engine_core::anticensorship::ResolverChain;
-use prime_net_engine_core::pt::direct::DirectOutbound;
 use prime_net_engine_core::config::EngineConfig;
+use prime_net_engine_core::pt::direct::DirectOutbound;
 use prime_net_engine_core::pt::socks5_server::{start_socks5_server, RelayOptions};
 
 #[tokio::test]
@@ -40,9 +40,15 @@ async fn test_randomized_fragmentation_and_window_size() {
         ..RelayOptions::default()
     };
 
-    let server = start_socks5_server("127.0.0.1:0", outbound, Arc::new(EngineConfig::default()), false, opts)
-        .await
-        .unwrap();
+    let server = start_socks5_server(
+        "127.0.0.1:0",
+        outbound,
+        Arc::new(EngineConfig::default()),
+        false,
+        opts,
+    )
+    .await
+    .unwrap();
     let proxy_addr = server.listen_addr();
 
     // Test connection through SOCKS5 with evasion
