@@ -256,7 +256,7 @@ async fn trojan_outbound_via_local_socks5_can_proxy_http() -> Result<()> {
     ));
 
     let socks = start_socks5_server(
-        "127.0.0.1:0",
+        "127.0.0.1:0".parse().unwrap(),
         outbound,
         Arc::new(EngineConfig::default()),
         true,

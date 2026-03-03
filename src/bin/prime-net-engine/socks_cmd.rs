@@ -121,8 +121,9 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
     let outbound =
         Arc::new(DirectOutbound::new(resolver).with_first_packet_ttl(cfg.evasion.first_packet_ttl));
 
+    let bind_addr: std::net::SocketAddr = opts.bind.parse().map_err(|e| EngineError::Config(format!("invalid bind address: {}", e)))?;
     let guard = start_socks5_server(
-        &opts.bind,
+        bind_addr,
         outbound,
         Arc::new(cfg.clone()),
         opts.silent_drop,
@@ -189,7 +190,7 @@ fn build_direct_relay_options(cfg: &EngineConfig) -> RelayOptions {
         fragment_budget_bytes: cfg.evasion.fragment_budget_bytes.clamp(1024, 128 * 1024),
         tcp_window_size: cfg.evasion.tcp_window_size as u16,
         classifier_persist_enabled: cfg.evasion.classifier_persist_enabled,
-        classifier_cache_path: cfg.evasion.classifier_cache_path.clone(),
+        classifier_cache_path: Some(cfg.evasion.classifier_cache_path.clone().into()),
         classifier_entry_ttl_secs: cfg.evasion.classifier_entry_ttl_secs,
         strategy_race_enabled: cfg.evasion.strategy_race_enabled,
         ..RelayOptions::default()

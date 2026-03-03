@@ -41,7 +41,7 @@ async fn test_randomized_fragmentation_and_window_size() {
     };
 
     let server = start_socks5_server(
-        "127.0.0.1:0",
+        "127.0.0.1:0".parse().unwrap(),
         outbound,
         Arc::new(EngineConfig::default()),
         false,

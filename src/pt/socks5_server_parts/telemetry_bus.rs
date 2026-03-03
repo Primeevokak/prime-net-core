@@ -1,50 +1,20 @@
-use super::*;
-use tokio::sync::mpsc;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use tracing::info;
+
+use crate::config::EngineConfig;
+use crate::pt::socks5_server::*;
 
 pub enum TelemetryEvent {
-    RouteSuccess {
-        route_key: String,
-        candidate: RouteCandidate,
-    },
-    RouteFailure {
-        route_key: String,
-        candidate: RouteCandidate,
-        reason: &'static str,
-    },
-    GlobalBypassSuccess {
-        candidate: RouteCandidate,
-    },
-    GlobalBypassFailure {
-        candidate: RouteCandidate,
-        reason: &'static str,
-    },
-    DestinationSuccess {
-        destination: String,
-        stage: u8,
-    },
-    DestinationFailure {
-        destination: String,
-        signal: BlockingSignal,
-        stage: u8,
-    },
-    MlDecision {
-        route_key: String,
-        candidates: Vec<RouteCandidate>,
-        raced: bool,
-        canary: Option<ml_shadow::ShadowCanaryDecision>,
-        decision_id: u64,
-    },
-    MlOutcome {
-        decision_id: u64,
-        candidate: Option<RouteCandidate>,
-        connect_ok: bool,
-        tls_ok_proxy: bool,
-        bytes_u2c: u64,
-        lifetime_ms: u64,
-        error_class: String,
-    },
+    RouteSuccess { route_key: String, candidate: RouteCandidate },
+    RouteFailure { route_key: String, candidate: RouteCandidate, reason: &'static str },
+    GlobalBypassSuccess { candidate: RouteCandidate },
+    GlobalBypassFailure { candidate: RouteCandidate, reason: &'static str },
+    DestinationSuccess { destination: String, stage: u8 },
+    DestinationFailure { destination: String, signal: BlockingSignal, stage: u8 },
+    MlDecision { route_key: String, candidates: Vec<RouteCandidate>, raced: bool, canary: Option<ml_shadow::ShadowCanaryDecision>, decision_id: u64 },
+    MlOutcome { decision_id: u64, candidate: Option<RouteCandidate>, connect_ok: bool, tls_ok_proxy: bool, bytes_u2c: u64, lifetime_ms: u64, error_class: String },
 }
 
 static TELEMETRY_TX: OnceLock<mpsc::UnboundedSender<TelemetryEvent>> = OnceLock::new();
@@ -56,7 +26,6 @@ pub fn init_telemetry_bus(cfg: Arc<EngineConfig>) {
     tokio::spawn(async move {
         info!(target: "socks5.telemetry", "Stats Actor started");
         let mut last_prune = Instant::now();
-        let mut last_flush = Instant::now();
 
         while let Some(event) = rx.recv().await {
             match event {
@@ -89,10 +58,6 @@ pub fn init_telemetry_bus(cfg: Arc<EngineConfig>) {
             if last_prune.elapsed() > Duration::from_secs(30) {
                 classifier_and_persistence::maybe_prune_runtime_classifier_state(now_unix_secs(), cfg.clone());
                 last_prune = Instant::now();
-            }
-            if last_flush.elapsed() > Duration::from_secs(10) {
-                classifier_and_persistence::maybe_flush_classifier_store(false, cfg.clone());
-                last_flush = Instant::now();
             }
         }
     });
