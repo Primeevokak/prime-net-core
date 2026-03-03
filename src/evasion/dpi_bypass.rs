@@ -175,7 +175,6 @@ async fn write_oob_at(stream: &mut TcpStream, data: &[u8], offset: usize) -> std
     }
 
     if cut + 1 < data.len() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
         stream.write_all(&data[cut + 1..]).await?;
     }
     Ok(())

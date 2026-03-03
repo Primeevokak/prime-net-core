@@ -30,13 +30,6 @@ impl Drop for PacketBypassGuard {
     fn drop(&mut self) {
         for mut child in self.children.drain(..) {
             let _ = child.start_kill();
-            for _ in 0..20 {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                    Err(_) => break,
-                }
-            }
         }
         for task in self.log_tasks.drain(..) {
             task.abort();
@@ -257,76 +250,42 @@ fn set_port_arg(args: &mut Vec<String>, port: u16) {
 fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
     let mut profiles = vec![
         PacketBypassProfile {
-            name: "stable-split-disorder".to_owned(),
+            name: "modern-disorder-split".to_owned(),
             args: vec![
-                "--split".into(), "1+s".into(),
+                "--split".into(), "1".into(),
                 "--disorder".into(), "3+s".into(),
-                "--auto=torst".into(),
-                "--timeout".into(), "15".into(),
+                "--mod-http".into(), "h,d".into(),
+                "--auto".into(), "none".into(),
+                "--timeout".into(), "10".into(),
             ],
         },
         PacketBypassProfile {
-            name: "stable-disorder-fake".to_owned(),
+            name: "tlsrec-fake-ttl".to_owned(),
             args: vec![
-                "--disorder".into(), "1".into(),
-                "--fake".into(), "-1".into(),
-                "--auto=torst".into(),
-                "--timeout".into(), "15".into(),
-            ],
-        },
-        PacketBypassProfile {
-            name: "stable-auto-tlsrec".to_owned(),
-            args: vec![
-                "--split".into(), "1+s".into(),
-                "--disorder".into(), "3+s".into(),
-                "--auto=torst".into(),
-                "--timeout".into(), "15".into(), // Increased from 3
-                "--tlsrec".into(), "3+s".into(),
-            ],
-        },
-        PacketBypassProfile {
-            name: "aggressive-fake-ttl-5".to_owned(),
-            args: vec![
+                "--tlsrec".into(), "1+s".into(),
                 "--fake".into(), "-1".into(),
                 "--ttl".into(), "5".into(),
-                "--auto=torst".into(),
-                "--timeout".into(), "15".into(),
+                "--auto".into(), "torst".into(),
+                "--timeout".into(), "10".into(),
             ],
         },
         PacketBypassProfile {
-            name: "aggressive-fake-ttl-10".to_owned(),
+            name: "aggressive-disorder-fake".to_owned(),
             args: vec![
+                "--disorder".into(), "1".into(),
                 "--fake".into(), "-1".into(),
-                "--ttl".into(), "10".into(),
-                "--auto=torst".into(),
-                "--timeout".into(), "15".into(),
+                "--auto".into(), "torst".into(),
+                "--timeout".into(), "10".into(),
             ],
         },
         PacketBypassProfile {
-            name: "aggressive-split-2".to_owned(),
+            name: "sni-split-oob".to_owned(),
             args: vec![
                 "--split".into(), "2".into(),
-                "--disorder".into(), "1".into(),
-                "--auto=torst".into(),
-                "--timeout".into(), "15".into(),
-            ],
-        },
-        PacketBypassProfile {
-            name: "fixed-ttl-3".to_owned(),
-            args: vec![
-                "--fake".into(), "-1".into(),
-                "--ttl".into(), "3".into(),
-                "--auto=torst".into(),
-                "--timeout".into(), "15".into(),
-            ],
-        },
-        PacketBypassProfile {
-            name: "experimental-oob".to_owned(),
-            args: vec![
-                "--split".into(), "1+s".into(),
                 "--oob".into(), "1".into(),
-                "--auto=torst".into(),
-                "--timeout".into(), "15".into(),
+                "--tlsrec".into(), "3+h".into(),
+                "--auto".into(), "torst".into(),
+                "--timeout".into(), "10".into(),
             ],
         },
     ];

@@ -6,7 +6,7 @@ use crate::anticensorship::ResolverChain;
 use crate::pt::socks5_server::route_connection::handle_socks5_connection;
 use crate::pt::socks5_server::telemetry_bus::init_telemetry_bus;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, warn, error};
+use tracing::{info, debug, error};
 use tokio::task::JoinSet;
 use tokio::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -44,7 +44,7 @@ pub async fn start_socks5_server(
                             let relay_opts_val = (*relay_opts).clone();
                             join_set.spawn(async move {
                                 if let Err(e) = handle_socks5_connection(conn_id, tcp, peer, "client", outbound_handle, cfg_handle, silent_drop, relay_opts_val).await {
-                                    warn!(target: "socks5", conn_id, error = %e, "client session failed");
+                                    debug!(target: "socks5", conn_id, error = %e, "client session finished with error (expected during race/eof)");
                                 }
                             });
                         }

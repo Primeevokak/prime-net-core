@@ -1,6 +1,6 @@
 use crate::config::EngineConfig;
 use crate::error::{EngineError, Result};
-use crate::pt::{BoxStream, DynOutbound, TargetEndpoint};
+use crate::pt::{BoxStream, DynOutbound, TargetEndpoint, TargetAddr};
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinSet;
@@ -8,15 +8,15 @@ use tokio::time::Duration;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+use dashmap::DashMap;
 
 use crate::pt::socks5_server::*;
 use crate::pt::socks5_server::route_scoring::*;
-use crate::pt::socks5_server::classifier_and_persistence::*;
-use crate::pt::socks5_server::ml_shadow::*;
 use crate::pt::socks5_server::state_and_startup::connect_bypass_upstream;
-use crate::pt::socks5_server::relay_and_io_helpers::relay_bidirectional;
+use crate::pt::socks5_server::relay_and_io_helpers::{relay_bidirectional, classify_io_error};
 use crate::pt::socks5_server::protocol_socks4::handle_socks4;
 use crate::pt::socks5_server::protocol_handlers::handle_http_proxy;
+use crate::pt::socks5_server::protocol_udp::handle_udp_associate;
 
 pub async fn connect_route_candidate(
     conn_id: u64,
@@ -52,6 +52,8 @@ pub async fn connect_via_best_route(
     initial_client_data: Option<Vec<u8>>,
 ) -> Result<ConnectedRoute> {
     let mut winners: JoinSet<Result<(RouteCandidate, BoxStream, Vec<u8>, bool)>> = JoinSet::new();
+    let cand_count = candidates.len();
+    
     for (idx, cand) in candidates.into_iter().enumerate() {
         let c: RouteCandidate = cand.clone();
         let t = target.clone();
@@ -61,21 +63,42 @@ pub async fn connect_via_best_route(
         let config = Arc::new(cfg.clone());
         let icd = initial_client_data.clone();
         winners.spawn(async move {
-            if idx > 0 { tokio::time::sleep(Duration::from_millis((idx as u64) * 50)).await; }
+            let delay = (idx as u64) * 100;
+            if delay > 0 { tokio::time::sleep(Duration::from_millis(delay)).await; }
+            
             let mut stream = connect_route_candidate(conn_id, &t, &tl, &c, out, &ro, config).await?;
             let mut initial_u2c = Vec::new();
             let mut sent = false;
+            
+            // SNIPER MODE: For port 443, we MUST verify the connection by sending data and reading a response.
+            // This prevents "fake fast" connections that win the race but fail immediately on data.
             if let Some(ref data) = icd {
-                // To win the race, we MUST send the request and wait for the first byte of response.
                 stream.write_all(data).await?; 
                 stream.flush().await?; 
                 sent = true;
                 
                 let mut buf = [0u8; 1];
-                // Wait for the first byte of response to confirm the route is actually working (bypassing DPI).
-                if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(1500), stream.read(&mut buf)).await {
-                    if n > 0 { initial_u2c.push(buf[0]); }
+                // Wait for the first byte of response (e.g., Server Hello 0x16)
+                if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(3000), stream.read(&mut buf)).await {
+                    if n > 0 {
+                        // Basic TLS check: Server Hello starts with 0x16 (Handshake)
+                        if t.port == 443 && buf[0] != 0x16 {
+                            debug!(conn_id, route = %c.route_label(), byte = buf[0], "invalid tls handshake response (dpi block?)");
+                            return Err(EngineError::Internal("invalid tls handshake (dpi)".to_owned()));
+                        }
+                        initial_u2c.push(buf[0]);
+                    }
                 }
+                
+                // If we're on port 443, we REQUIRE a response to win the race.
+                if t.port == 443 && initial_u2c.is_empty() {
+                    return Err(EngineError::Internal("no response from upstream".to_owned()));
+                }
+            } else if t.port == 443 {
+                // If port 443 but we have no client data, this candidate cannot win a race 
+                // against other potentially better candidates that we can't probe yet.
+                // We let it fail so a more stable route is chosen once we HAVE data.
+                return Err(EngineError::Internal("missing client data for race probing".to_owned()));
             }
             Ok((c, stream, initial_u2c, sent))
         });
@@ -83,6 +106,9 @@ pub async fn connect_via_best_route(
 
     while let Some(res) = winners.join_next().await {
         if let Ok(Ok((cand, stream, u2c, sent))) = res {
+            if cand_count > 1 {
+                info!(conn_id, route = %cand.route_label(), "route race winner selected");
+            }
             reap_route_race_losers_v3(winners, conn_id, target_label.to_owned());
             return Ok(ConnectedRoute { 
                 stream, 
@@ -95,59 +121,122 @@ pub async fn connect_via_best_route(
             });
         }
     }
-    Err(EngineError::Internal("race failed: all candidates timed out or failed to connect".to_owned()))
+    Err(EngineError::Internal("race failed: no working route found".to_owned()))
 }
 
 pub struct ConnectedRoute { pub stream: BoxStream, pub candidate: RouteCandidate, pub route_key: String, pub decision_id: u64, pub initial_client_data: Vec<u8>, pub initial_upstream_data: Vec<u8>, pub client_data_sent: bool }
 
 pub async fn handle_socks5_connection(conn_id: u64, mut tcp: TcpStream, peer: SocketAddr, _label: &str, outbound: DynOutbound, cfg: Arc<EngineConfig>, _silent_drop: bool, relay_opts: RelayOptions) -> Result<()> {
-    let mut hdr = [0u8; 2]; tcp.read_exact(&mut hdr).await?;
-    if hdr[0] != 0x05 { return Err(EngineError::Internal("not socks5".to_owned())); }
-    let mut m = vec![0u8; hdr[1] as usize]; tcp.read_exact(&mut m).await?;
-    tcp.write_all(&[0x05, 0x00]).await?;
-    let mut req = [0u8; 4]; tcp.read_exact(&mut req).await?;
-    let target = read_socks5_target_endpoint_with_atyp(&mut tcp, req[3]).await?;
-    
-    // We NO LONGER send Success here. We wait for the race to finish.
-    
-    let mut p = [0u8; 2048];
-    // We still try to peek at the first data packet (e.g. TLS Client Hello) if it's already in the buffer.
-    // Some clients send it immediately after the SOCKS request (Optimistic Data), but most wait for Success.
-    let icd = match tokio::time::timeout(Duration::from_millis(5), tcp.read(&mut p)).await {
-        Ok(Ok(n)) if n > 0 => Some(p[..n].to_vec()),
-        _ => None,
-    };
-    handle_socks5_request_with_target(conn_id, tcp, peer, "client", &target, outbound, cfg, relay_opts, icd).await
+    let mut hdr = [0u8; 2];
+    tcp.read_exact(&mut hdr).await?;
+
+    if hdr[0] == 0x05 {
+        let mut m = vec![0u8; hdr[1] as usize];
+        tcp.read_exact(&mut m).await?;
+        tcp.write_all(&[0x05, 0x00]).await?;
+        let mut req = [0u8; 4];
+        tcp.read_exact(&mut req).await?;
+        
+        if req[1] == 0x03 {
+            // UDP ASSOCIATE - Now supported with selective QUIC blocking
+            return handle_udp_associate(conn_id, tcp, peer).await;
+        }
+
+        let target = read_socks5_target_endpoint_with_atyp(&mut tcp, req[3]).await?;
+        
+        tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+        
+        let target_str = target.to_string();
+        let route_key = route_destination_key(&target_str);
+        let has_cached_winner = {
+            let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
+            map.contains_key(route_key)
+        };
+
+        let mut p = [0u8; 4096];
+        // CRITICAL: For port 443, we MUST wait for the TLS Client Hello to perform a safe 'route race'.
+        let wait_ms = if target.port == 443 { 2000 } else if has_cached_winner { 500 } else { 1500 };
+        
+        let icd = match tokio::time::timeout(Duration::from_millis(wait_ms), tcp.read(&mut p)).await {
+            Ok(Ok(n)) if n > 0 => Some(p[..n].to_vec()),
+            _ => None,
+        };
+        handle_socks5_request_with_target(conn_id, tcp, peer, "client", &target, outbound, cfg, relay_opts, icd).await
+    } else if hdr[0] == 0x04 {
+        let cmd = hdr[1];
+        handle_socks4(conn_id, tcp, peer, "client".to_owned(), outbound, cfg, cmd, _silent_drop, relay_opts).await
+    } else if hdr[0] == b'G' || hdr[0] == b'C' || hdr[0] == b'P' || hdr[0] == b'H' {
+        handle_http_proxy(conn_id, tcp, peer, "client".to_owned(), outbound, cfg, hdr, relay_opts).await
+    } else {
+        warn!(target: "socks5", conn_id, first_byte = hdr[0], "unknown protocol detected");
+        Err(EngineError::Internal("unsupported protocol".to_owned()))
+    }
 }
 
-pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream, peer: SocketAddr, _cl: &str, target: &TargetEndpoint, outbound: DynOutbound, cfg: Arc<EngineConfig>, relay_opts: RelayOptions, icd: Option<Vec<u8>>) -> Result<()> {
+pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream, _peer: SocketAddr, _cl: &str, target: &TargetEndpoint, outbound: DynOutbound, cfg: Arc<EngineConfig>, relay_opts: RelayOptions, icd: Option<Vec<u8>>) -> Result<()> {
     let target_label = target.to_string();
-    let candidates = select_route_candidates(&relay_opts, &target.addr, target.port, &target_label, &cfg);
+    let route_key = route_destination_key(&target_label);
     
-    // If we don't have ICD yet (browser waited for Success), we send Success now to provoke the browser.
-    // BUT we need a connected stream first to be SOCKS-compliant.
-    // So we run the race first. If the browser waited for Success, the race will connect but won't send/receive any data.
+    // 1. Check cached winner
+    let cached_winner = {
+        let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
+        map.get(route_key).map(|w| w.clone())
+    };
+
+    let candidates = if let Some(winner) = cached_winner {
+        if now_unix_secs().saturating_sub(winner.updated_at_unix) < ROUTE_WINNER_TTL_SECS {
+            let mut cands = select_route_candidates(&relay_opts, &target.addr, target.port, &target_label, &cfg);
+            cands.retain(|c| c.route_id() == winner.route_id);
+            if !cands.is_empty() { cands } else { select_route_candidates(&relay_opts, &target.addr, target.port, &target_label, &cfg) }
+        } else { select_route_candidates(&relay_opts, &target.addr, target.port, &target_label, &cfg) }
+    } else { select_route_candidates(&relay_opts, &target.addr, target.port, &target_label, &cfg) };
     
-    let route = connect_via_best_route(conn_id, target, &target_label, candidates, outbound, &relay_opts, &cfg, icd).await?;
+    let route_res = connect_via_best_route(conn_id, target, &target_label, candidates, outbound, &relay_opts, &cfg, icd).await;
     
-    // Now that we have a winner, we MUST send SOCKS5 Success if we haven't yet.
-    tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0,0,0,0,0,0]).await?;
-    
-    let mut upstream = route.stream;
-    relay_bidirectional(&mut tcp, &mut upstream, relay_opts, route.initial_client_data, route.initial_upstream_data, route.client_data_sent).await?;
-    Ok(())
+    match route_res {
+        Ok(route) => {
+            {
+                let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
+                map.insert(route_key.to_owned(), RouteWinner {
+                    route_id: route.candidate.route_id(),
+                    updated_at_unix: now_unix_secs(),
+                });
+            }
+            let mut upstream = route.stream;
+            let relay_res = relay_bidirectional(&mut tcp, &mut upstream, relay_opts, route.initial_client_data, route.initial_upstream_data, route.client_data_sent).await;
+            if let Err(ref e) = relay_res {
+                let signal = classify_io_error(e);
+                if signal == BlockingSignal::Reset || signal == BlockingSignal::Timeout {
+                    debug!(conn_id, error = %e, signal = ?signal, "upstream relay failed, invalidating cache for {}", route_key);
+                    let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
+                    map.remove(route_key);
+                } else {
+                    debug!(conn_id, error = %e, signal = ?signal, "client disconnected, keeping cache for {}", route_key);
+                }
+                return Err(EngineError::Io(std::io::Error::new(e.kind(), e.to_string())));
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
+            map.remove(route_key);
+            Err(e)
+        }
+    }
 }
 
 async fn read_socks5_target_endpoint_with_atyp(tcp: &mut TcpStream, atyp: u8) -> Result<TargetEndpoint> {
     let addr = match atyp {
-        0x01 => { let mut ip = [0u8; 4]; tcp.read_exact(&mut ip).await?; crate::pt::TargetAddr::Ip(std::net::IpAddr::V4(ip.into())) }
-        0x03 => { let mut l = [0u8; 1]; tcp.read_exact(&mut l).await?; let mut d = vec![0u8; l[0] as usize]; tcp.read_exact(&mut d).await?; crate::pt::TargetAddr::Domain(String::from_utf8_lossy(&d).to_string()) }
+        0x01 => { let mut ip = [0u8; 4]; tcp.read_exact(&mut ip).await?; TargetAddr::Ip(std::net::IpAddr::V4(ip.into())) }
+        0x03 => { let mut l = [0u8; 1]; tcp.read_exact(&mut l).await?; let mut d = vec![0u8; l[0] as usize]; tcp.read_exact(&mut d).await?; TargetAddr::Domain(String::from_utf8_lossy(&d).to_string()) }
         _ => return Err(EngineError::Internal("unsupported atyp".to_owned())),
     };
     let mut p = [0u8; 2]; tcp.read_exact(&mut p).await?;
     Ok(TargetEndpoint { addr, port: u16::from_be_bytes(p) })
 }
 
-fn reap_route_race_losers_v3(winners: JoinSet<Result<(RouteCandidate, BoxStream, Vec<u8>, bool)>>, _cid: u64, _tl: String) {
-    tokio::spawn(async move { let mut winners = winners; while let Some(_) = winners.join_next().await {} });
+fn reap_route_race_losers_v3(mut winners: JoinSet<Result<(RouteCandidate, BoxStream, Vec<u8>, bool)>>, _cid: u64, _tl: String) {
+    // CRITICAL FIX: Abort all pending connections immediately so they don't leak sockets.
+    winners.abort_all();
+    tokio::spawn(async move { while let Some(_) = winners.join_next().await {} });
 }

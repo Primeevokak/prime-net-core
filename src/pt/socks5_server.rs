@@ -1,17 +1,13 @@
 use dashmap::DashMap;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::AtomicU64;
+use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpStream};
-use tracing::{info, warn, debug, error};
 
-use crate::config::EngineConfig;
-use crate::error::{EngineError, Result};
-use crate::pt::{BoxStream, DynOutbound, OutboundConnector, TargetAddr, TargetEndpoint};
+use crate::pt::{BoxStream, OutboundConnector};
 
 // --- GLOBAL CONSTANTS ---
 pub const ROUTE_WINNER_TTL_SECS: u64 = 900;
@@ -43,12 +39,21 @@ pub enum StageSelectionSource { #[default] Default }
 // --- GLOBAL STRUCTS ---
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteCandidate {
-    pub kind: RouteKind, pub source: &'static str, pub bypass_addr: Option<SocketAddr>,
-    pub bypass_profile_idx: u8, pub bypass_profile_total: u8, pub family: RouteIpFamily,
+    pub kind: RouteKind, 
+    pub source: &'static str, 
+    pub bypass_addr: Option<SocketAddr>,
+    pub bypass_profile_idx: u8, 
+    pub bypass_profile_total: u8, 
+    pub family: RouteIpFamily,
+    pub score: i32,
 }
 impl RouteCandidate {
-    pub fn direct_with_family(source: &'static str, family: RouteIpFamily) -> Self { Self { kind: RouteKind::Direct, source, bypass_addr: None, bypass_profile_idx: 0, bypass_profile_total: 0, family } }
-    pub fn bypass_with_family(source: &'static str, addr: SocketAddr, idx: u8, total: u8, family: RouteIpFamily) -> Self { Self { kind: RouteKind::Bypass, source, bypass_addr: Some(addr), bypass_profile_idx: idx, bypass_profile_total: total, family } }
+    pub fn direct_with_family(source: &'static str, family: RouteIpFamily) -> Self { 
+        Self { kind: RouteKind::Direct, source, bypass_addr: None, bypass_profile_idx: 0, bypass_profile_total: 0, family, score: 0 } 
+    }
+    pub fn bypass_with_family(source: &'static str, addr: SocketAddr, idx: u8, total: u8, family: RouteIpFamily) -> Self { 
+        Self { kind: RouteKind::Bypass, source, bypass_addr: Some(addr), bypass_profile_idx: idx, bypass_profile_total: total, family, score: 0 } 
+    }
     pub fn route_id(&self) -> String { match self.kind { RouteKind::Direct => "direct".to_owned(), RouteKind::Bypass => format!("bypass:{}", self.bypass_profile_idx + 1) } }
     pub fn route_label(&self) -> String { match self.kind { RouteKind::Direct => format!("direct:{}", self.source), RouteKind::Bypass => format!("bypass:{}:{}", self.bypass_profile_idx + 1, self.source) } }
     pub fn kind_rank(&self) -> u8 { match self.kind { RouteKind::Direct => 0, RouteKind::Bypass => 1 } }
@@ -79,6 +84,7 @@ pub static DEST_ROUTE_HEALTH: OnceLock<DashMap<String, DashMap<String, RouteHeal
 pub static GLOBAL_BYPASS_PROFILE_HEALTH: OnceLock<DashMap<String, BypassProfileHealth>> = OnceLock::new();
 pub static ROUTE_CAPABILITIES: OnceLock<RwLock<RouteCapabilities>> = OnceLock::new();
 pub static ROUTE_METRICS: OnceLock<RouteMetrics> = OnceLock::new();
+pub static BLOCKLIST_DOMAINS: OnceLock<RwLock<std::collections::HashSet<String>>> = OnceLock::new();
 
 // --- MODULES ---
 #[path = "socks5_server_parts/telemetry_bus.rs"]
@@ -91,6 +97,8 @@ pub mod ml_shadow;
 pub mod protocol_handlers;
 #[path = "socks5_server_parts/protocol_socks4.rs"]
 pub mod protocol_socks4;
+#[path = "socks5_server_parts/protocol_udp.rs"]
+pub mod protocol_udp;
 #[path = "socks5_server_parts/relay_and_io_helpers.rs"]
 pub mod relay_and_io_helpers;
 #[path = "socks5_server_parts/route_connection.rs"]

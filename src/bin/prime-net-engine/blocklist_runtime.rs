@@ -157,6 +157,15 @@ pub async fn initialize_runtime_blocklist(cfg: &BlocklistConfig) -> Result<Runti
     let ips_loaded = matcher.ips.len();
     let _ = RUNTIME_MATCHER.set(matcher);
 
+    // Populate engine global blocklist for routing
+    let global_set = prime_net_engine_core::pt::socks5_server::BLOCKLIST_DOMAINS.get_or_init(|| std::sync::RwLock::new(std::collections::HashSet::new()));
+    if let Ok(mut set) = global_set.write() {
+        set.clear();
+        for domain in &domains {
+            set.insert(domain.clone());
+        }
+    }
+
     let pt_tools_path = if domains.is_empty() {
         None
     } else {

@@ -1,7 +1,6 @@
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
-use tracing::{info, warn};
 use serde::{Deserialize, Serialize};
 
 use crate::config::EngineConfig;
@@ -14,23 +13,36 @@ pub(super) static ROUTE_DECISION_EVENTS_PENDING: OnceLock<DashMap<u64, RouteDeci
 pub(super) static ROUTE_OUTCOME_EVENTS: OnceLock<DashMap<u64, RouteOutcomeEvent>> = OnceLock::new();
 pub(super) static SHADOW_BANDIT_ARMS: OnceLock<DashMap<String, ShadowBanditArmStats>> =
     OnceLock::new();
+#[allow(dead_code)]
 pub(super) static SHADOW_CANARY_DECISIONS: OnceLock<DashMap<u64, ShadowCanaryDecision>> =
     OnceLock::new();
+#[allow(dead_code)]
 pub(super) static SHADOW_CANARY_SWITCH_GUARD: OnceLock<DashMap<String, ShadowCanarySwitchGuard>> =
     OnceLock::new();
+#[allow(dead_code)]
 pub(super) static SHADOW_CANARY_BUCKET_COOLDOWN_UNTIL: OnceLock<DashMap<String, u64>> =
     OnceLock::new();
+#[allow(dead_code)]
 pub(super) static SHADOW_CANARY_SLO_STATE: OnceLock<RwLock<ShadowCanarySloState>> = OnceLock::new();
+#[allow(dead_code)]
 pub(super) static SHADOW_CANARY_ROLLBACK_UNTIL_UNIX: AtomicU64 = AtomicU64::new(0);
 
 const SHADOW_PRIOR_PSEUDO_PULLS: u64 = 10;
+#[allow(dead_code)]
 const SHADOW_UCB_EXPLORATION_SCALE: f64 = 18.0;
+#[allow(dead_code)]
 const SHADOW_EXPLORATION_BUDGET_PCT: u64 = 5;
+#[allow(dead_code)]
 const PHASE2_CANARY_ENABLED: bool = true;
+#[allow(dead_code)]
 const PHASE2_CANARY_SWITCH_WINDOW_SECS: u64 = 30;
+#[allow(dead_code)]
 const PHASE2_CANARY_MAX_SWITCHES_PER_WINDOW: u8 = 1;
+#[allow(dead_code)]
 const PHASE2_CANARY_PROFILE_ROTATION_COOLDOWN_SECS: u64 = 45;
+#[allow(dead_code)]
 const SHADOW_DECAY_HALFLIFE_SECS: u64 = 1800;
+#[allow(dead_code)]
 const SHADOW_DECAY_MIN_ELAPSED_SECS: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

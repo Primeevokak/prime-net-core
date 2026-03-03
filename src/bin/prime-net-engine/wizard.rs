@@ -158,19 +158,22 @@ pub async fn run_wizard(opts: &WizardOpts) -> Result<()> {
 }
 
 async fn auto_tune_fragment_size(cfg: &mut EngineConfig, test_url: &str) -> Result<usize> {
+    let original_sleep = cfg.evasion.fragment_sleep_ms;
     let candidates = [64usize, 48, 32, 16, 8];
     for &sz in &candidates {
         cfg.evasion.fragment_size_max = sz;
         cfg.evasion.fragment_size_min = sz.min(10);
-        cfg.evasion.fragment_sleep_ms = 10;
+        cfg.evasion.fragment_sleep_ms = 10; // Temporary for tuning stability
 
         let client = PrimeEngine::new(cfg.clone()).await?.client();
         let req = RequestData::new(test_url.to_owned(), Method::HEAD);
         let res = client.fetch(req, None).await;
         if res.is_ok() {
+            cfg.evasion.fragment_sleep_ms = original_sleep; // Restore!
             return Ok(sz);
         }
     }
+    cfg.evasion.fragment_sleep_ms = original_sleep; // Restore on failure
     Err(EngineError::Internal(
         "no fragment_size candidate succeeded".to_owned(),
     ))

@@ -172,22 +172,25 @@ fn build_direct_relay_options(cfg: &EngineConfig) -> RelayOptions {
     split_offsets.retain(|v| *v > 0);
 
     let mut sleep_ms = cfg.evasion.fragment_sleep_ms;
-    if sleep_ms == 0 {
-        sleep_ms = 2; // Default to 2ms for better balance
+    
+    // Hard-reset sleep to 0 for bypass performance, unless user explicitly set something else than wizard's 10ms
+    if sleep_ms == 10 || sleep_ms == 2 {
+        sleep_ms = 0;
     }
+    
     if sleep_ms > 50 {
-        sleep_ms = 50; // Cap to reasonable delay
+        sleep_ms = 50;
     }
 
     RelayOptions {
         fragment_client_hello: true,
         split_at_sni: cfg.evasion.split_at_sni,
         client_hello_split_offsets: split_offsets,
-        fragment_size_min: 1, // Back to 1 for better bypass
+        fragment_size_min: 1, 
         fragment_size_max: cfg.evasion.fragment_size_max.clamp(1, 128),
         randomize_fragment_size: cfg.evasion.randomize_fragment_size,
         fragment_sleep_ms: sleep_ms,
-        fragment_budget_bytes: cfg.evasion.fragment_budget_bytes.clamp(1024, 128 * 1024),
+        fragment_budget_bytes: cfg.evasion.fragment_budget_bytes.max(128 * 1024), // Ensure at least 128KB budget
         tcp_window_size: cfg.evasion.tcp_window_size as u16,
         classifier_persist_enabled: cfg.evasion.classifier_persist_enabled,
         classifier_cache_path: Some(cfg.evasion.classifier_cache_path.clone().into()),

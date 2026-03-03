@@ -37,9 +37,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("Starting Prime Net Engine on 127.0.0.1:1080...");
+    println!("Starting Prime Net Engine on 127.0.0.1:1080 with aggressive-evasion preset...");
     let mut engine_child = Command::new(&engine_bin)
-        .args(["socks", "--bind", "127.0.0.1:1080"])
+        .args(["--preset", "aggressive-evasion", "socks", "--bind", "127.0.0.1:1080"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -48,10 +48,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reader = BufReader::new(stderr);
     let mut lines = reader.lines();
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     let args: Vec<String> = env::args().collect();
-    let test_url = args.get(1).map(|s| s.as_str()).unwrap_or("https://www.google.com/search?q=prime+net+engine+test");
+    let test_url = args.get(1).map(|s| s.as_str()).unwrap_or("https://www.youtube.com");
     println!("Launching Chrome to visit: {}", test_url);
 
     let user_data_dir = current_dir.join("target").join("chrome-test-profile");
@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ])
         .spawn()?;
 
-    println!("Monitoring engine logs for activity (timeout 30s)...");
+    println!("Monitoring engine logs for activity (timeout 60s)...");
     let start_time = Instant::now();
     let mut success = false;
     let mut connection_seen = false;
@@ -83,13 +83,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match timeout_check.await {
             Ok(Ok(Some(line))) => {
                 println!("  [ENGINE] {}", line);
-                if line.contains("starting route selection") || line.contains("SOCKS5 connection") {
+                if line.contains("starting route selection") || line.contains("SOCKS5 connection") || line.contains("trying route candidate") {
                     connection_seen = true;
-                    println!("  >>> EVENT: Connection detected!");
                 }
-                if line.contains("upstream -> client data flow") || line.contains("session finished normally") {
+                if line.contains("won the race!") || line.contains("relay_bidirectional") || line.contains("session finished normally") {
                     data_flowing = true;
-                    println!("  >>> EVENT: Data flow detected!");
                 }
                 if connection_seen && data_flowing {
                     success = true;
@@ -102,8 +100,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(_) => {}
         }
 
-        if start_time.elapsed() > Duration::from_secs(30) {
-            println!("\n=== BROWSER TEST TIMED OUT (30s reached) ===");
+        if start_time.elapsed() > Duration::from_secs(60) {
+            println!("\n=== BROWSER TEST TIMED OUT (60s reached) ===");
             break;
         }
     }

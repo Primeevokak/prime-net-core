@@ -201,7 +201,7 @@ fn parse_cli(args: &[String]) -> Result<ParsedCli> {
         config_check: false,
         offline: false,
         probe_domain: "example.com".to_owned(),
-        log_level: Level::INFO,
+        log_level: Level::DEBUG,
         log_format: LogFormat::Text,
         log_file: None,
         log_rotation: LogRotation::Daily,

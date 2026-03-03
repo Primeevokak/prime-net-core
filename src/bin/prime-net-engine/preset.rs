@@ -171,6 +171,20 @@ fn apply_aggressive_evasion(cfg: &mut EngineConfig, strict: bool) -> Result<()> 
     cfg.anticensorship.doh_enabled = true;
     cfg.anticensorship.dot_enabled = true;
     cfg.anticensorship.doq_enabled = true;
+    cfg.anticensorship.dns_parallel_racing = true;
+    cfg.anticensorship.dns_query_timeout_secs = 2;
+
+    cfg.anticensorship.dot_servers = vec![
+        "8.8.8.8:853".to_owned(),
+        "1.1.1.1:853".to_owned(),
+        "9.9.9.9:853".to_owned(),
+    ];
+
+    cfg.anticensorship.doh_providers = vec![
+        "google".to_owned(),
+        "cloudflare".to_owned(),
+        "quad9".to_owned(),
+    ];
 
     conflict_vec(
         strict,
@@ -178,15 +192,15 @@ fn apply_aggressive_evasion(cfg: &mut EngineConfig, strict: bool) -> Result<()> 
         &cfg.anticensorship.dns_fallback_chain,
         &def.anticensorship.dns_fallback_chain,
         &[
-            DnsResolverKind::Doh,
-            DnsResolverKind::Dot,
             DnsResolverKind::Doq,
+            DnsResolverKind::Dot,
+            DnsResolverKind::Doh,
         ],
     )?;
     cfg.anticensorship.dns_fallback_chain = vec![
-        DnsResolverKind::Doh,
-        DnsResolverKind::Dot,
         DnsResolverKind::Doq,
+        DnsResolverKind::Dot,
+        DnsResolverKind::Doh,
     ];
 
     // ECH: auto.
@@ -214,7 +228,7 @@ fn apply_aggressive_evasion(cfg: &mut EngineConfig, strict: bool) -> Result<()> 
     }
     cfg.evasion.split_at_sni = true;
     cfg.evasion.fragment_sleep_ms = 0;
-    cfg.evasion.fragment_budget_bytes = 32 * 1024;
+    cfg.evasion.fragment_budget_bytes = 128 * 1024; // Increased budget for complex handshakes
     cfg.evasion.prime_mode = true;
     #[cfg(windows)]
     {
