@@ -162,52 +162,57 @@ impl App {
     }
 
     async fn refresh_proxy_diagnostics(&mut self) {
-        let mut out = Vec::new();
-        let endpoint = self
-            .config_editor
-            .config
-            .system_proxy
-            .socks_endpoint
-            .clone();
-        
+        let endpoint = self.config_editor.config.system_proxy.socks_endpoint.clone();
         let packet_bypass_enabled = self.config_editor.config.evasion.packet_bypass_enabled;
+        let pt_is_none = self.config_editor.config.pt.is_none();
+        let pac_url = system_proxy_manager().status().ok().and_then(|s| s.pac_url);
+        let core_running = self
+            .core_process
+            .as_mut()
+            .map(|c| c.try_wait().ok().flatten().is_none())
+            .unwrap_or(false);
+
+        let diag_task = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            
+            if pt_is_none {
+                if packet_bypass_enabled {
+                    out.push(DiagnosticResult::info(
+                        "Активен обход через Packet Bypass (ciadpi)",
+                        "Движок использует внешний бэкенд для десинхронизации пакетов",
+                    ));
+                } else {
+                    out.push(DiagnosticResult::warn(
+                        "Транспорт обхода отключен (шаблон PT = direct)",
+                        "Установите шаблон trojan/shadowsocks в Конфиг -> Системный прокси",
+                    ));
+                }
+            }
+
+            if let Ok(status) = system_proxy_manager().status() {
+                if status.enabled || core_running {
+                    out.push(ProxyDiagnostics::check_socks5_listening(&endpoint));
+                } else {
+                    out.push(DiagnosticResult::info(
+                        "SOCKS5-сервер остановлен",
+                        "Нажмите [a], чтобы запустить ядро и включить прокси",
+                    ));
+                }
+                out.push(ProxyDiagnostics::check_system_proxy_config());
+            } else if let Ok(mut fallback) = ProxyDiagnostics::run_sync_basic(&endpoint) {
+                out.append(&mut fallback);
+            }
+            out
+        });
+
+        let mut diagnostics = diag_task.await.unwrap_or_default();
         
-        if self.config_editor.config.pt.is_none() {
-            if packet_bypass_enabled {
-                out.push(DiagnosticResult::info(
-                    "Активен обход через Packet Bypass (ciadpi)",
-                    "Движок использует внешний бэкенд для десинхронизации пакетов",
-                ));
-            } else {
-                out.push(DiagnosticResult::warn(
-                    "Транспорт обхода отключен (шаблон PT = direct)",
-                    "Установите шаблон trojan/shadowsocks в Конфиг -> Системный прокси",
-                ));
-            }
+        // PAC check is already async, keep it as is but after the blocking part
+        if let Some(url) = pac_url {
+            diagnostics.push(ProxyDiagnostics::check_pac_server(&url).await);
         }
-        let status = system_proxy_manager().status();
-        if let Ok(status) = status {
-            let core_running = self
-                .core_process
-                .as_mut()
-                .map(|c| c.try_wait().ok().flatten().is_none())
-                .unwrap_or(false);
-            if status.enabled || core_running {
-                out.push(ProxyDiagnostics::check_socks5_listening(&endpoint));
-            } else {
-                out.push(DiagnosticResult::info(
-                    "SOCKS5-сервер остановлен",
-                    "Нажмите [a], чтобы запустить ядро и включить прокси",
-                ));
-            }
-            out.push(ProxyDiagnostics::check_system_proxy_config());
-            if let Some(url) = status.pac_url {
-                out.push(ProxyDiagnostics::check_pac_server(&url).await);
-            }
-        } else if let Ok(mut fallback) = ProxyDiagnostics::run_sync_basic(&endpoint) {
-            out.append(&mut fallback);
-        }
-        self.diagnostics = out;
+
+        self.diagnostics = diagnostics;
         self.last_diag_refresh = Instant::now();
     }
 

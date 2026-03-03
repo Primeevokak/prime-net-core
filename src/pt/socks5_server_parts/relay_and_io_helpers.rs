@@ -33,7 +33,26 @@ pub async fn relay_bidirectional(
         client.flush().await?;
     }
 
-    let (c2u, u2c) = tokio::io::copy_bidirectional(client, upstream).await?;
+    let (mut client_read, mut client_write) = tokio::io::split(client);
+    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
+
+    let c2u_task = async {
+        tokio::io::copy(&mut client_read, &mut upstream_write).await
+    };
+
+    let u2c_task = async {
+        tokio::io::copy(&mut upstream_read, &mut client_write).await
+    };
+
+    let (c2u_res, u2c_res) = tokio::join!(c2u_task, u2c_task);
+    
+    let c2u = c2u_res.as_ref().copied().unwrap_or(0);
+    let u2c = u2c_res.as_ref().copied().unwrap_or(0);
+
+    if c2u_res.is_err() || u2c_res.is_err() {
+        let err = c2u_res.err().or(u2c_res.err()).unwrap();
+        return Err(err);
+    }
     
     Ok((c2u + initial_c2u_len, u2c + initial_u2c_len))
 }
@@ -83,7 +102,27 @@ pub async fn relay_bidirectional_with_first_byte_timeout(
         }
     }
 
-    let (c2u, u2c) = tokio::io::copy_bidirectional(client, upstream).await?;
+    let (mut client_read, mut client_write) = tokio::io::split(client);
+    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
+
+    let c2u_task = async {
+        tokio::io::copy(&mut client_read, &mut upstream_write).await
+    };
+
+    let u2c_task = async {
+        tokio::io::copy(&mut upstream_read, &mut client_write).await
+    };
+
+    let (c2u_res, u2c_res) = tokio::join!(c2u_task, u2c_task);
+    
+    let c2u = c2u_res.as_ref().copied().unwrap_or(0);
+    let u2c = u2c_res.as_ref().copied().unwrap_or(0);
+
+    if c2u_res.is_err() || u2c_res.is_err() {
+        let err = c2u_res.err().or(u2c_res.err()).unwrap();
+        return Err(err);
+    }
+    
     Ok((c2u + initial_c2u_len, u2c + if initial_u2c_len > 0 { initial_u2c_len } else { 1 }))
 }
 

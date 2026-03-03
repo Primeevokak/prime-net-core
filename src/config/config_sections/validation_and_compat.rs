@@ -140,6 +140,40 @@ impl EngineConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.privacy.ip_spoof.enabled {
+            let ip = self.privacy.ip_spoof.spoofed_ip.trim();
+            if ip.is_empty() {
+                return Err(EngineError::Config("privacy.ip_spoof.spoofed_ip must not be empty when enabled".to_owned()));
+            }
+            if ip.parse::<std::net::IpAddr>().is_err() {
+                return Err(EngineError::Config(format!("privacy.ip_spoof.spoofed_ip is not a valid IP: {ip}")));
+            }
+        }
+        if self.privacy.user_agent.enabled {
+            if let crate::config::UserAgentPreset::Custom = self.privacy.user_agent.preset {
+                if self.privacy.user_agent.custom_value.trim().is_empty() {
+                    return Err(EngineError::Config("privacy.user_agent.custom_value must not be empty when using 'custom' preset".to_owned()));
+                }
+            }
+        }
+        if self.anticensorship.dot_enabled {
+            let sni = self.anticensorship.dot_sni.trim();
+            if sni.is_empty() {
+                 return Err(EngineError::Config("anticensorship.dot_sni must not be empty when dot is enabled".to_owned()));
+            }
+            if sni.parse::<std::net::IpAddr>().is_ok() {
+                return Err(EngineError::Config("anticensorship.dot_sni must be a hostname, not an IP literal".to_owned()));
+            }
+        }
+        if self.anticensorship.doq_enabled {
+            let sni = self.anticensorship.doq_sni.trim();
+            if sni.is_empty() {
+                 return Err(EngineError::Config("anticensorship.doq_sni must not be empty when doq is enabled".to_owned()));
+            }
+            if sni.parse::<std::net::IpAddr>().is_ok() {
+                return Err(EngineError::Config("anticensorship.doq_sni must be a hostname, not an IP literal".to_owned()));
+            }
+        }
         self.tls.validate()?;
         if self.anticensorship.effective_ech_mode().is_some() {
             let min = self.tls.min_version;

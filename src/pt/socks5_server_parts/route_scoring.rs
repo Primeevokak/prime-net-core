@@ -66,36 +66,43 @@ pub fn ordered_route_candidates(route_key: &str, candidates: Vec<RouteCandidate>
     filtered
 }
 
-pub fn is_censored_domain(domain: &str, relay_opts: &RelayOptions, cfg: &EngineConfig) -> bool {
+pub fn is_censored_domain(domain: &str, _relay_opts: &RelayOptions, cfg: &EngineConfig) -> bool {
     let dest_lower = domain.to_lowercase();
+    let group_key = route_destination_key(&dest_lower);
+    let now = now_unix_secs();
 
-    // 1. Check global engine blocklist
-    if let Some(lock) = BLOCKLIST_DOMAINS.get() {
-        if let Ok(set) = lock.read() {
-            if set.contains(&dest_lower) {
-                return true;
-            }
-            // Subdomain check (e.g., test.discord.com -> discord.com)
-            for (idx, byte) in dest_lower.as_bytes().iter().enumerate() {
-                if *byte == b'.' {
-                    let suffix = &dest_lower[idx + 1..];
-                    if set.contains(suffix) {
-                        return true;
-                    }
+    // 1. LM INTELLIGENCE: Check classifier for recent resets or persistent timeouts
+    // Precision: A block is signaled if (RESETS > 0 OR TIMEOUTS >= 2) AND SUCCESSES == 0
+    if let Some(classifier) = DEST_CLASSIFIER.get() {
+        // Check both the specific subdomain and the SLD group
+        for key in [&dest_lower, group_key] {
+            if let Some(stats) = classifier.get(key) {
+                if stats.successes == 0 && (stats.resets > 0 || stats.timeouts >= 2) && now.saturating_sub(stats.last_seen_unix) < 900 {
+                    return true;
                 }
             }
         }
     }
 
-    // 2. Check if the runtime provided a custom check function (antifilter list fallback)
-    if let Some(check_fn) = relay_opts.bypass_domain_check {
-        if check_fn(domain) {
-            return true;
+    // 2. Check global engine blocklist
+    if let Some(lock) = BLOCKLIST_DOMAINS.get() {
+        if let Ok(set) = lock.read() {
+            if set.contains(&dest_lower) { return true; }
+            for (idx, byte) in dest_lower.as_bytes().iter().enumerate() {
+                if *byte == b'.' {
+                    if set.contains(&dest_lower[idx + 1..]) { return true; }
+                }
+            }
         }
     }
 
-    // 3. Check config groups
-    let raw_bucket = host_service_bucket(route_destination_key(domain), cfg);
+    // 3. Custom check function fallback
+    if let Some(check_fn) = _relay_opts.bypass_domain_check {
+        if check_fn(domain) { return true; }
+    }
+
+    // 4. Config groups
+    let raw_bucket = host_service_bucket(group_key, cfg);
     cfg.routing.censored_groups.keys().any(|g| raw_bucket == *g || raw_bucket == format!("meta-group:{}", g))
 }
 
@@ -120,9 +127,9 @@ pub fn record_route_failure_sync(route_key: &str, candidate: &RouteCandidate, re
     let now = now_unix_secs();
     let route_id = candidate.route_id();
     
-    // NUCLEAR PENALTY: If we get a Connection Reset (10054), it's a strong DPI signal.
-    // We immediately mark this profile as weak for this domain group.
+    // NUCLEAR PENALTY: If we get a Connection Reset or a DPI Signal (Alert/HTTP), it's a strong block signal.
     let is_reset = reason.contains("reset") || reason.contains("10054") || reason.contains("BrokenPipe");
+    let is_dpi_signal = reason.contains("dpi-signal");
     
     {
         let map = DEST_ROUTE_HEALTH.get_or_init(dashmap::DashMap::new);
@@ -132,13 +139,13 @@ pub fn record_route_failure_sync(route_key: &str, candidate: &RouteCandidate, re
         health.consecutive_failures += 1;
         health.last_failure_unix = now;
         
-        if is_reset || health.consecutive_failures >= ROUTE_FAILS_BEFORE_WEAK {
-            // Mark as weak for 5 minutes (300s) on reset, or 60s on normal failure
-            let penalty_secs = if is_reset { 300 } else { 60 };
+        if is_reset || is_dpi_signal || health.consecutive_failures >= ROUTE_FAILS_BEFORE_WEAK {
+            // Mark as weak for 10 minutes (600s) on DPI signal, 5 mins on reset, or 60s on normal failure
+            let penalty_secs = if is_dpi_signal { 600 } else if is_reset { 300 } else { 60 };
             health.weak_until_unix = now + penalty_secs;
             
-            // If it's a reset on a bypass profile, force a rotation for the whole domain group
-            if is_reset && candidate.kind == RouteKind::Bypass {
+            // Force a rotation for the whole domain group
+            if (is_reset || is_dpi_signal) && candidate.kind == RouteKind::Bypass {
                 record_bypass_profile_failure(route_key, candidate.bypass_profile_idx, candidate.bypass_profile_total, reason, cfg);
             }
         }
@@ -170,27 +177,27 @@ pub fn select_route_candidates(relay_opts: &RelayOptions, target: &crate::pt::Ta
     let is_blocked = is_censored_domain(destination, relay_opts, cfg);
     let family = route_family_for_target(target);
 
-    if port == 443 || port == 80 || port == 6443 || (port >= 5000 && port <= 9000) { // Add Discord/Game ports
+    if port == 443 || port == 80 || port == 6443 || (port >= 5000 && port <= 9000) {
         let bypass_cands = select_bypass_candidates(relay_opts, destination, cfg);
         
         if is_blocked {
-            // For known blocked domains, use ONLY Bypass routes OR give Bypass a huge head start.
+            // PROACTIVE BYPASS: For domains with block signals, try bypass FIRST.
             let mut count = 0;
             for (addr, idx, total) in bypass_cands {
                 out.push(RouteCandidate {
-                    score: 100, // High priority
+                    score: 1000, // Very high priority
                     ..RouteCandidate::bypass_with_family("pool", addr, idx, total, family)
                 });
                 count += 1;
-                if count >= 4 { break; } // Limit to 4 parallel bypass attempts for efficiency
+                if count >= 4 { break; }
             }
-            // Direct is a very late fallback
+            // Direct is a very late fallback (shorter timeout should be applied in connect logic)
             out.push(RouteCandidate {
-                score: -1000, // Massive handicap
+                score: -10000, 
                 ..RouteCandidate::direct_with_family("adaptive", family)
             });
         } else {
-            // Normal domains: Direct first, then Bypass as backup
+            // Normal domains: Direct first, but Bypass as close backup
             out.push(RouteCandidate {
                 score: 100,
                 ..RouteCandidate::direct_with_family("adaptive", family)
@@ -266,20 +273,21 @@ pub fn route_destination_key(rk: &str) -> &str {
     let host = rk.split('|').next().unwrap_or(rk);
     let host = host.split(':').next().unwrap_or(host);
     
-    // Group subdomains for high-traffic services to share route winners
-    if host.ends_with(".googlevideo.com") { return "googlevideo.com"; }
-    if host.ends_with(".ytimg.com") { return "ytimg.com"; }
-    if host.ends_with(".ggpht.com") { return "ggpht.com"; }
-    if host.ends_with(".googleusercontent.com") { return "googleusercontent.com"; }
-    if host.ends_with(".discord.gg") { return "discord.gg"; }
-    if host.ends_with(".discordapp.com") { return "discordapp.com"; }
-    if host.ends_with(".discord.com") { return "discord.com"; }
-    if host.ends_with(".sndcdn.com") { return "sndcdn.com"; } // SoundCloud
-    if host.ends_with(".soundcloud.com") { return "soundcloud.com"; }
-    if host.ends_with(".instagram.com") { return "instagram.com"; }
-    if host.ends_with(".cdninstagram.com") { return "cdninstagram.com"; }
-    if host.ends_with(".facebook.com") { return "facebook.com"; }
-    if host.ends_with(".fbcdn.net") { return "fbcdn.net"; }
+    // 1. Specialized High-Traffic Groups (keep for stability)
+    if host.contains("googlevideo") { return "googlevideo.com"; }
+    if host.contains("discord") { return "discord.com"; }
+    if host.contains("instagram") || host.contains("fbcdn") { return "instagram.com"; }
+    if host.contains("facebook.com") || host.contains("fb.com") || host.contains("messenger.com") { return "facebook.com"; }
+    if host.contains("sndcdn") || host.contains("soundcloud") { return "soundcloud.com"; }
+    
+    // 2. Generic SLD-based grouping (e.g., sub.example.com -> example.com)
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() >= 2 {
+        let len = parts.len();
+        // Return the last two parts as the group key
+        let last_two = &host[host.len() - (parts[len-2].len() + parts[len-1].len() + 1)..];
+        return last_two;
+    }
     
     host
 }
@@ -289,5 +297,9 @@ pub fn record_bypass_profile_failure(destination: &str, current_idx: u8, total: 
     let idx_map = DEST_BYPASS_PROFILE_IDX.get_or_init(dashmap::DashMap::new);
     idx_map.insert(destination.to_owned(), next_idx);
 }
-pub fn record_route_success(_rk: &str, _c: &RouteCandidate, _cfg: &EngineConfig) {}
-pub fn record_route_failure(_rk: &str, _c: &RouteCandidate, _r: &'static str, _cfg: &EngineConfig) {}
+pub fn record_route_success(rk: &str, c: &RouteCandidate, cfg: &EngineConfig) {
+    record_route_success_sync(rk, c, cfg);
+}
+pub fn record_route_failure(rk: &str, c: &RouteCandidate, r: &'static str, cfg: &EngineConfig) {
+    record_route_failure_sync(rk, c, r, cfg);
+}

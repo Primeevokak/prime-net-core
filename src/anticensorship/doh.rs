@@ -182,41 +182,45 @@ impl DoHResolver {
     }
 
     async fn refresh_cache(&self, domain: &str) -> Result<Vec<IpAddr>> {
+        let mut last_err = None;
         for provider in &self.providers {
-            if let Ok(answer) = self.query_doh_provider(provider, domain, false).await {
-                if !answer.ips.is_empty() {
-                    self.cache.write().insert(
-                        domain.to_owned(),
-                        CachedDnsEntry {
-                            expires_at: Instant::now() + answer.ttl,
-                            ips: answer.ips.clone(),
-                        },
-                    );
-                    return Ok(answer.ips);
+            match self.query_doh_provider(provider, domain, false).await {
+                Ok(answer) => {
+                    if !answer.ips.is_empty() {
+                        self.cache.write().insert(
+                            domain.to_owned(),
+                            CachedDnsEntry {
+                                expires_at: Instant::now() + answer.ttl,
+                                ips: answer.ips.clone(),
+                            },
+                        );
+                        return Ok(answer.ips);
+                    }
+                }
+                Err(e) => {
+                    last_err = Some(e);
                 }
             }
         }
 
-        let ips = self.system_resolve(domain).await?;
-        self.cache.write().insert(
-            domain.to_owned(),
-            CachedDnsEntry {
-                expires_at: Instant::now() + self.default_ttl,
-                ips: ips.clone(),
-            },
-        );
-        Ok(ips)
+        Err(last_err.unwrap_or_else(|| EngineError::Internal("DoH refresh failed: no results".to_owned())))
     }
 
     pub async fn resolve_with_dnssec(&self, domain: &str) -> Result<(Vec<IpAddr>, bool)> {
+        let mut last_err = None;
         for provider in &self.providers {
-            if let Ok(answer) = self.query_doh_provider(provider, domain, true).await {
-                if !answer.ips.is_empty() {
-                    return Ok((answer.ips, answer.ad));
+            match self.query_doh_provider(provider, domain, true).await {
+                Ok(answer) => {
+                    if !answer.ips.is_empty() {
+                        return Ok((answer.ips, answer.ad));
+                    }
+                }
+                Err(e) => {
+                    last_err = Some(e);
                 }
             }
         }
-        Ok((self.system_resolve(domain).await?, false))
+        Err(last_err.unwrap_or_else(|| EngineError::Internal("DoH DNSSEC resolve failed".to_owned())))
     }
 
     async fn query_doh_provider(

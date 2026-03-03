@@ -51,41 +51,56 @@ pub async fn handle_udp_associate(
     let relay_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         let mut client_source_addr: Option<SocketAddr> = None;
+        let mut remote_to_target = std::collections::HashMap::new();
 
         loop {
             tokio::select! {
                 res = udp_recv.recv_from(&mut buf) => {
                     match res {
                         Ok((n, src)) => {
-                            // First packet from client defines the client's UDP source address
                             if client_source_addr.is_none() {
                                 client_source_addr = Some(src);
                             }
 
                             if Some(src) == client_source_addr {
                                 // Packet from client -> remote
-                                if let Err(e) = handle_client_to_remote(conn_id, &udp_send, &buf[..n]).await {
-                                    debug!(conn_id, error = %e, "UDP client->remote relay failed");
+                                match handle_client_to_remote(conn_id, &udp_send, &buf[..n]).await {
+                                    Ok(Some(target_addr)) => {
+                                        // Track which target this packet was sent to, so we can identify replies
+                                        remote_to_target.insert(target_addr, target_addr);
+                                    }
+                                    Err(e) => {
+                                        debug!(conn_id, error = %e, "UDP client->remote relay failed");
+                                    }
+                                    _ => {}
                                 }
                             } else {
                                 // Packet from remote -> client
-                                // We don't know which remote it is yet, the SOCKS5 UDP encapsulation 
-                                // tells us where it's from.
+                                // We identify the target based on the source address of the remote packet
+                                if let Some(target) = remote_to_target.get(&src) {
+                                    if let Some(client_addr) = client_source_addr {
+                                        if let Err(e) = send_to_client(conn_id, &udp_send, client_addr, target, &buf[..n]).await {
+                                            debug!(conn_id, error = %e, "UDP remote->client relay failed");
+                                        }
+                                    }
+                                }
                             }
                         }
                         Err(_) => break,
                     }
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                    // Timeout if no activity
+                _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
                     break;
                 }
             }
         }
     });
 
+    let abort_handle = relay_task.abort_handle();
     tokio::select! {
-        _ = tcp_monitor => {},
+        _ = tcp_monitor => {
+            abort_handle.abort();
+        },
         _ = relay_task => {},
     }
 
@@ -98,16 +113,16 @@ async fn handle_client_to_remote(
     conn_id: u64,
     socket: &UdpSocket,
     data: &[u8],
-) -> std::io::Result<()> {
-    if data.len() < 4 { return Ok(()); }
+) -> std::io::Result<Option<SocketAddr>> {
+    if data.len() < 4 { return Ok(None); }
     // SOCKS5 UDP Encapsulation: [RSV, FRAG, ATYP, DST.ADDR, DST.PORT, DATA]
     let frag = data[2];
-    if frag != 0 { return Ok(()); } // We don't support fragmentation in this simple relay
+    if frag != 0 { return Ok(None); } // We don't support fragmentation in this simple relay
 
     let atyp = data[3];
     let (target_addr, header_len) = match atyp {
         0x01 => {
-            if data.len() < 10 { return Ok(()); }
+            if data.len() < 10 { return Ok(None); }
             let ip = std::net::Ipv4Addr::new(data[4], data[5], data[6], data[7]);
             let port = u16::from_be_bytes([data[8], data[9]]);
             let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
@@ -115,13 +130,13 @@ async fn handle_client_to_remote(
             // BLOCK QUIC (UDP 443) for Google/YouTube IPs
             if port == 443 && is_likely_google_ip(addr.ip()) {
                 debug!(conn_id, "blocking QUIC to IP {} for fallback", addr.ip());
-                return Ok(());
+                return Ok(None);
             }
             (addr, 10)
         }
         0x03 => {
             let len = data[4] as usize;
-            if data.len() < 5 + len + 2 { return Ok(()); }
+            if data.len() < 5 + len + 2 { return Ok(None); }
             let domain = String::from_utf8_lossy(&data[5..5 + len]);
             let port = u16::from_be_bytes([data[5 + len], data[5 + len + 1]]);
             
@@ -130,7 +145,7 @@ async fn handle_client_to_remote(
                 let key = route_destination_key(&domain);
                 if key == "googlevideo.com" || key == "ytimg.com" || domain.contains("google") || domain.contains("youtube") {
                     debug!(conn_id, "blocking QUIC to domain {} for fallback", domain);
-                    return Ok(());
+                    return Ok(None);
                 }
             }
 
@@ -140,14 +155,14 @@ async fn handle_client_to_remote(
                     if let Some(addr) = addrs.next() {
                         (addr, 5 + len + 2)
                     } else {
-                        return Ok(());
+                        return Ok(None);
                     }
                 }
-                Err(_) => return Ok(()),
+                Err(_) => return Ok(None),
             }
         }
         0x04 => {
-            if data.len() < 22 { return Ok(()); }
+            if data.len() < 22 { return Ok(None); }
             let mut ip_bytes = [0u8; 16];
             ip_bytes.copy_from_slice(&data[4..20]);
             let port = u16::from_be_bytes([data[20], data[21]]);
@@ -155,16 +170,42 @@ async fn handle_client_to_remote(
             
             if port == 443 && is_likely_google_ip(addr.ip()) {
                 debug!(conn_id, "blocking QUIC to IPv6 {} for fallback", addr.ip());
-                return Ok(());
+                return Ok(None);
             }
             (addr, 22)
         }
-        _ => return Ok(()),
+        _ => return Ok(None),
     };
 
     // --- UDP RELAY ---
     let payload = &data[header_len..];
     socket.send_to(payload, target_addr).await?;
+    Ok(Some(target_addr))
+}
+
+async fn send_to_client(
+    _conn_id: u64,
+    socket: &UdpSocket,
+    client_addr: SocketAddr,
+    remote_addr: &SocketAddr,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    // SOCKS5 UDP Encapsulation for reply: [RSV(2), FRAG(1), ATYP(1), BND.ADDR, BND.PORT, DATA]
+    let mut reply = vec![0x00, 0x00, 0x00];
+    match remote_addr.ip() {
+        std::net::IpAddr::V4(ip) => {
+            reply.push(0x01);
+            reply.extend_from_slice(&ip.octets());
+        }
+        std::net::IpAddr::V6(ip) => {
+            reply.push(0x04);
+            reply.extend_from_slice(&ip.octets());
+        }
+    }
+    reply.extend_from_slice(&remote_addr.port().to_be_bytes());
+    reply.extend_from_slice(payload);
+
+    socket.send_to(&reply, client_addr).await?;
     Ok(())
 }
 

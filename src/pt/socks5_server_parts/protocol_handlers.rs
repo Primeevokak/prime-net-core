@@ -4,8 +4,9 @@ use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::EngineConfig;
-use crate::error::Result;
+use crate::error::{EngineError, Result};
 use crate::pt::{DynOutbound, TargetAddr, TargetEndpoint};
+
 use crate::pt::socks5_server::*;
 use crate::pt::socks5_server::route_scoring::*;
 use crate::pt::socks5_server::route_connection::*;
@@ -31,17 +32,17 @@ pub async fn handle_http_proxy(
         buf.extend_from_slice(&tmp[..n]);
     }
 
-    let header_end = find_http_header_end(&buf).unwrap();
+    let header_end = find_http_header_end(&buf).ok_or_else(|| EngineError::Internal("malformed http header".to_owned()))?;
     let header_bytes = &buf[..header_end];
     let request = String::from_utf8_lossy(header_bytes);
-    let first_line = request.lines().next().unwrap();
+    let first_line = request.lines().next().ok_or_else(|| EngineError::Internal("empty http request".to_owned()))?;
     let mut parts = first_line.split_whitespace();
-    let method = parts.next().unwrap();
-    let target = parts.next().unwrap();
+    let method = parts.next().ok_or_else(|| EngineError::Internal("invalid http method".to_owned()))?;
+    let target = parts.next().ok_or_else(|| EngineError::Internal("invalid http target".to_owned()))?;
 
     if method == "CONNECT" {
-        let (host, port) = split_host_port_for_connect(target).unwrap();
-        let target_addr = if let Some(ip) = parse_ip_literal(&host) { TargetAddr::Ip(ip) } else { TargetAddr::Domain(host.clone()) };
+        let (host, port) = split_host_port_for_connect(target).ok_or_else(|| EngineError::Internal("invalid http connect target".to_owned()))?;
+        let target_addr = if let Some(ip) = parse_ip_literal(&host) { TargetAddr::Ip(ip) } else { TargetAddr::Domain(host.to_owned()) };
         let target_endpoint = TargetEndpoint { addr: target_addr, port };
         let target_label = target_endpoint.to_string();
         let _candidates = select_route_candidates(&relay_opts, &target_endpoint.addr, target_endpoint.port, &target_label, &cfg);

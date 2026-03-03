@@ -29,14 +29,24 @@ impl ConnectionMonitor {
     }
 
     pub fn tick(&mut self) {
-        while let Ok(info) = self.rx.try_recv() {
-            self.connections.insert(info.id, info);
-            while self.connections.len() > 500 {
-                if let Some(first) = self.connections.keys().next().copied() {
-                    self.connections.remove(&first);
-                } else {
+        loop {
+            match self.rx.try_recv() {
+                Ok(info) => {
+                    self.connections.insert(info.id, info);
+                    while self.connections.len() > 500 {
+                        if let Some(first) = self.connections.keys().next().copied() {
+                            self.connections.remove(&first);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                    self.refresh();
                     break;
                 }
+                Err(broadcast::error::TryRecvError::Closed) => break,
             }
         }
         if self.selected_id.is_none() {

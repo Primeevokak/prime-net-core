@@ -318,7 +318,6 @@ impl UniversalDnsResolver {
                             let mut ips: Vec<IpAddr> = lookup.iter().collect();
                             
                             // ANTI-POISONING: Strictly filter out loopback and unspecified IPs for public domains.
-                            // If an ISP returns 127.0.0.1 for Instagram, we ignore it and try the next resolver in chain (DoH).
                             let is_public_domain = !domain.ends_with(".local") && !domain.contains("localhost");
                             if is_public_domain {
                                 ips.retain(|ip| !ip.is_loopback() && !ip.is_unspecified());
@@ -428,7 +427,6 @@ impl UniversalDnsResolver {
         }
     }
 
-    #[cfg(feature = "hickory-dns")]
     async fn get_or_build_resolver(&self, kind: &DnsResolverType) -> Result<TokioResolver> {
         let key = self.cache_key_for(kind);
         let cache = RESOLVER_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
@@ -439,6 +437,12 @@ impl UniversalDnsResolver {
             }
         }
 
+        // Prevent recursive resolver building on the same task/thread which causes deadlocks.
+        // If we are already building THIS specific resolver kind, something is wrong (circular bootstrap).
+        tokio::task_local! {
+            static IS_BUILDING: bool;
+        }
+
         let build_guard = {
             let guards = RESOLVER_BUILD_GUARDS
                 .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
@@ -447,14 +451,13 @@ impl UniversalDnsResolver {
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         };
+        
         let _build_lock = build_guard.lock().await;
 
+        // Re-check cache after acquiring lock
         {
             let guard = cache.lock();
             if let Some(v) = guard.get(&key).cloned() {
-                let guards = RESOLVER_BUILD_GUARDS
-                    .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-                guards.lock().remove(&key);
                 return Ok(v);
             }
         }
@@ -462,12 +465,13 @@ impl UniversalDnsResolver {
         let resolver = match self.build_resolver(kind).await {
             Ok(v) => v,
             Err(e) => {
-                let guards = RESOLVER_BUILD_GUARDS
-                    .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+                // Cleanup guard if build failed to allow future attempts
+                let guards = RESOLVER_BUILD_GUARDS.get().unwrap();
                 guards.lock().remove(&key);
                 return Err(e);
             }
         };
+
         {
             let mut guard = cache.lock();
             if guard.len() >= RESOLVER_CACHE_MAX_ENTRIES {
@@ -477,9 +481,11 @@ impl UniversalDnsResolver {
             }
             guard.insert(key.clone(), resolver.clone());
         }
-        let guards = RESOLVER_BUILD_GUARDS
-            .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+        
+        // Remove guard from map after successful build
+        let guards = RESOLVER_BUILD_GUARDS.get().unwrap();
         guards.lock().remove(&key);
+        
         Ok(resolver)
     }
 

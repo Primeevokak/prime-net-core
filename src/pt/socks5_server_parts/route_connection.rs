@@ -53,73 +53,77 @@ pub async fn connect_via_best_route(
 ) -> Result<ConnectedRoute> {
     let mut winners: JoinSet<Result<(RouteCandidate, BoxStream, Vec<u8>, bool)>> = JoinSet::new();
     let cand_count = candidates.len();
+    let cfg_arc = Arc::new(cfg.clone());
     
     for (idx, cand) in candidates.into_iter().enumerate() {
-        let c: RouteCandidate = cand.clone();
+        let c = cand.clone();
         let t = target.clone();
         let tl = target_label.to_owned();
         let out = outbound.clone();
         let ro = relay_opts.clone();
-        let config = Arc::new(cfg.clone());
+        let config = cfg_arc.clone(); // CORRECT: Clone Arc, don't move cfg
         let icd = initial_client_data.clone();
+        
         winners.spawn(async move {
             let delay = (idx as u64) * 100;
             if delay > 0 { tokio::time::sleep(Duration::from_millis(delay)).await; }
             
-            let mut stream = connect_route_candidate(conn_id, &t, &tl, &c, out, &ro, config).await?;
+            let mut stream = connect_route_candidate(conn_id, &t, &tl, &c, out, &ro, config.clone()).await?;
             let mut initial_u2c = Vec::new();
             let mut sent = false;
             
-            // SNIPER MODE: For port 443, we MUST verify the connection by sending data and reading a response.
-            // This prevents "fake fast" connections that win the race but fail immediately on data.
             if let Some(ref data) = icd {
                 stream.write_all(data).await?; 
                 stream.flush().await?; 
                 sent = true;
                 
                 let mut buf = [0u8; 1];
-                // Wait for the first byte of response (e.g., Server Hello 0x16)
-                if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(3000), stream.read(&mut buf)).await {
+                // Wait for the first byte of response.
+                if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(2000), stream.read(&mut buf)).await {
                     if n > 0 {
-                        // Basic TLS check: Server Hello starts with 0x16 (Handshake)
+                        // Validate TLS on HTTPS port 443
                         if t.port == 443 && buf[0] != 0x16 {
-                            debug!(conn_id, route = %c.route_label(), byte = buf[0], "invalid tls handshake response (dpi block?)");
+                            debug!(conn_id, route = %c.route_label(), byte = buf[0], "REJECTED: invalid TLS handshake (likely DPI)");
                             return Err(EngineError::Internal("invalid tls handshake (dpi)".to_owned()));
+                        }
+                        // Validate HTTP on port 80 (common fake redirect)
+                        if t.port == 80 && buf[0] == 0x15 {
+                            return Err(EngineError::Internal("DPI block page detected".to_owned()));
                         }
                         initial_u2c.push(buf[0]);
                     }
                 }
                 
-                // If we're on port 443, we REQUIRE a response to win the race.
-                if t.port == 443 && initial_u2c.is_empty() {
-                    return Err(EngineError::Internal("no response from upstream".to_owned()));
+                if initial_u2c.is_empty() && (t.port == 443 || t.port == 80) {
+                    return Err(EngineError::Internal("no response from candidate".to_owned()));
                 }
-            } else if t.port == 443 {
-                // If port 443 but we have no client data, this candidate cannot win a race 
-                // against other potentially better candidates that we can't probe yet.
-                // We let it fail so a more stable route is chosen once we HAVE data.
-                return Err(EngineError::Internal("missing client data for race probing".to_owned()));
             }
             Ok((c, stream, initial_u2c, sent))
         });
     }
 
+    let mut final_res = None;
     while let Some(res) = winners.join_next().await {
         if let Ok(Ok((cand, stream, u2c, sent))) = res {
             if cand_count > 1 {
                 info!(conn_id, route = %cand.route_label(), "route race winner selected");
             }
-            reap_route_race_losers_v3(winners, conn_id, target_label.to_owned());
-            return Ok(ConnectedRoute { 
-                stream, 
-                candidate: cand, 
-                route_key: target_label.to_owned(), 
-                decision_id: 0, 
-                initial_client_data: initial_client_data.unwrap_or_default(), 
-                initial_upstream_data: u2c, 
-                client_data_sent: sent 
-            });
+            final_res = Some((cand, stream, u2c, sent));
+            break;
         }
+    }
+
+    if let Some((cand, stream, u2c, sent)) = final_res {
+        reap_route_race_losers_v3(winners, conn_id, target_label.to_owned());
+        return Ok(ConnectedRoute { 
+            stream, 
+            candidate: cand, 
+            route_key: target_label.to_owned(), 
+            decision_id: 0, 
+            initial_client_data: initial_client_data.unwrap_or_default(), 
+            initial_upstream_data: u2c, 
+            client_data_sent: sent 
+        });
     }
     Err(EngineError::Internal("race failed: no working route found".to_owned()))
 }
@@ -137,15 +141,11 @@ pub async fn handle_socks5_connection(conn_id: u64, mut tcp: TcpStream, peer: So
         let mut req = [0u8; 4];
         tcp.read_exact(&mut req).await?;
         
+        let target = read_socks5_target_endpoint_with_atyp(&mut tcp, req[3]).await?;
         if req[1] == 0x03 {
-            // UDP ASSOCIATE - Now supported with selective QUIC blocking
             return handle_udp_associate(conn_id, tcp, peer).await;
         }
 
-        let target = read_socks5_target_endpoint_with_atyp(&mut tcp, req[3]).await?;
-        
-        tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
-        
         let target_str = target.to_string();
         let route_key = route_destination_key(&target_str);
         let has_cached_winner = {
@@ -154,7 +154,6 @@ pub async fn handle_socks5_connection(conn_id: u64, mut tcp: TcpStream, peer: So
         };
 
         let mut p = [0u8; 4096];
-        // CRITICAL: For port 443, we MUST wait for the TLS Client Hello to perform a safe 'route race'.
         let wait_ms = if target.port == 443 { 2000 } else if has_cached_winner { 500 } else { 1500 };
         
         let icd = match tokio::time::timeout(Duration::from_millis(wait_ms), tcp.read(&mut p)).await {
@@ -177,7 +176,6 @@ pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream,
     let target_label = target.to_string();
     let route_key = route_destination_key(&target_label);
     
-    // 1. Check cached winner
     let cached_winner = {
         let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
         map.get(route_key).map(|w| w.clone())
@@ -195,6 +193,12 @@ pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream,
     
     match route_res {
         Ok(route) => {
+            let label = route.candidate.route_label();
+            info!(conn_id, target = %target_label, route = %label, "connection established");
+            
+            // Send SOCKS5 success reply NOW that we are actually connected
+            tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+
             {
                 let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
                 map.insert(route_key.to_owned(), RouteWinner {
@@ -204,18 +208,22 @@ pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream,
             }
             let mut upstream = route.stream;
             let relay_res = relay_bidirectional(&mut tcp, &mut upstream, relay_opts, route.initial_client_data, route.initial_upstream_data, route.client_data_sent).await;
-            if let Err(ref e) = relay_res {
-                let signal = classify_io_error(e);
-                if signal == BlockingSignal::Reset || signal == BlockingSignal::Timeout {
-                    debug!(conn_id, error = %e, signal = ?signal, "upstream relay failed, invalidating cache for {}", route_key);
-                    let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
-                    map.remove(route_key);
-                } else {
-                    debug!(conn_id, error = %e, signal = ?signal, "client disconnected, keeping cache for {}", route_key);
+            
+            match relay_res {
+                Ok((c2u, u2c)) => {
+                    info!(conn_id, tx = c2u, rx = u2c, "session finished normally");
+                    Ok(())
                 }
-                return Err(EngineError::Io(std::io::Error::new(e.kind(), e.to_string())));
+                Err(e) => {
+                    let signal = classify_io_error(&e);
+                    if signal == BlockingSignal::Reset || signal == BlockingSignal::Timeout {
+                        debug!(conn_id, error = %e, signal = ?signal, "upstream failure, invalidating cache for {}", route_key);
+                        let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
+                        map.remove(route_key);
+                    }
+                    Err(EngineError::Io(std::io::Error::new(e.kind(), e.to_string())))
+                }
             }
-            Ok(())
         }
         Err(e) => {
             let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
@@ -236,7 +244,6 @@ async fn read_socks5_target_endpoint_with_atyp(tcp: &mut TcpStream, atyp: u8) ->
 }
 
 fn reap_route_race_losers_v3(mut winners: JoinSet<Result<(RouteCandidate, BoxStream, Vec<u8>, bool)>>, _cid: u64, _tl: String) {
-    // CRITICAL FIX: Abort all pending connections immediately so they don't leak sockets.
     winners.abort_all();
     tokio::spawn(async move { while let Some(_) = winners.join_next().await {} });
 }

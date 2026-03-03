@@ -167,7 +167,10 @@ impl ChunkManager {
         progress: Option<ProgressHook>,
     ) -> Result<()> {
         use std::fs::OpenOptions;
-        use std::io::{Seek, SeekFrom, Write};
+        #[cfg(windows)]
+        use std::os::windows::fs::FileExt;
+        #[cfg(unix)]
+        use std::os::unix::fs::FileExt;
 
         let file = OpenOptions::new()
             .write(true)
@@ -177,7 +180,7 @@ impl ChunkManager {
         if content_length > 0 {
             file.set_len(content_length)?;
         }
-        let file = Arc::new(parking_lot::Mutex::new(file));
+        let file = Arc::new(file);
 
         let chunks = self.calculate_chunks(content_length);
         let concurrency = self.current_concurrency();
@@ -205,10 +208,12 @@ impl ChunkManager {
 
                 let chunk_len = bytes.len() as u64;
                 let chunk_start = chunk.start;
+                
                 tokio::task::spawn_blocking(move || {
-                    let mut guard = file.lock();
-                    guard.seek(SeekFrom::Start(chunk_start))?;
-                    guard.write_all(&bytes)?;
+                    #[cfg(windows)]
+                    file.seek_write(&bytes, chunk_start)?;
+                    #[cfg(unix)]
+                    file.write_at(&bytes, chunk_start)?;
                     Ok::<(), std::io::Error>(())
                 })
                 .await

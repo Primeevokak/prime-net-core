@@ -18,8 +18,8 @@ const MAX_LOGS_SIZE_BYTES: usize = 5 * 1024 * 1024;
 pub struct LogViewer {
     pub logs: Arc<RwLock<VecDeque<LogEntry>>>,
     approx_size_bytes: AtomicUsize,
-    // Optimisation: store filtered logs in a separate Arc-wrapped Vec to avoid re-cloning and re-filtering
-    filtered_cache: RwLock<Arc<Vec<LogEntry>>>,
+    filtered_storage: RwLock<Vec<LogEntry>>,
+    filtered_snapshot: RwLock<Arc<Vec<LogEntry>>>,
     cache_dirty: AtomicBool,
     filter_level: RwLock<Option<Level>>,
     category_filter: RwLock<Option<String>>,
@@ -48,7 +48,8 @@ impl LogViewer {
         Self {
             logs: Arc::new(RwLock::new(VecDeque::with_capacity(10_000))),
             approx_size_bytes: AtomicUsize::new(0),
-            filtered_cache: RwLock::new(Arc::new(Vec::new())),
+            filtered_storage: RwLock::new(Vec::with_capacity(10_000)),
+            filtered_snapshot: RwLock::new(Arc::new(Vec::new())),
             cache_dirty: AtomicBool::new(true),
             filter_level: RwLock::new(None),
             category_filter: RwLock::new(None),
@@ -79,13 +80,12 @@ impl LogViewer {
         self.approx_size_bytes
             .store(current_size, Ordering::Relaxed);
 
-        // 2. Incremental update of the filtered cache if cache isn't already fully dirty
-        if !self.cache_dirty.load(Ordering::Relaxed) && !removed_any {
+        // 2. Incremental update of the filtered storage
+        if !removed_any {
             if self.entry_matches_filters(&entry) {
-                let mut cache = self.filtered_cache.write();
-                let mut new_vec = (**cache).clone();
-                new_vec.push(entry);
-                *cache = Arc::new(new_vec);
+                let mut storage = self.filtered_storage.write();
+                storage.push(entry);
+                self.cache_dirty.store(true, Ordering::Relaxed);
             }
         } else {
             self.cache_dirty.store(true, Ordering::Relaxed);
@@ -124,8 +124,10 @@ impl LogViewer {
         self.logs.write().clear();
         self.approx_size_bytes.store(0, Ordering::Relaxed);
         {
-            let mut cache = self.filtered_cache.write();
-            *cache = Arc::new(Vec::new());
+            let mut storage = self.filtered_storage.write();
+            storage.clear();
+            let mut snapshot = self.filtered_snapshot.write();
+            *snapshot = Arc::new(Vec::new());
         }
         self.cache_dirty.store(false, Ordering::Relaxed);
         self.selected_line.store(0, Ordering::Relaxed);
@@ -133,22 +135,32 @@ impl LogViewer {
 
     pub fn filtered_logs(&self) -> Arc<Vec<LogEntry>> {
         if !self.cache_dirty.load(Ordering::Relaxed) {
-            return self.filtered_cache.read().clone();
+            return self.filtered_snapshot.read().clone().into();
         }
 
-        // Full re-filter (slow path, only happens on filter change or buffer wrap)
-        let logs = self.logs.read();
-        let filtered = logs
-            .iter()
-            .filter(|entry| self.entry_matches_filters(entry))
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut snapshot = self.filtered_snapshot.write();
+        // Check dirty again after write lock
+        if !self.cache_dirty.load(Ordering::Relaxed) {
+            return (**snapshot).clone().into();
+        }
 
-        let mut cache = self.filtered_cache.write();
-        *cache = Arc::new(filtered);
+        let logs = self.logs.read();
+        let mut storage = self.filtered_storage.write();
+        
+        // Full re-filter if storage state is suspicious
+        if storage.is_empty() && !logs.is_empty() || storage.len() > logs.len() {
+             let filtered = logs
+                .iter()
+                .filter(|entry| self.entry_matches_filters(entry))
+                .cloned()
+                .collect::<Vec<_>>();
+             *storage = filtered;
+        }
+
+        *snapshot = Arc::new(storage.clone());
         self.cache_dirty.store(false, Ordering::Relaxed);
 
-        cache.clone()
+        Arc::new(storage.clone())
     }
 
     pub fn visible_logs(&self, max_lines: usize) -> Vec<LogEntry> {
