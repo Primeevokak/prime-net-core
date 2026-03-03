@@ -5,6 +5,9 @@ use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinSet;
 use tokio::time::Duration;
+use std::time::Instant;
+use crate::pt::socks5_server::protocol_handlers::tune_relay_for_target;
+use crate::pt::socks5_server::ml_shadow::complete_route_outcome_event;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -146,6 +149,9 @@ pub async fn handle_socks5_connection(conn_id: u64, mut tcp: TcpStream, peer: So
             return handle_udp_associate(conn_id, tcp, peer).await;
         }
 
+        // UNBLOCK CLIENT: Send SOCKS5 success reply NOW so the client can send its first payload (e.g. TLS Client Hello)
+        tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+
         let target_str = target.to_string();
         let route_key = route_destination_key(&target_str);
         let has_cached_winner = {
@@ -154,7 +160,8 @@ pub async fn handle_socks5_connection(conn_id: u64, mut tcp: TcpStream, peer: So
         };
 
         let mut p = [0u8; 4096];
-        let wait_ms = if target.port == 443 { 2000 } else if has_cached_winner { 500 } else { 1500 };
+        let is_discord = target_str.contains("discord");
+        let wait_ms = if is_discord { 500 } else if target.port == 443 { 2000 } else if has_cached_winner { 500 } else { 1500 };
         
         let icd = match tokio::time::timeout(Duration::from_millis(wait_ms), tcp.read(&mut p)).await {
             Ok(Ok(n)) if n > 0 => Some(p[..n].to_vec()),
@@ -174,6 +181,9 @@ pub async fn handle_socks5_connection(conn_id: u64, mut tcp: TcpStream, peer: So
 
 pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream, _peer: SocketAddr, _cl: &str, target: &TargetEndpoint, outbound: DynOutbound, cfg: Arc<EngineConfig>, relay_opts: RelayOptions, icd: Option<Vec<u8>>) -> Result<()> {
     let target_label = target.to_string();
+    let tuned = tune_relay_for_target(relay_opts, target.port, &target_label, false, false);
+    let relay_opts = tuned.options;
+    
     let route_key = route_destination_key(&target_label);
     
     let cached_winner = {
@@ -196,9 +206,6 @@ pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream,
             let label = route.candidate.route_label();
             info!(conn_id, target = %target_label, route = %label, "connection established");
             
-            // Send SOCKS5 success reply NOW that we are actually connected
-            tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
-
             {
                 let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
                 map.insert(route_key.to_owned(), RouteWinner {
@@ -207,15 +214,18 @@ pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream,
                 });
             }
             let mut upstream = route.stream;
+            let start_time = Instant::now();
             let relay_res = relay_bidirectional(&mut tcp, &mut upstream, relay_opts, route.initial_client_data, route.initial_upstream_data, route.client_data_sent).await;
             
             match relay_res {
                 Ok((c2u, u2c)) => {
                     info!(conn_id, tx = c2u, rx = u2c, "session finished normally");
+                    complete_route_outcome_event(conn_id, route_key, Some(&route.candidate), true, true, u2c, start_time.elapsed().as_millis() as u64, "", &cfg);
                     Ok(())
                 }
                 Err(e) => {
                     let signal = classify_io_error(&e);
+                    complete_route_outcome_event(conn_id, route_key, Some(&route.candidate), false, false, 0, start_time.elapsed().as_millis() as u64, &format!("{:?}", signal), &cfg);
                     if signal == BlockingSignal::Reset || signal == BlockingSignal::Timeout {
                         debug!(conn_id, error = %e, signal = ?signal, "upstream failure, invalidating cache for {}", route_key);
                         let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);

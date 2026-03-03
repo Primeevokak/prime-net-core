@@ -68,6 +68,14 @@ pub fn ordered_route_candidates(route_key: &str, candidates: Vec<RouteCandidate>
 
 pub fn is_censored_domain(domain: &str, _relay_opts: &RelayOptions, cfg: &EngineConfig) -> bool {
     let dest_lower = domain.to_lowercase();
+    
+    // HARDCODED PROTECTION: Ensure these platforms always use bypass routes for all subdomains
+    if dest_lower.contains("soundcloud") || dest_lower.contains("sndcdn") || 
+       dest_lower.contains("instagram") || dest_lower.contains("facebook") || dest_lower.contains("fbcdn") ||
+       dest_lower.contains("discord") || dest_lower.contains("youtube") || dest_lower.contains("googlevideo") {
+        return true;
+    }
+
     let group_key = route_destination_key(&dest_lower);
     let now = now_unix_secs();
 
@@ -77,7 +85,8 @@ pub fn is_censored_domain(domain: &str, _relay_opts: &RelayOptions, cfg: &Engine
         // Check both the specific subdomain and the SLD group
         for key in [&dest_lower, group_key] {
             if let Some(stats) = classifier.get(key) {
-                if stats.successes == 0 && (stats.resets > 0 || stats.timeouts >= 2) && now.saturating_sub(stats.last_seen_unix) < 900 {
+                // AGGRESSIVE: Switch to bypass on FIRST reset or FIRST timeout if no successes recorded yet.
+                if stats.successes == 0 && (stats.resets > 0 || stats.timeouts >= 1) && now.saturating_sub(stats.last_seen_unix) < 600 {
                     return true;
                 }
             }

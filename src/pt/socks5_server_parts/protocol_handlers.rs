@@ -62,6 +62,24 @@ pub async fn handle_http_proxy(
     }
 }
 
-pub fn tune_relay_for_target(opts: RelayOptions, _p: u16, _d: &str, _s4: bool, _http: bool) -> TunedRelay {
-    TunedRelay { options: opts, stage: 1, source: StageSelectionSource::Default }
+pub fn tune_relay_for_target(mut opts: RelayOptions, port: u16, destination: &str, _s4: bool, _http: bool) -> TunedRelay {
+    let dest_lower = destination.to_lowercase();
+    let is_censored = dest_lower.contains("soundcloud") || dest_lower.contains("instagram") || dest_lower.contains("facebook") || dest_lower.contains("fbcdn");
+    
+    let stage = if is_censored && port == 443 {
+        // For highly censored media platforms, use aggressive fragmentation by default
+        opts.fragment_client_hello = true;
+        opts.fragment_size_min = 1;
+        opts.fragment_size_max = 32; // Very small chunks
+        opts.fragment_sleep_ms = 10; // Slow down to confuse DPI
+        2 // Start at stage 2 (more aggressive)
+    } else {
+        1
+    };
+
+    TunedRelay { 
+        options: opts, 
+        stage, 
+        source: if is_censored { StageSelectionSource::DomainMatch } else { StageSelectionSource::Default } 
+    }
 }

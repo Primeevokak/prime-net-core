@@ -34,7 +34,7 @@ impl RouteIpFamily { pub fn label(&self) -> &'static str { match self { Self::V4
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteRaceReason { NonTlsPort, SingleCandidate, NoWinner, EmptyWinner, WinnerStale, WinnerMissingFromCandidates, WinnerWeak, WinnerHealthy }
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-pub enum StageSelectionSource { #[default] Default }
+pub enum StageSelectionSource { #[default] Default, Classifier, DomainMatch }
 
 // --- GLOBAL STRUCTS ---
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -306,20 +306,6 @@ impl DoHResolver {
         })
     }
 
-    async fn system_resolve(&self, domain: &str) -> Result<Vec<IpAddr>> {
-        let result = tokio::net::lookup_host((domain, 443))
-            .await
-            .map_err(|e| EngineError::Internal(e.to_string()))?;
-        let mut ips: Vec<IpAddr> = result.map(|addr| addr.ip()).collect();
-        ips.sort_unstable();
-        ips.dedup();
-        if ips.is_empty() {
-            return Err(EngineError::Internal(
-                "DNS resolve produced no addresses".to_owned(),
-            ));
-        }
-        Ok(ips)
-    }
 }
 
 #[derive(Debug, Deserialize)]
