@@ -34,7 +34,8 @@ impl DomainFrontingProxy {
     }
 
     pub fn upsert_mapping(&mut self, host: impl Into<String>, cfg: FrontConfig) {
-        self.mapping.insert(host.into().to_ascii_lowercase(), cfg);
+        let host = host.into().trim_end_matches('.').to_ascii_lowercase();
+        self.mapping.insert(host, cfg);
     }
 
     pub fn apply_fronting(&self, req: &mut RequestData) -> Result<()> {
@@ -42,7 +43,8 @@ impl DomainFrontingProxy {
         let Some(host) = parsed.host_str() else {
             return Ok(());
         };
-        let Some(cfg) = self.mapping.get(&host.to_ascii_lowercase()) else {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        let Some(cfg) = self.mapping.get(&host) else {
             return Ok(());
         };
 
@@ -93,5 +95,24 @@ mod tests {
                 .map(|(_, v)| v.as_str()),
             Some("blocked.example")
         );
+    }
+
+    #[test]
+    fn apply_fronting_handles_trailing_dot_in_url() {
+        let mut proxy = DomainFrontingProxy::new();
+        proxy.upsert_mapping(
+            "blocked.example",
+            FrontConfig {
+                front_domain: "front.cloudflare.example".to_owned(),
+                real_host: "blocked.example".to_owned(),
+                sni_domain: "front.cloudflare.example".to_owned(),
+                provider: CdnProvider::Cloudflare,
+            },
+        );
+
+        let mut request = RequestData::get("https://blocked.example./path");
+        proxy.apply_fronting(&mut request).unwrap();
+
+        assert_eq!(request.url, "https://front.cloudflare.example/path");
     }
 }

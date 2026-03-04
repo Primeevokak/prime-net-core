@@ -220,7 +220,9 @@ impl RequestOpGuard {
 impl Drop for RequestOpGuard {
     fn drop(&mut self) {
         if self.finish() {
-            // SAFETY: lifecycle map guarantees single final drop point.
+            // SAFETY: The REQUEST_LIFECYCLE map acts as a reference counter for raw FFI pointers.
+            // When finish() returns true, it confirms that all asynchronous operations and 
+            // the user-held handle have reached a terminal state, making it safe to reclaim memory.
             unsafe {
                 drop(Box::from_raw(self.ptr as *mut PrimeRequestHandleInner));
             }
@@ -228,11 +230,14 @@ impl Drop for RequestOpGuard {
     }
 }
 
+// SAFETY: Internal helper to safely cast the opaque FFI handle back to a Rust reference.
 unsafe fn engine_from_ptr<'a>(engine: *mut PrimeEngine) -> Option<&'a PrimeEngineHandle> {
     if engine.is_null() {
         return None;
     }
-    // SAFETY: caller provides an opaque pointer from FFI boundary.
+    // SAFETY: The FFI boundary guarantees that 'engine' is a pointer to PrimeEngineOpaque
+    // allocated via Box::into_raw in prime_engine_new. We use a magic number check to 
+    // further validate the pointer's provenance.
     let opaque = unsafe { &*(engine as *mut PrimeEngineOpaque) };
     if opaque.magic != PRIME_ENGINE_MAGIC {
         return None;
@@ -422,16 +427,11 @@ pub unsafe extern "C" fn prime_engine_fetch_async(
         let abort = match abort_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(v) => Some(v),
             Err(_) => {
-                // Do not drop the request on this edge case: return a live handle so caller
-                // can still wait for completion and avoid orphaned background work.
-                set_last_error(EngineError::Internal(
-                    "engine did not acknowledge async request in time; continuing without abort handle"
-                        .to_owned(),
-                ));
+                tracing::warn!("FFI: engine did not acknowledge async request in 5s; abort capability will be hydrated lazily");
                 None
             }
         };
-        let abort_rx = if abort.is_some() {
+        let abort_rx_store = if abort.is_some() {
             None
         } else {
             Some(abort_rx)
@@ -442,7 +442,7 @@ pub unsafe extern "C" fn prime_engine_fetch_async(
             tx,
             status,
             abort: parking_lot::Mutex::new(abort),
-            abort_rx: parking_lot::Mutex::new(abort_rx),
+            abort_rx: parking_lot::Mutex::new(abort_rx_store),
         })) as *mut PrimeRequestHandle;
         register_request_handle(ptr);
         ptr
@@ -478,11 +478,7 @@ pub unsafe extern "C" fn prime_request_wait(
             // SAFETY: pointer was allocated by prime_engine_fetch_async.
             // SAFETY: Lifecycle map ensures pointer is valid and not already freed.
             let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
-
-            // If already cancelled, return immediately.
-            if inner.status.load(Ordering::SeqCst) == PrimeRequestStatus::CANCELLED as u8 {
-                return pack_error(PRIME_ERR_RUNTIME, "cancelled");
-            }
+            try_hydrate_abort_handle(inner);
 
             let res = if timeout_ms == 0 {
                 inner.rx.lock().recv().map_err(|_| {
@@ -556,6 +552,7 @@ pub unsafe extern "C" fn prime_request_cancel(handle: *mut PrimeRequestHandle) -
             // SAFETY: pointer was allocated by prime_engine_fetch_async.
             // SAFETY: Lifecycle map ensures pointer is valid and not already freed.
             let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
+            try_hydrate_abort_handle(inner);
 
             let cur = inner.status.load(Ordering::SeqCst);
             if cur == PrimeRequestStatus::COMPLETED as u8 || cur == PrimeRequestStatus::FAILED as u8
@@ -632,6 +629,8 @@ pub unsafe extern "C" fn prime_request_free(handle: *mut PrimeRequestHandle) {
             // Best-effort: cancel underlying task to avoid background network activity after handle free.
             // SAFETY: Lifecycle map ensures pointer is valid and not already freed.
             let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
+            try_hydrate_abort_handle(inner);
+
             let cur = inner.status.load(Ordering::SeqCst);
             if cur != PrimeRequestStatus::COMPLETED as u8
                 && cur != PrimeRequestStatus::FAILED as u8

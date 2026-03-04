@@ -68,7 +68,7 @@ pub async fn connect_via_best_route(
         let icd = initial_client_data.clone();
         
         winners.spawn(async move {
-            let delay = (idx as u64) * 100;
+            let delay = (idx as u64) * 250;
             if delay > 0 { tokio::time::sleep(Duration::from_millis(delay)).await; }
             
             let mut stream = connect_route_candidate(conn_id, &t, &tl, &c, out, &ro, config.clone()).await?;
@@ -146,7 +146,10 @@ pub async fn handle_socks5_connection(conn_id: u64, mut tcp: TcpStream, peer: So
         
         let target = read_socks5_target_endpoint_with_atyp(&mut tcp, req[3]).await?;
         if req[1] == 0x03 {
-            return handle_udp_associate(conn_id, tcp, peer).await;
+            let resolver = outbound
+                .resolver()
+                .ok_or_else(|| EngineError::Internal("resolver missing for UDP associate".to_owned()))?;
+            return handle_udp_associate(conn_id, tcp, peer, resolver).await;
         }
 
         // UNBLOCK CLIENT: Send SOCKS5 success reply NOW so the client can send its first payload (e.g. TLS Client Hello)

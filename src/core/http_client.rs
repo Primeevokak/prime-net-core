@@ -74,7 +74,7 @@ pub struct PrimeHttpClient {
     client_plain: reqwest::Client,
     client_ech_grease: Option<reqwest::Client>,
     client_ech_real_cache: parking_lot::Mutex<std::collections::HashMap<String, reqwest::Client>>,
-    h3_endpoint: Option<quinn::Endpoint>,
+    h3_endpoint: parking_lot::Mutex<Option<quinn::Endpoint>>,
     config: EngineConfig,
     chunk_manager: ChunkManager,
     resolver_chain: std::sync::Arc<ResolverChain>,
@@ -571,6 +571,7 @@ fn build_rustls_client_config(
     // ALPN protocols (drives HTTP/2 negotiation).
     let mut alpn = Vec::new();
     for p in &cfg.tls.alpn_protocols {
+        let p: &str = p.as_ref();
         let p = p.trim();
         if !p.is_empty() {
             alpn.push(p.as_bytes().to_vec());

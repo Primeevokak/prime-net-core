@@ -56,12 +56,20 @@ impl PrimeHttpClient {
             .resolver_chain
             .lookup_ech_config_list(&host)
             .await
-            .unwrap_or_default();
-        let ech_list = ech_list?;
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, host = %host, "ECH config lookup failed; falling back to plain TLS");
+                None
+            });
+        let Some(ech_list) = ech_list else {
+            return None;
+        };
 
         let ech_config = match build_rustls_ech_config(&ech_list) {
             Ok(v) => v,
-            Err(_) => return None,
+            Err(e) => {
+                tracing::warn!(error = %e, host = %host, "ECH config parse failed; falling back to plain TLS");
+                return None;
+            }
         };
 
         let tls = match build_rustls_client_config(
@@ -437,12 +445,32 @@ impl PrimeHttpClient {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
 
+        let max_bytes = (self.config.download.max_response_body_mb as u64) * 1024 * 1024;
+        if let Some(cl) = total_opt {
+            if cl > max_bytes {
+                return Err(EngineError::Internal(format!(
+                    "response body too large ({} bytes, limit is {} MB)",
+                    cl, self.config.download.max_response_body_mb
+                )));
+            }
+        }
+
         let mut body = resp.into_body();
         let mut out = Vec::new();
+        if let Some(cl) = total_opt {
+            out.reserve(cl as usize);
+        }
+
         while let Some(frame) = body.frame().await {
             let frame =
                 frame.map_err(|e| EngineError::Internal(format!("body read failed: {e}")))?;
             if let Ok(data) = frame.into_data() {
+                if (out.len() + data.len()) as u64 > max_bytes {
+                    return Err(EngineError::Internal(format!(
+                        "response body exceeded limit of {} MB during fragmented download",
+                        self.config.download.max_response_body_mb
+                    )));
+                }
                 out.extend_from_slice(&data);
                 if let Some(cb) = &progress {
                     let downloaded = out.len() as u64;

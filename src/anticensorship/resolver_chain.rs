@@ -580,14 +580,27 @@ async fn system_resolve(domain: &str) -> Result<Vec<IpAddr>> {
 
 fn sanitize_resolved_ips(domain: &str, mut ips: Vec<IpAddr>) -> Result<Vec<IpAddr>> {
     if should_filter_poisoned_ips(domain) {
-        ips.retain(|ip| !ip.is_unspecified() && !ip.is_loopback());
+        ips.retain(|ip| {
+            !ip.is_unspecified() && !ip.is_loopback() && !is_private_ip(ip)
+        });
         if ips.is_empty() {
             return Err(EngineError::InvalidInput(format!(
-                "dns resolver returned only unspecified/sinkhole IPs for '{domain}'"
+                "dns resolver returned only unspecified/private/sinkhole IPs for public domain '{domain}'"
             )));
         }
     }
     Ok(ips)
+}
+
+fn is_private_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            // IPv6 unique local address (fc00::/7) or link local (fe80::/10)
+            let octets = v6.octets();
+            (octets[0] & 0xfe) == 0xfc || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+        }
+    }
 }
 
 fn should_filter_poisoned_ips(domain: &str) -> bool {

@@ -21,9 +21,11 @@ impl SignatureVerifier {
             || self
                 .public_key_fingerprint
                 .contains("REPLACE_WITH_REAL_RELEASE_SIGNING_FINGERPRINT")
+            || self.public_key_fingerprint == "0123456789ABCDEF0123456789ABCDEF01234567"
+            || self.public_key.contains("7E2X7E2X7E2X7E2X")
         {
             return Err(EngineError::Internal(
-                "release signature verification is not configured: public key/fingerprint placeholders are still set"
+                "release signature verification is not configured: public key/fingerprint placeholders or dummy values are still set"
                     .to_owned(),
             ));
         }
@@ -100,7 +102,7 @@ fn normalize_fingerprint(value: &str) -> Option<String> {
         .filter(|c| c.is_ascii_hexdigit())
         .map(|c| c.to_ascii_uppercase())
         .collect();
-    if normalized.len() < 16 {
+    if normalized.len() < 32 {
         return None;
     }
     Some(normalized)
@@ -115,7 +117,7 @@ BQJmlfNaAhsDBQsJCAcCBhUKCQgLAgQWAgMBAh4BAheAAAoJEOxNl+xNl+xNl+xA
 9A6xTj9E6N1U3W7Q4Q6P8H7A6S9K7D5G8F2UH4I8J9K0
 -----END PGP PUBLIC KEY BLOCK-----"#;
 
-const PRIME_NET_PUBLIC_KEY_FINGERPRINT: &str = "0123456789ABCDEF0123456789ABCDEF";
+const PRIME_NET_PUBLIC_KEY_FINGERPRINT: &str = "0123456789ABCDEF0123456789ABCDEF01234567";
 
 #[cfg(test)]
 mod tests {
@@ -123,9 +125,9 @@ mod tests {
 
     #[test]
     fn normalize_fingerprint_accepts_spaced_lowercase() {
-        let got = normalize_fingerprint("ab cd ef 12 34 56 78 90")
+        let got = normalize_fingerprint("ab cd ef 12 34 56 78 90 ab cd ef 12 34 56 78 90 ab cd ef 12")
             .expect("must normalize valid fingerprint");
-        assert_eq!(got, "ABCDEF1234567890");
+        assert_eq!(got, "ABCDEF1234567890ABCDEF1234567890ABCDEF12");
     }
 
     #[test]

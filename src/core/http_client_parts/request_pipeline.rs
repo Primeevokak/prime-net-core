@@ -11,6 +11,7 @@ impl PrimeHttpClient {
             max_concurrency: config.download.max_concurrency,
             chunk_size_bytes: config.download.chunk_size_mb * 1024 * 1024,
             adaptive_threshold_mbps: config.download.adaptive_threshold_mbps,
+            max_response_body_mb: config.download.max_response_body_mb,
         };
 
         let pool = ConnectionPoolConfig {
@@ -50,7 +51,7 @@ impl PrimeHttpClient {
             client_plain,
             client_ech_grease,
             client_ech_real_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            h3_endpoint: None,
+            h3_endpoint: None.into(),
             chunk_manager: ChunkManager::new(strategy, config.download.adaptive_enabled),
             fronting,
             fronting_v2,

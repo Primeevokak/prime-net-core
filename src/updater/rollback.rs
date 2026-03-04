@@ -80,23 +80,33 @@ impl RollbackManager {
     fn replace_binary(&self, source: &Path, dest: &Path) -> Result<()> {
         #[cfg(unix)]
         {
-            fs::copy(source, dest)?;
+            let temp_dest = dest.with_extension("tmp-update");
+            fs::copy(source, &temp_dest)?;
+
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(dest)?.permissions();
+            let mut perms = fs::metadata(&temp_dest)?.permissions();
             perms.set_mode(0o755);
-            fs::set_permissions(dest, perms)?;
+            fs::set_permissions(&temp_dest, perms)?;
+
+            fs::rename(&temp_dest, dest)?;
         }
 
         #[cfg(windows)]
         {
             let dest_backup = dest.with_extension("old");
-            fs::rename(dest, &dest_backup)?;
+            fs::rename(dest, &dest_backup).map_err(|e| EngineError::Internal(format!("failed to move current binary to backup: {e}")))?;
             match fs::copy(source, dest) {
                 Ok(_) => {
-                    let _ = fs::remove_file(dest_backup);
+                    if let Err(e) = fs::remove_file(&dest_backup) {
+                        tracing::warn!(error = %e, path = %dest_backup.display(), "failed to remove old binary backup (non-critical)");
+                    }
                 }
                 Err(e) => {
-                    let _ = fs::rename(dest_backup, dest);
+                    fs::rename(&dest_backup, dest).map_err(|e2| {
+                        EngineError::Internal(format!(
+                            "CRITICAL: update failed and recovery failed too. Original: {e}, Recovery: {e2}"
+                        ))
+                    })?;
                     return Err(e.into());
                 }
             }

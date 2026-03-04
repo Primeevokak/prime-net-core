@@ -243,6 +243,7 @@ fn short(value: &str, max_len: usize) -> String {
 fn ua_summary(cfg: &EngineConfig) -> String {
     match cfg.privacy.user_agent.preset {
         UserAgentPreset::ChromeWindows => "пресет=chrome_windows".to_owned(),
+        UserAgentPreset::FirefoxWindows => "пресет=firefox_windows".to_owned(),
         UserAgentPreset::FirefoxLinux => "пресет=firefox_linux".to_owned(),
         UserAgentPreset::SafariMacOs => "пресет=safari_macos".to_owned(),
         UserAgentPreset::Custom => {
@@ -265,6 +266,7 @@ fn detail_lines(selected_item: usize, cfg: &EngineConfig) -> Vec<Line<'static>> 
                 "Пресет: {}",
                 match cfg.privacy.user_agent.preset {
                     UserAgentPreset::ChromeWindows => "chrome_windows",
+                    UserAgentPreset::FirefoxWindows => "firefox_windows",
                     UserAgentPreset::FirefoxLinux => "firefox_linux",
                     UserAgentPreset::SafariMacOs => "safari_macos",
                     UserAgentPreset::Custom => "custom",
@@ -318,7 +320,8 @@ fn detail_lines(selected_item: usize, cfg: &EngineConfig) -> Vec<Line<'static>> 
 
 fn cycle_ua_preset(current: &UserAgentPreset) -> UserAgentPreset {
     match current {
-        UserAgentPreset::ChromeWindows => UserAgentPreset::FirefoxLinux,
+        UserAgentPreset::ChromeWindows => UserAgentPreset::FirefoxWindows,
+        UserAgentPreset::FirefoxWindows => UserAgentPreset::FirefoxLinux,
         UserAgentPreset::FirefoxLinux => UserAgentPreset::SafariMacOs,
         UserAgentPreset::SafariMacOs => UserAgentPreset::Custom,
         UserAgentPreset::Custom => UserAgentPreset::ChromeWindows,

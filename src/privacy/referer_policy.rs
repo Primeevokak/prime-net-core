@@ -137,11 +137,13 @@ fn upsert_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RefererPolicy;
 
     #[test]
     fn strips_search_referer() {
         let cfg = RefererConfig {
             enabled: true,
+            policy: RefererPolicy::Origin,
             mode: RefererMode::OriginOnly,
             strip_from_search_engines: true,
             search_engine_domains: Vec::new(),
@@ -162,6 +164,7 @@ mod tests {
     fn keeps_same_origin_referer() {
         let cfg = RefererConfig {
             enabled: true,
+            policy: RefererPolicy::Origin,
             mode: RefererMode::Strip,
             strip_from_search_engines: true,
             search_engine_domains: Vec::new(),

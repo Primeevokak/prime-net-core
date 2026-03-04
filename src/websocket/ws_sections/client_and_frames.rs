@@ -151,8 +151,8 @@ impl WebSocketClient {
             let candidates: Vec<String> = if !rule.front_domains.is_empty() {
                 rule.front_domains
                     .iter()
-                    .map(|s| s.trim().to_owned())
-                    .filter(|s| !s.is_empty())
+                    .map(|s: &String| s.trim().to_owned())
+                    .filter(|s: &String| !s.is_empty())
                     .collect()
             } else if !rule.front_domain.trim().is_empty() {
                 vec![rule.front_domain.trim().to_owned()]
@@ -471,7 +471,7 @@ async fn ws_worker(
         {
             Ok(()) => {
                 // graceful close
-                break;
+                return;
             }
             Err(e) => {
                 attempts += 1;
@@ -538,7 +538,11 @@ async fn connect_and_run(
 
     loop {
         tokio::select! {
-            Some(msg) = out_rx.recv() => {
+            msg_opt = out_rx.recv() => {
+                let Some(msg) = msg_opt else {
+                    tracing::debug!("WebSocket command channel closed, shutting down worker");
+                    break Ok(());
+                };
                 match msg {
                     WsMessage::Text(t) => {
                         let data = t.into_bytes();

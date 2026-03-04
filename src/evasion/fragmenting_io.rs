@@ -136,8 +136,8 @@ impl<T> FragmentingIo<T> {
     fn next_write_limit(&mut self, buf: &[u8]) -> usize {
         let buf_len = buf.len();
         if self.first_write && self.cfg.split_at_sni && !self.sni_plan_initialized {
-            self.sni_plan_initialized = true;
             if let Some((sni_off, sni_len)) = find_sni_info(buf) {
+                self.sni_plan_initialized = true;
                 let mut plan = Vec::new();
                 if sni_off > 0 {
                     plan.push(sni_off);
@@ -163,23 +163,27 @@ impl<T> FragmentingIo<T> {
                 if !plan.is_empty() {
                     self.cfg.first_write_plan = Some(plan);
                 }
+            } else if buf_len >= 1024 {
+                // If we've seen 1KB and still no SNI, stop trying to find it.
+                self.sni_plan_initialized = true;
             }
         }
 
         if let Some(plan) = self.cfg.first_write_plan.as_deref() {
             // The plan is applied across multiple poll_write calls for the first write buffer.
-            if self.first_plan_remaining == 0 {
+            while self.first_plan_remaining == 0 && self.first_plan_idx < plan.len() {
                 let next = plan.get(self.first_plan_idx).copied().unwrap_or(0);
-                if next == 0 {
-                    // Skip invalid entries.
-                    self.first_plan_idx = self.first_plan_idx.saturating_add(1);
-                } else {
+                self.first_plan_idx = self.first_plan_idx.saturating_add(1);
+                if next > 0 {
                     self.first_plan_remaining = next;
                 }
             }
 
             if self.first_plan_remaining > 0 {
                 return self.first_plan_remaining.min(buf_len.max(1)).max(1);
+            } else {
+                // Plan exhausted.
+                self.cfg.first_write_plan = None;
             }
         }
 
@@ -496,5 +500,26 @@ mod tests {
         let mut pinned = Pin::new(&mut io);
         let res = AsyncWrite::poll_write(pinned.as_mut(), &mut cx, b"hello");
         assert!(matches!(res, Poll::Ready(Ok(5))));
+    }
+
+    #[test]
+    fn first_write_plan_skips_zeros() {
+        let cfg = FragmentConfig {
+            first_write_plan: Some(vec![0, 2, 0, 3]),
+            first_write_max: 64,
+            ..FragmentConfig::default()
+        };
+        let (mut io, _handle) = FragmentingIo::new(DummyWriter, cfg);
+        
+        let limit1 = io.next_write_limit(b"hello");
+        assert_eq!(limit1, 2, "Should skip first 0 and return 2");
+        io.first_plan_remaining = 2; // Simulate write of 2
+        
+        // Mocking the plan advancement that normally happens in poll_write
+        io.first_plan_remaining = 0;
+        io.first_plan_idx += 1;
+        
+        let limit2 = io.next_write_limit(b"llo");
+        assert_eq!(limit2, 3, "Should skip second 0 and return 3");
     }
 }

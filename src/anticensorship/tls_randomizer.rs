@@ -78,8 +78,7 @@ pub fn build_client_hello_for_domain(domain: &str) -> Vec<u8> {
     exts_data.extend_from_slice(&ALPN_EXT);
     exts_data.extend_from_slice(&ALPN_EXT_TAIL);
 
-    // GREASE Extensions (random types, empty body)
-    // Chrome usually adds two GREASE extensions.
+    // GREASE Extensions (random types, 1 byte of dummy data to look more like real Chrome)
     let grease_type1 = 0x0a0au16 + (rand::thread_rng().gen_range(0..10) * 0x1010);
     let mut grease_type2 = 0x0a0au16 + (rand::thread_rng().gen_range(0..10) * 0x1010);
     while grease_type2 == grease_type1 {
@@ -87,10 +86,12 @@ pub fn build_client_hello_for_domain(domain: &str) -> Vec<u8> {
     }
 
     exts_data.extend_from_slice(&grease_type1.to_be_bytes());
-    exts_data.extend_from_slice(&0u16.to_be_bytes());
+    exts_data.extend_from_slice(&1u16.to_be_bytes());
+    exts_data.push(rand::thread_rng().gen());
 
     exts_data.extend_from_slice(&grease_type2.to_be_bytes());
-    exts_data.extend_from_slice(&0u16.to_be_bytes());
+    exts_data.extend_from_slice(&1u16.to_be_bytes());
+    exts_data.push(rand::thread_rng().gen());
 
     body.extend_from_slice(&(exts_data.len() as u16).to_be_bytes());
     body.extend_from_slice(&exts_data);

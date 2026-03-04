@@ -17,6 +17,7 @@ pub struct DownloadStrategy {
     pub max_concurrency: usize,
     pub chunk_size_bytes: usize,
     pub adaptive_threshold_mbps: f64,
+    pub max_response_body_mb: usize,
 }
 
 impl Default for DownloadStrategy {
@@ -26,6 +27,7 @@ impl Default for DownloadStrategy {
             max_concurrency: 16,
             chunk_size_bytes: 4 * 1024 * 1024,
             adaptive_threshold_mbps: 25.0,
+            max_response_body_mb: 100,
         }
     }
 }
@@ -96,6 +98,14 @@ impl ChunkManager {
         max_retries: usize,
         progress: Option<ProgressHook>,
     ) -> Result<Vec<u8>> {
+        let max_bytes = (self.strategy.max_response_body_mb as u64) * 1024 * 1024;
+        if content_length > max_bytes {
+            return Err(EngineError::Internal(format!(
+                "chunked download too large ({} bytes, limit is {} MB)",
+                content_length, self.strategy.max_response_body_mb
+            )));
+        }
+
         if request.method != reqwest::Method::GET {
             return Err(EngineError::InvalidInput(
                 "chunked download only supports GET requests".to_owned(),

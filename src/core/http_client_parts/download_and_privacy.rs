@@ -347,13 +347,14 @@ impl PrimeHttpClient {
         }
 
         if let Some(blocker) = &self.tracker_blocker {
-            if let Some(hit) = blocker.matches(&parsed) {
-                record_blocked_domain(&hit.host);
+            if let Some(matched_rule) = blocker.matches(&parsed) {
+                let host = parsed.host_str().unwrap_or("unknown");
+                record_blocked_domain(host);
                 tracing::info!(
                     target: "privacy.tracker",
                     "[BLOCKED][TRACKER] host={} rule={}",
-                    hit.host,
-                    hit.matched_rule
+                    host,
+                    matched_rule
                 );
                 tracing::debug!(
                     target: "privacy.tracker",
@@ -372,7 +373,7 @@ impl PrimeHttpClient {
                         TrackerBlockAction::Error => {
                             return Err(EngineError::BlockedByPrivacyPolicy(format!(
                                 "tracker request blocked: host={} rule={}",
-                                hit.host, hit.matched_rule
+                                host, matched_rule
                             )));
                         }
                         TrackerBlockAction::Empty200 => {
@@ -385,14 +386,11 @@ impl PrimeHttpClient {
 
         // Privacy Headers: User-Agent override.
         if self.config.privacy.user_agent.enabled {
-            let ua_value = self
-                .config
-                .privacy
-                .user_agent
-                .preset
-                .ua_string()
-                .map(str::to_owned)
-                .unwrap_or_else(|| self.config.privacy.user_agent.custom_value.clone());
+            let ua_value = if let Some(ua) = self.config.privacy.user_agent.preset.ua_string() {
+                ua.to_owned()
+            } else {
+                self.config.privacy.user_agent.custom_value.clone()
+            };
             request
                 .headers
                 .retain(|(k, _)| !k.eq_ignore_ascii_case("user-agent"));
@@ -647,8 +645,28 @@ impl PrimeHttpClient {
         let headers = collect_headers(response.headers());
         let total_opt = response.content_length();
 
+        let max_bytes = (self.config.download.max_response_body_mb as u64) * 1024 * 1024;
+        if let Some(cl) = total_opt {
+            if cl > max_bytes {
+                return Err(EngineError::Internal(format!(
+                    "response body too large ({} bytes, limit is {} MB)",
+                    cl, self.config.download.max_response_body_mb
+                )));
+            }
+        }
+
         let mut out = Vec::new();
+        if let Some(cl) = total_opt {
+            out.reserve(cl as usize);
+        }
+
         while let Some(chunk) = response.chunk().await? {
+            if (out.len() + chunk.len()) as u64 > max_bytes {
+                return Err(EngineError::Internal(format!(
+                    "response body exceeded limit of {} MB during streaming",
+                    self.config.download.max_response_body_mb
+                )));
+            }
             out.extend_from_slice(&chunk);
             if let Some(cb) = &progress {
                 let downloaded = out.len() as u64;

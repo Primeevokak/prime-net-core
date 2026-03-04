@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::blocklist::{expand_tilde, BlocklistCache};
@@ -26,8 +27,8 @@ impl HealthChecker {
         let endpoint = self.config.system_proxy.socks_endpoint.clone();
         let resolve =
             tokio::time::timeout(Duration::from_secs(1), tokio::net::lookup_host(&endpoint)).await;
-        let mut addrs = match resolve {
-            Ok(Ok(v)) => v,
+        let mut addrs: std::vec::IntoIter<SocketAddr> = match resolve {
+            Ok(Ok(v)) => v.collect::<Vec<_>>().into_iter(),
             Ok(Err(_)) | Err(_) => {
                 return HealthCheckResult::error(
                     "Invalid SOCKS5 endpoint in config",

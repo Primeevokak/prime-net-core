@@ -140,10 +140,15 @@ impl PrimeHttpClient {
         }
 
         // Lazy initialize or use shared endpoint if available
-        let mut endpoint = if let Some(ep) = &self.h3_endpoint {
-            ep.clone()
-        } else {
-            bind_quinn_endpoint()?
+        let mut endpoint = {
+            let mut guard = self.h3_endpoint.lock();
+            if let Some(ep) = &*guard {
+                ep.clone()
+            } else {
+                let ep = bind_quinn_endpoint()?;
+                *guard = Some(ep.clone());
+                ep
+            }
         };
         let tls_cfg = build_rustls_config_http3(self)?;
         let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(tls_cfg)
@@ -220,13 +225,30 @@ impl PrimeHttpClient {
 
             let mut body = Vec::new();
             let mut downloaded: u64 = 0;
-            while let Some(chunk) = stream
-                .recv_data()
-                .await
-                .map_err(|e| EngineError::Internal(format!("h3 recv_data failed: {e}")))?
-            {
-                let mut chunk = chunk;
+            let max_bytes = (self.config.download.max_response_body_mb as u64) * 1024 * 1024;
+            let request_timeout = Duration::from_millis(self.config.transport.http3_request_timeout_ms);
+
+            loop {
+                let chunk_res = tokio::time::timeout(request_timeout, stream.recv_data()).await;
+                let mut chunk = match chunk_res {
+                    Ok(Ok(Some(c))) => c,
+                    Ok(Ok(None)) => break,
+                    Ok(Err(e)) => {
+                        return Err(EngineError::Internal(format!("h3 recv_data failed: {e}")));
+                    }
+                    Err(_) => {
+                        return Err(EngineError::Internal("HTTP/3 data transfer timeout".to_owned()));
+                    }
+                };
+
                 let n = chunk.remaining();
+                if downloaded + (n as u64) > max_bytes {
+                    driver.abort();
+                    return Err(EngineError::Internal(format!(
+                        "HTTP/3 response body exceeded limit of {} MB",
+                        self.config.download.max_response_body_mb
+                    )));
+                }
                 let bytes = chunk.copy_to_bytes(n);
                 downloaded += bytes.len() as u64;
                 if let Some(h) = &progress {
@@ -263,10 +285,15 @@ impl PrimeHttpClient {
         }
 
         // Lazy initialize or use shared endpoint if available
-        let mut endpoint = if let Some(ep) = &self.h3_endpoint {
-            ep.clone()
-        } else {
-            bind_quinn_endpoint()?
+        let mut endpoint = {
+            let mut guard = self.h3_endpoint.lock();
+            if let Some(ep) = &*guard {
+                ep.clone()
+            } else {
+                let ep = bind_quinn_endpoint()?;
+                *guard = Some(ep.clone());
+                ep
+            }
         };
         let tls_cfg = build_rustls_config_http3(self)?;
         let quic_cfg = quinn::crypto::rustls::QuicClientConfig::try_from(tls_cfg)

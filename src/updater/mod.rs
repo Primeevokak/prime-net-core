@@ -280,7 +280,11 @@ impl AutoUpdater {
             .no_proxy()
             .build()
             .map_err(|e| EngineError::Internal(format!("failed to build updater client: {e}")))?;
-        let response = client.get(url).send().await?;
+        let response = client
+            .get(url)
+            .header("User-Agent", "prime-net-engine-updater")
+            .send()
+            .await?;
         if !response.status().is_success() {
             return Err(EngineError::Internal(format!(
                 "download failed: {}",

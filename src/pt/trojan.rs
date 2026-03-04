@@ -107,10 +107,6 @@ impl TrojanOutbound {
         // To mitigate replay attacks, we can append a 32-bit timestamp (seconds) if the server supports it.
         // Standard Trojan doesn't, but enhanced versions do. We'll include it as an optional suffix.
         let pass = sha224_hex(self.cfg.password.as_bytes());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(0);
 
         timeout(Self::IO_TIMEOUT, tls.write_all(pass.as_bytes()))
             .await
@@ -119,9 +115,10 @@ impl TrojanOutbound {
             .await
             .map_err(|_| EngineError::Internal("trojan write timeout".to_owned()))??;
 
-        let mut req = build_trojan_connect_request(target)?;
-        // Append 4-byte big-endian timestamp as a simple nonce/replay protection suffix.
-        req.extend_from_slice(&now.to_be_bytes());
+        let req = build_trojan_connect_request(target)?;
+        // NOTE: Appending custom metadata here (like a timestamp for replay protection) 
+        // will break compatibility with standard Trojan servers. 
+        // Standard servers expect CRLF immediately after the SOCKS5 request.
 
         timeout(Self::IO_TIMEOUT, tls.write_all(&req))
             .await
