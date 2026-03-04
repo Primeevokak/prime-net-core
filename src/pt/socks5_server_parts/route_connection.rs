@@ -16,7 +16,7 @@ use dashmap::DashMap;
 use crate::pt::socks5_server::*;
 use crate::pt::socks5_server::route_scoring::*;
 use crate::pt::socks5_server::state_and_startup::connect_bypass_upstream;
-use crate::pt::socks5_server::relay_and_io_helpers::{relay_bidirectional, classify_io_error};
+use crate::pt::socks5_server::relay_and_io_helpers::{relay_bidirectional, classify_io_error, is_tls_client_hello, fragment_and_send_tls_hello};
 use crate::pt::socks5_server::protocol_socks4::handle_socks4;
 use crate::pt::socks5_server::protocol_handlers::handle_http_proxy;
 use crate::pt::socks5_server::protocol_udp::handle_udp_associate;
@@ -76,24 +76,30 @@ pub async fn connect_via_best_route(
             let mut sent = false;
             
             if let Some(ref data) = icd {
-                stream.write_all(data).await?; 
-                stream.flush().await?; 
+                if ro.fragment_client_hello && is_tls_client_hello(data) {
+                    let _ = fragment_and_send_tls_hello(data, &mut stream, &ro).await
+                        .map_err(|e| EngineError::Io(e))?;
+                } else {
+                    stream.write_all(data).await?; 
+                    stream.flush().await?; 
+                }
                 sent = true;
                 
-                let mut buf = [0u8; 1];
-                // Wait for the first byte of response.
-                if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(2000), stream.read(&mut buf)).await {
+                let mut buf = [0u8; 2048];
+                // Wait for the TLS record header or some response data.
+                // Increase timeout to 3s for slower bypass routes like Discord
+                if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(3000), stream.read(&mut buf)).await {
                     if n > 0 {
                         // Validate TLS on HTTPS port 443
                         if t.port == 443 && buf[0] != 0x16 {
-                            debug!(conn_id, route = %c.route_label(), byte = buf[0], "REJECTED: invalid TLS handshake (likely DPI)");
+                            debug!(conn_id, route = %c.route_label(), byte = buf[0], "REJECTED: invalid TLS handshake record type (likely DPI)");
                             return Err(EngineError::Internal("invalid tls handshake (dpi)".to_owned()));
                         }
                         // Validate HTTP on port 80 (common fake redirect)
                         if t.port == 80 && buf[0] == 0x15 {
                             return Err(EngineError::Internal("DPI block page detected".to_owned()));
                         }
-                        initial_u2c.push(buf[0]);
+                        initial_u2c.extend_from_slice(&buf[..n]);
                     }
                 }
                 
@@ -222,7 +228,15 @@ pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream,
 
             let mut upstream = route.stream;
             let start_time = Instant::now();
-            let relay_res = relay_bidirectional(&mut tcp, &mut upstream, relay_opts, route.initial_client_data, route.initial_upstream_data, route.client_data_sent).await;
+            
+            // CRITICAL: If the route is via Bypass (ByeDPI), disable internal fragmentation
+            // to avoid "double-evasion" which causes Facebook to reset connections.
+            let mut final_opts = relay_opts;
+            if route.candidate.kind == RouteKind::Bypass {
+                final_opts.fragment_client_hello = false;
+            }
+
+            let relay_res = relay_bidirectional(&mut tcp, &mut upstream, final_opts, route.initial_client_data, route.initial_upstream_data, route.client_data_sent).await;
             
             match relay_res {
                 Ok((c2u, u2c)) => {

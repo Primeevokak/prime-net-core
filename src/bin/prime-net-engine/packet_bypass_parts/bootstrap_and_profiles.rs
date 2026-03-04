@@ -262,10 +262,10 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
         PacketBypassProfile {
             name: "tlsrec-fake-ttl".to_owned(),
             args: vec![
-                "--tlsrec".into(), "1+s".into(),
+                "--tlsrec".into(), "3+s".into(),
                 "--fake".into(), "-1".into(),
                 "--ttl".into(), "5".into(),
-                "--auto".into(), "torst".into(),
+                "--auto".into(), "none".into(),
                 "--timeout".into(), "10".into(),
             ],
         },
@@ -274,7 +274,8 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
             args: vec![
                 "--disorder".into(), "1".into(),
                 "--fake".into(), "-1".into(),
-                "--auto".into(), "torst".into(),
+                "--udp-fake".into(), "-1".into(),
+                "--auto".into(), "none".into(),
                 "--timeout".into(), "10".into(),
             ],
         },
@@ -283,8 +284,8 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
             args: vec![
                 "--split".into(), "2".into(),
                 "--oob".into(), "1".into(),
-                "--tlsrec".into(), "3+h".into(),
-                "--auto".into(), "torst".into(),
+                "--tlsrec".into(), "3+s".into(),
+                "--auto".into(), "none".into(),
                 "--timeout".into(), "10".into(),
             ],
         },

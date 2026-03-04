@@ -61,12 +61,14 @@ pub async fn relay_bidirectional_with_first_byte_timeout(
         client.write_all(&initial_upstream_to_client).await?;
         client.flush().await?;
     } else {
-        let mut first_byte = [0u8; 1];
-        match tokio::time::timeout(timeout_duration, upstream.read(&mut first_byte)).await {
+        let mut buf = [0u8; 2048];
+        match tokio::time::timeout(timeout_duration, upstream.read(&mut buf)).await {
             Ok(Ok(0)) => return Ok((initial_c2u_len, 0)),
             Ok(Ok(n)) => {
-                client.write_all(&first_byte[..n]).await?;
+                client.write_all(&buf[..n]).await?;
                 client.flush().await?;
+                let (c2u, u2c) = tokio::io::copy_bidirectional(client, upstream).await?;
+                return Ok((c2u + initial_c2u_len, u2c + n as u64));
             }
             Ok(Err(e)) => return Err(e),
             Err(_) => {
@@ -76,14 +78,14 @@ pub async fn relay_bidirectional_with_first_byte_timeout(
     }
 
     let (c2u, u2c) = tokio::io::copy_bidirectional(client, upstream).await?;
-    Ok((c2u + initial_c2u_len, u2c + if initial_u2c_len > 0 { initial_u2c_len } else { 1 }))
+    Ok((c2u + initial_c2u_len, u2c + initial_u2c_len))
 }
 
-pub(super) fn is_tls_client_hello(data: &[u8]) -> bool {
+pub fn is_tls_client_hello(data: &[u8]) -> bool {
     data.len() >= 5 && data[0] == 0x16 && data[1] == 0x03 && (data[2] == 0x01 || data[2] == 0x03)
 }
 
-pub(super) async fn fragment_and_send_tls_hello(
+pub async fn fragment_and_send_tls_hello(
     data: &[u8],
     upstream_w: &mut (impl AsyncWriteExt + Unpin),
     opts: &RelayOptions,

@@ -186,9 +186,9 @@ fn build_direct_relay_options(cfg: &EngineConfig) -> RelayOptions {
         fragment_client_hello: true,
         split_at_sni: cfg.evasion.split_at_sni,
         client_hello_split_offsets: split_offsets,
-        fragment_size_min: 1, 
-        fragment_size_max: cfg.evasion.fragment_size_max.clamp(1, 128),
-        randomize_fragment_size: cfg.evasion.randomize_fragment_size,
+        fragment_size_min: 500, 
+        fragment_size_max: cfg.evasion.fragment_size_max.clamp(500, 1500),
+        randomize_fragment_size: false,
         fragment_sleep_ms: sleep_ms,
         fragment_budget_bytes: cfg.evasion.fragment_budget_bytes.max(128 * 1024), // Ensure at least 128KB budget
         tcp_window_size: cfg.evasion.tcp_window_size as u16,
