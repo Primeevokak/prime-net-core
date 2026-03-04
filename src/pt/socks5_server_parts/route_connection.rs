@@ -87,7 +87,7 @@ pub async fn connect_via_best_route(
                 }
                 sent = true;
                 
-                let mut buf = [0u8; 2048];
+                let mut buf = [0u8; 4096];
                 // Wait for the TLS record header or some response data.
                 // Increase timeout to 3s for slower bypass routes like Discord
                 if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(3000), stream.read(&mut buf)).await {
@@ -102,6 +102,15 @@ pub async fn connect_via_best_route(
                             return Err(EngineError::Internal("DPI block page detected".to_owned()));
                         }
                         initial_u2c.extend_from_slice(&buf[..n]);
+                        
+                        // TRY TO READ MORE: Strict Meta servers might send Server Hello in multiple segments.
+                        // Capture as much as possible in 50ms to avoid breaking the flight.
+                        let mut extra = [0u8; 4096];
+                        while let Ok(Ok(Ok(en))) = tokio::time::timeout(Duration::from_millis(50), tokio::time::timeout(Duration::from_millis(10), stream.read(&mut extra))).await {
+                            if en == 0 { break; }
+                            initial_u2c.extend_from_slice(&extra[..en]);
+                            if initial_u2c.len() > 8192 { break; }
+                        }
                     }
                 }
                 

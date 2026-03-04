@@ -4,7 +4,7 @@ use crate::pt::socks5_server::*;
 
 pub fn record_destination_failure(destination: &str, signal: BlockingSignal, _emit: u64, stage: u8, cfg: &EngineConfig) {
     send_telemetry(TelemetryEvent::DestinationFailure { destination: destination.to_owned(), signal, stage });
-    let _ = cfg;
+    record_destination_failure_sync(destination, signal, stage, cfg);
 }
 
 pub fn record_destination_failure_sync(destination: &str, signal: BlockingSignal, stage: u8, _cfg: &EngineConfig) {
@@ -28,8 +28,9 @@ pub fn record_destination_failure_sync(destination: &str, signal: BlockingSignal
     }
 }
 
-pub fn record_destination_success(destination: &str, stage: u8, _source: StageSelectionSource, _cfg: &EngineConfig) {
+pub fn record_destination_success(destination: &str, stage: u8, _source: StageSelectionSource, cfg: &EngineConfig) {
     send_telemetry(TelemetryEvent::DestinationSuccess { destination: destination.to_owned(), stage });
+    record_destination_success_sync(destination, stage, cfg);
 }
 
 pub fn record_destination_success_sync(destination: &str, stage: u8, _cfg: &EngineConfig) {

@@ -75,9 +75,9 @@ pub fn tune_relay_for_target(mut opts: RelayOptions, port: u16, destination: &st
     if let Some(stage) = learned_stage {
         if stage >= 2 && port == 443 {
             opts.fragment_client_hello = true;
-            opts.fragment_size_min = 500; // Keep handshake intact for ByeDPI
-            opts.fragment_size_max = 1000; 
-            opts.fragment_sleep_ms = 0;
+            opts.fragment_size_min = 40; 
+            opts.fragment_size_max = 128; 
+            opts.fragment_sleep_ms = 5;
         }
         return TunedRelay { 
             options: opts, 
@@ -87,14 +87,14 @@ pub fn tune_relay_for_target(mut opts: RelayOptions, port: u16, destination: &st
     }
 
     // 2. Fallback to domain-based hardcoded rules
-    let is_censored = dest_lower.contains("soundcloud") || dest_lower.contains("instagram") || dest_lower.contains("facebook") || dest_lower.contains("fbcdn");
+    let is_censored = dest_lower.contains("soundcloud") || dest_lower.contains("sndcdn");
     
     let stage = if is_censored && port == 443 {
-        // For highly censored media platforms, ensure the first packet is large enough for ByeDPI to see SNI
+        // For highly censored platforms, use small chunks for Direct mode
         opts.fragment_client_hello = true;
-        opts.fragment_size_min = 500; 
-        opts.fragment_size_max = 1000; 
-        opts.fragment_sleep_ms = 0; 
+        opts.fragment_size_min = 40; 
+        opts.fragment_size_max = 128; 
+        opts.fragment_sleep_ms = 5; 
         2 // Start at stage 2
     } else {
         1

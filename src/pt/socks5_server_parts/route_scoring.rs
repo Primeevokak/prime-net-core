@@ -68,14 +68,6 @@ pub fn ordered_route_candidates(route_key: &str, candidates: Vec<RouteCandidate>
 
 pub fn is_censored_domain(domain: &str, _relay_opts: &RelayOptions, cfg: &EngineConfig) -> bool {
     let dest_lower = domain.to_lowercase();
-    
-    // HARDCODED PROTECTION: Ensure these platforms always use bypass routes for all subdomains
-    if dest_lower.contains("soundcloud") || dest_lower.contains("sndcdn") || 
-       dest_lower.contains("instagram") || dest_lower.contains("facebook") || dest_lower.contains("fbcdn") ||
-       dest_lower.contains("discord") || dest_lower.contains("youtube") || dest_lower.contains("googlevideo") {
-        return true;
-    }
-
     let group_key = route_destination_key(&dest_lower);
     let now = now_unix_secs();
 
@@ -90,21 +82,16 @@ pub fn is_censored_domain(domain: &str, _relay_opts: &RelayOptions, cfg: &Engine
         }
     }
 
-    // 1. LM INTELLIGENCE: Check classifier for persistent signals or learned winners in persisted state
+    // 1. DYNAMIC LEARNING: Check classifier for persistent signals
     if let Some(classifier) = DEST_CLASSIFIER.get() {
-        // Check both the specific subdomain and the SLD group
         for key in [&dest_lower, group_key] {
             if let Some(stats) = classifier.get(key) {
-                // Check persisted winner if hot cache didn't have it
                 if let Some(ref winner) = stats.winner {
-                    if winner.route_id.starts_with("bypass:") {
-                        return true;
-                    }
+                    if winner.route_id.starts_with("bypass:") { return true; }
                 }
 
-                // Precision: A block is signaled if (RESETS > 0 OR TIMEOUTS >= 1) AND SUCCESSES == 0
-                // AGGRESSIVE: Switch to bypass on FIRST reset or FIRST timeout if no successes recorded yet.
-                if stats.successes == 0 && (stats.resets > 0 || stats.timeouts >= 1) && now.saturating_sub(stats.last_seen_unix) < 604800 {
+                // SENSITIVE DETECTION: Switch to bypass if we have ANY resets or ANY timeouts and no recent successes
+                if stats.successes == 0 && (stats.resets > 0 || stats.timeouts > 0) && now.saturating_sub(stats.last_seen_unix) < 86400 {
                     return true;
                 }
             }

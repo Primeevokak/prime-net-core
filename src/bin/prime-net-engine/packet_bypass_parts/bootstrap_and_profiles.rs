@@ -251,43 +251,51 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
     let mut profiles = vec![
         PacketBypassProfile {
             name: "disorder-split-1".to_owned(),
-            args: vec!["--split".into(), "1".into(), "--disorder".into(), "1".into(), "--auto=none".into(), "--timeout".into(), "10".into()],
+            args: vec!["--split".into(), "1".into(), "--disorder".into(), "1".into(), "--auto".into(), "none".into()],
         },
         PacketBypassProfile {
             name: "tlsrec-disorder-3".to_owned(),
-            args: vec!["--tlsrec".into(), "3+s".into(), "--disorder".into(), "1".into(), "--auto=none".into(), "--timeout".into(), "10".into()],
+            args: vec!["--tlsrec".into(), "3+s".into(), "--disorder".into(), "1".into(), "--auto".into(), "none".into()],
         },
         PacketBypassProfile {
             name: "split-2-oob-disorder".to_owned(),
-            args: vec!["--split".into(), "2".into(), "--oob".into(), "1".into(), "--disorder".into(), "1".into(), "--auto=none".into()],
+            args: vec!["--split".into(), "2".into(), "--oob".into(), "1".into(), "--disorder".into(), "1".into(), "--auto".into(), "none".into()],
         },
         PacketBypassProfile {
             name: "deep-split-40".to_owned(),
-            args: vec!["--split".into(), "40".into(), "--disorder".into(), "1".into(), "--auto=none".into()],
+            args: vec!["--split".into(), "40".into(), "--disorder".into(), "1".into(), "--auto".into(), "none".into()],
         },
         PacketBypassProfile {
             name: "tlsrec-5-fake-ttl".to_owned(),
-            args: vec!["--tlsrec".into(), "5+s".into(), "--fake".into(), "1".into(), "--ttl".into(), "5".into(), "--auto=none".into()],
+            args: vec!["--tlsrec".into(), "5+s".into(), "--fake".into(), "1".into(), "--ttl".into(), "5".into(), "--auto".into(), "none".into()],
         },
         PacketBypassProfile {
             name: "disorder-shuffle-3".to_owned(),
-            args: vec!["--disorder".into(), "3".into(), "--auto=none".into(), "--udp-fake".into(), "1".into()],
+            args: vec!["--disorder".into(), "3".into(), "--auto".into(), "none".into(), "--udp-fake".into(), "1".into()],
         },
         PacketBypassProfile {
             name: "oob-1-deep-split-60".to_owned(),
-            args: vec!["--oob".into(), "1".into(), "--split".into(), "60".into(), "--auto=none".into()],
+            args: vec!["--oob".into(), "1".into(), "--split".into(), "60".into(), "--auto".into(), "none".into()],
         },
         PacketBypassProfile {
             name: "tlsrec-1-disorder-shuffle".to_owned(),
-            args: vec!["--tlsrec".into(), "1+s".into(), "--disorder".into(), "3+s".into(), "--auto=none".into()],
+            args: vec!["--tlsrec".into(), "1+s".into(), "--disorder".into(), "3+s".into(), "--auto".into(), "none".into()],
         },
         PacketBypassProfile {
             name: "split-1-fake-1".to_owned(),
-            args: vec!["--split".into(), "1".into(), "--fake".into(), "1".into(), "--auto=none".into()],
+            args: vec!["--split".into(), "1".into(), "--fake".into(), "1".into(), "--auto".into(), "none".into()],
         },
         PacketBypassProfile {
             name: "modern-mix-all".to_owned(),
-            args: vec!["--split".into(), "2".into(), "--disorder".into(), "1".into(), "--oob".into(), "1".into(), "--tlsrec".into(), "3+s".into(), "--auto=none".into()],
+            args: vec!["--split".into(), "2".into(), "--disorder".into(), "1".into(), "--oob".into(), "1".into(), "--tlsrec".into(), "3+s".into(), "--auto".into(), "none".into()],
+        },
+        PacketBypassProfile {
+            name: "meta-special-oob".to_owned(),
+            args: vec!["--split".into(), "1".into(), "--oob".into(), "1".into(), "--disorder".into(), "3+s".into(), "--auto".into(), "none".into()],
+        },
+        PacketBypassProfile {
+            name: "ttl-hop-desync".to_owned(),
+            args: vec!["--split".into(), "2".into(), "--fake".into(), "1".into(), "--ttl".into(), "8".into(), "--auto".into(), "none".into()],
         },
     ];
     for p in &mut profiles {
