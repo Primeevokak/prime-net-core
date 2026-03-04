@@ -250,44 +250,44 @@ fn set_port_arg(args: &mut Vec<String>, port: u16) {
 fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
     let mut profiles = vec![
         PacketBypassProfile {
-            name: "modern-disorder-split".to_owned(),
-            args: vec![
-                "--split".into(), "1".into(),
-                "--disorder".into(), "3+s".into(),
-                "--mod-http".into(), "h,d".into(),
-                "--auto".into(), "none".into(),
-                "--timeout".into(), "10".into(),
-            ],
+            name: "disorder-split-1".to_owned(),
+            args: vec!["--split".into(), "1".into(), "--disorder".into(), "1".into(), "--auto=none".into(), "--timeout".into(), "10".into()],
         },
         PacketBypassProfile {
-            name: "tlsrec-fake-ttl".to_owned(),
-            args: vec![
-                "--tlsrec".into(), "3+s".into(),
-                "--fake".into(), "-1".into(),
-                "--ttl".into(), "5".into(),
-                "--auto".into(), "none".into(),
-                "--timeout".into(), "10".into(),
-            ],
+            name: "tlsrec-disorder-3".to_owned(),
+            args: vec!["--tlsrec".into(), "3+s".into(), "--disorder".into(), "1".into(), "--auto=none".into(), "--timeout".into(), "10".into()],
         },
         PacketBypassProfile {
-            name: "aggressive-disorder-fake".to_owned(),
-            args: vec![
-                "--disorder".into(), "1".into(),
-                "--fake".into(), "-1".into(),
-                "--udp-fake".into(), "-1".into(),
-                "--auto".into(), "none".into(),
-                "--timeout".into(), "10".into(),
-            ],
+            name: "split-2-oob-disorder".to_owned(),
+            args: vec!["--split".into(), "2".into(), "--oob".into(), "1".into(), "--disorder".into(), "1".into(), "--auto=none".into()],
         },
         PacketBypassProfile {
-            name: "sni-split-oob".to_owned(),
-            args: vec![
-                "--split".into(), "2".into(),
-                "--oob".into(), "1".into(),
-                "--tlsrec".into(), "3+s".into(),
-                "--auto".into(), "none".into(),
-                "--timeout".into(), "10".into(),
-            ],
+            name: "deep-split-40".to_owned(),
+            args: vec!["--split".into(), "40".into(), "--disorder".into(), "1".into(), "--auto=none".into()],
+        },
+        PacketBypassProfile {
+            name: "tlsrec-5-fake-ttl".to_owned(),
+            args: vec!["--tlsrec".into(), "5+s".into(), "--fake".into(), "1".into(), "--ttl".into(), "5".into(), "--auto=none".into()],
+        },
+        PacketBypassProfile {
+            name: "disorder-shuffle-3".to_owned(),
+            args: vec!["--disorder".into(), "3".into(), "--auto=none".into(), "--udp-fake".into(), "1".into()],
+        },
+        PacketBypassProfile {
+            name: "oob-1-deep-split-60".to_owned(),
+            args: vec!["--oob".into(), "1".into(), "--split".into(), "60".into(), "--auto=none".into()],
+        },
+        PacketBypassProfile {
+            name: "tlsrec-1-disorder-shuffle".to_owned(),
+            args: vec!["--tlsrec".into(), "1+s".into(), "--disorder".into(), "3+s".into(), "--auto=none".into()],
+        },
+        PacketBypassProfile {
+            name: "split-1-fake-1".to_owned(),
+            args: vec!["--split".into(), "1".into(), "--fake".into(), "1".into(), "--auto=none".into()],
+        },
+        PacketBypassProfile {
+            name: "modern-mix-all".to_owned(),
+            args: vec!["--split".into(), "2".into(), "--disorder".into(), "1".into(), "--oob".into(), "1".into(), "--tlsrec".into(), "3+s".into(), "--auto=none".into()],
         },
     ];
     for p in &mut profiles {

@@ -68,7 +68,7 @@ pub async fn connect_via_best_route(
         let icd = initial_client_data.clone();
         
         winners.spawn(async move {
-            let delay = (idx as u64) * 250;
+            let delay = (idx as u64) * 100;
             if delay > 0 { tokio::time::sleep(Duration::from_millis(delay)).await; }
             
             let mut stream = connect_route_candidate(conn_id, &t, &tl, &c, out, &ro, config.clone()).await?;
@@ -76,7 +76,9 @@ pub async fn connect_via_best_route(
             let mut sent = false;
             
             if let Some(ref data) = icd {
-                if ro.fragment_client_hello && is_tls_client_hello(data) {
+                // IMPORTANT: Only fragment internally for DIRECT connections.
+                // For Bypass, let the external proxy (ByeDPI) handle it.
+                if c.kind == RouteKind::Direct && ro.fragment_client_hello && is_tls_client_hello(data) {
                     let _ = fragment_and_send_tls_hello(data, &mut stream, &ro).await
                         .map_err(|e| EngineError::Io(e))?;
                 } else {
