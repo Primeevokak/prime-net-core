@@ -79,14 +79,32 @@ pub fn is_censored_domain(domain: &str, _relay_opts: &RelayOptions, cfg: &Engine
     let group_key = route_destination_key(&dest_lower);
     let now = now_unix_secs();
 
-    // 1. LM INTELLIGENCE: Check classifier for recent resets or persistent timeouts
-    // Precision: A block is signaled if (RESETS > 0 OR TIMEOUTS >= 2) AND SUCCESSES == 0
+    // 0. CHECK LEARNED WINNERS: If we have a cached winner for this domain/group, use it
+    if let Some(winners) = DEST_ROUTE_WINNER.get() {
+        for key in [&dest_lower, group_key] {
+            if let Some(winner) = winners.get(key) {
+                if winner.route_id.starts_with("bypass:") {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // 1. LM INTELLIGENCE: Check classifier for persistent signals or learned winners in persisted state
     if let Some(classifier) = DEST_CLASSIFIER.get() {
         // Check both the specific subdomain and the SLD group
         for key in [&dest_lower, group_key] {
             if let Some(stats) = classifier.get(key) {
+                // Check persisted winner if hot cache didn't have it
+                if let Some(ref winner) = stats.winner {
+                    if winner.route_id.starts_with("bypass:") {
+                        return true;
+                    }
+                }
+
+                // Precision: A block is signaled if (RESETS > 0 OR TIMEOUTS >= 1) AND SUCCESSES == 0
                 // AGGRESSIVE: Switch to bypass on FIRST reset or FIRST timeout if no successes recorded yet.
-                if stats.successes == 0 && (stats.resets > 0 || stats.timeouts >= 1) && now.saturating_sub(stats.last_seen_unix) < 600 {
+                if stats.successes == 0 && (stats.resets > 0 || stats.timeouts >= 1) && now.saturating_sub(stats.last_seen_unix) < 604800 {
                     return true;
                 }
             }

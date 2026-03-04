@@ -65,7 +65,19 @@ pub struct RouteHealth { pub successes: u64, pub failures: u64, pub consecutive_
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BypassProfileHealth { pub successes: u64, pub failures: u64, pub connect_failures: u64, pub soft_zero_replies: u64, pub io_errors: u64, pub last_success_unix: u64, pub last_failure_unix: u64 }
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct DestinationClassifier { pub successes: u64, pub failures: u64, pub resets: u8, pub timeouts: u64, pub early_closes: u64, pub broken_pipes: u64, pub suspicious_zero_replies: u64, pub silent_drops: u64, pub last_seen_unix: u64 }
+pub struct DestinationClassifier { 
+    pub successes: u64, 
+    pub failures: u64, 
+    pub resets: u8, 
+    pub timeouts: u64, 
+    pub early_closes: u64, 
+    pub broken_pipes: u64, 
+    pub suspicious_zero_replies: u64, 
+    pub silent_drops: u64, 
+    pub last_seen_unix: u64,
+    pub winner: Option<RouteWinner>,
+    pub preferred_stage: Option<u8>,
+}
 #[derive(Debug, Clone, Default)]
 pub struct RouteCapabilities { pub direct_v4_weak_until: u64, pub direct_v6_weak_until: u64, pub bypass_v4_weak_until: u64, pub bypass_v6_weak_until: u64 }
 #[derive(Debug, Default)]

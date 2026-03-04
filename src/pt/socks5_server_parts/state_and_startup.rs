@@ -29,6 +29,7 @@ pub async fn start_socks5_server(
     let local_addr = listener.local_addr().map_err(EngineError::Io)?;
 
     init_telemetry_bus(cfg.clone());
+    classifier_and_persistence::init_classifier_store(&relay_opts, cfg.clone());
 
     tokio::spawn(async move {
         info!(target: "socks5", listen_addr = %local_addr, "SOCKS5 server started");
@@ -51,7 +52,11 @@ pub async fn start_socks5_server(
                         Err(e) => { error!(target: "socks5", error = %e, "failed to accept connection"); }
                     }
                 }
-                _ = &mut shutdown_rx => { break; }
+                _ = &mut shutdown_rx => { 
+                    info!(target: "socks5", "SOCKS5 server shutting down, flushing classifier cache...");
+                    classifier_and_persistence::maybe_flush_classifier_store(true, cfg.clone());
+                    break; 
+                }
             }
         }
     });

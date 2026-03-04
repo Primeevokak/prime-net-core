@@ -64,6 +64,29 @@ pub async fn handle_http_proxy(
 
 pub fn tune_relay_for_target(mut opts: RelayOptions, port: u16, destination: &str, _s4: bool, _http: bool) -> TunedRelay {
     let dest_lower = destination.to_lowercase();
+    let group_key = route_destination_key(&dest_lower);
+
+    // 1. Check for a learned preferred stage for this destination or its group
+    let learned_stage = {
+        let map = DEST_PREFERRED_STAGE.get_or_init(dashmap::DashMap::new);
+        map.get(&dest_lower).or_else(|| map.get(group_key)).map(|v| *v)
+    };
+
+    if let Some(stage) = learned_stage {
+        if stage >= 2 && port == 443 {
+            opts.fragment_client_hello = true;
+            opts.fragment_size_min = 1;
+            opts.fragment_size_max = 32;
+            opts.fragment_sleep_ms = 10;
+        }
+        return TunedRelay { 
+            options: opts, 
+            stage, 
+            source: StageSelectionSource::Classifier 
+        };
+    }
+
+    // 2. Fallback to domain-based hardcoded rules
     let is_censored = dest_lower.contains("soundcloud") || dest_lower.contains("instagram") || dest_lower.contains("facebook") || dest_lower.contains("fbcdn");
     
     let stage = if is_censored && port == 443 {
