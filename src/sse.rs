@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use futures_util::Stream;
 use reqwest::Method;
-use tokio::io::AsyncBufRead;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::core::{PrimeHttpClient, RequestData};

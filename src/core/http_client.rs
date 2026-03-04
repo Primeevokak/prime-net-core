@@ -545,12 +545,26 @@ fn build_rustls_client_config(
 
     let mut tls = builder.with_root_certificates(roots).with_no_client_auth();
 
+    fn is_dev_mode() -> bool {
+        std::env::var("PRIME_NET_DEV").is_ok()
+    }
+
     if use_system_verifier {
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         {
             use rustls_platform_verifier::Verifier;
             tls.dangerous()
                 .set_certificate_verifier(std::sync::Arc::new(Verifier::new()));
+        }
+    }
+
+    if cfg.tls.insecure_skip_verify {
+        if is_dev_mode() {
+            tracing::warn!("TLS verification is DISABLED via insecure_skip_verify. This is only allowed in dev mode.");
+            tls.dangerous()
+                .set_certificate_verifier(std::sync::Arc::new(crate::tls::InsecureSkipVerify));
+        } else {
+            tracing::error!("insecure_skip_verify=true ignored in production mode. Set PRIME_NET_DEV=1 to enable for local testing.");
         }
     }
 

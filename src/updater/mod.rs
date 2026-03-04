@@ -292,26 +292,30 @@ impl AutoUpdater {
     }
 
     fn save_to_temp(&self, data: &[u8]) -> Result<PathBuf> {
-        let temp_dir = std::env::temp_dir();
-        let temp_path = temp_dir.join(format!(
-            "prime-net-engine-update-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        ));
+        let mut temp_file = tempfile::Builder::new()
+            .prefix("prime-net-engine-update-")
+            .rand_bytes(8)
+            .tempfile()
+            .map_err(|e| EngineError::Internal(format!("failed to create temporary file for update: {e}")))?;
 
-        std::fs::write(&temp_path, data)?;
+        use std::io::Write;
+        temp_file.write_all(data).map_err(|e| {
+            EngineError::Internal(format!("failed to write update data to temporary file: {e}"))
+        })?;
+
+        let (_file, path) = temp_file.keep().map_err(|e| {
+            EngineError::Internal(format!("failed to persist temporary update file: {e}"))
+        })?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&temp_path)?.permissions();
+            let mut perms = file.metadata()?.permissions();
             perms.set_mode(0o755);
-            std::fs::set_permissions(&temp_path, perms)?;
+            file.set_permissions(perms)?;
         }
 
-        Ok(temp_path)
+        Ok(path)
     }
 }
 

@@ -479,7 +479,10 @@ async fn ws_worker(
                     let _ = in_tx.send(Err(e)).await;
                     break;
                 }
-                tokio::time::sleep(cfg.reconnect_backoff).await;
+                let backoff = (cfg.reconnect_backoff * (1 << (attempts.min(6) - 1)))
+                    .min(Duration::from_secs(60));
+                tracing::warn!(attempts = attempts, backoff = ?backoff, "WebSocket reconnecting due to error: {e}");
+                tokio::time::sleep(backoff).await;
             }
         }
     }

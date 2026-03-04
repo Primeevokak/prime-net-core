@@ -164,16 +164,30 @@ impl Visit for JsonVisitor {
 
 impl JsonVisitor {
     fn insert(&mut self, name: &str, v: Value) {
+        let name_lc = name.to_ascii_lowercase();
+        let is_sensitive = name_lc.contains("password")
+            || name_lc.contains("token")
+            || name_lc.contains("secret")
+            || name_lc.contains("key")
+            || name_lc.contains("auth");
+
+        let masked_v = if is_sensitive && v.is_string() {
+            json!("[MASKED]")
+        } else {
+            v
+        };
+
         if name == "message" {
-            self.message = v
+            self.message = masked_v
                 .as_str()
                 .map(|s| s.to_owned())
-                .or_else(|| Some(v.to_string()));
+                .or_else(|| Some(masked_v.to_string()));
         } else {
             // Keep a separate key=value vector for the text formatter.
-            self.kv.push((name.to_owned(), text_value_for_text_log(&v)));
+            self.kv
+                .push((name.to_owned(), text_value_for_text_log(&masked_v)));
         }
-        self.fields.insert(name.to_owned(), v);
+        self.fields.insert(name.to_owned(), masked_v);
     }
 }
 

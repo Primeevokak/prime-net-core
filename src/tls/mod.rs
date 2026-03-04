@@ -51,6 +51,8 @@ pub struct TlsConfig {
     pub ja3_fingerprint: Ja3Fingerprint,
     #[serde(default)]
     pub root_store: TlsRootStore,
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
 }
 
 fn default_tls_max() -> TlsVersion {
@@ -69,12 +71,24 @@ impl Default for TlsConfig {
             alpn_protocols: default_alpn(),
             ja3_fingerprint: Ja3Fingerprint::default(),
             root_store: TlsRootStore::default(),
+            insecure_skip_verify: false,
         }
     }
 }
 
 impl TlsConfig {
     pub fn validate(&self) -> Result<()> {
+        fn is_dev_mode() -> bool {
+            std::env::var("PRIME_NET_DEV").is_ok()
+        }
+
+        if version_rank(self.min_version) < version_rank(TlsVersion::Tls1_2) && !is_dev_mode() {
+            return Err(EngineError::Config(
+                "TLS 1.0 and 1.1 are disabled in production for security reasons. Use TLS 1.2 or higher, or set PRIME_NET_DEV=1 for legacy testing."
+                    .to_owned(),
+            ));
+        }
+
         if version_rank(self.min_version) > version_rank(self.max_version) {
             return Err(EngineError::Config(
                 "tls.min_version cannot be greater than tls.max_version".to_owned(),
@@ -90,5 +104,54 @@ fn version_rank(v: TlsVersion) -> u8 {
         TlsVersion::Tls1_1 => 11,
         TlsVersion::Tls1_2 => 12,
         TlsVersion::Tls1_3 => 13,
+    }
+}
+
+#[derive(Debug)]
+pub struct InsecureSkipVerify;
+
+impl rustls::client::danger::ServerCertVerifier for InsecureSkipVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+        ]
     }
 }

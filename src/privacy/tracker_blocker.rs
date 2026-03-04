@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
+use std::path::Path;
 
 use url::Url;
 
@@ -83,6 +84,18 @@ impl TrackerBlocker {
         }
 
         for path in &cfg.custom_lists {
+            let path_buf = Path::new(path);
+            if path_buf.is_absolute() {
+                return Err(EngineError::Config(format!(
+                    "privacy.tracker_blocker.custom_lists: absolute paths are not allowed for security reasons: '{path}'"
+                )));
+            }
+            if path.contains("..") {
+                return Err(EngineError::Config(format!(
+                    "privacy.tracker_blocker.custom_lists: path traversal attempts are not allowed: '{path}'"
+                )));
+            }
+
             let raw = fs::read_to_string(path).map_err(|e| {
                 EngineError::Config(format!(
                     "privacy.tracker_blocker.custom_lists could not read '{path}': {e}"

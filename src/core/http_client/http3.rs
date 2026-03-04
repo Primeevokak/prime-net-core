@@ -11,49 +11,6 @@ use url::Url;
 use crate::core::{PrimeHttpClient, ProgressHook, RequestData, ResponseData, ResponseStream};
 use crate::error::{EngineError, Result};
 
-// Rustls API is intentionally split; keep the unsafe verifier local to the HTTP/3 module.
-#[derive(Debug)]
-struct InsecureSkipVerify;
-
-impl rustls::client::danger::ServerCertVerifier for InsecureSkipVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        // Must not be empty, otherwise rustls will fail the handshake.
-        // Keep this aligned with the provider we use for the QUIC config (aws-lc-rs fallback).
-        rustls::crypto::aws_lc_rs::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
 fn build_rustls_config_http3(client: &PrimeHttpClient) -> Result<rustls::ClientConfig> {
     // QUIC uses TLS 1.3 exclusively. Build a dedicated rustls config to avoid accidentally
     // including TLS 1.2 in `with_protocol_versions()`.
@@ -71,9 +28,18 @@ fn build_rustls_config_http3(client: &PrimeHttpClient) -> Result<rustls::ClientC
     // HTTP/3 ALPNs. Keep a couple of legacy drafts for compatibility.
     cfg.alpn_protocols = vec![b"h3".to_vec(), b"h3-29".to_vec(), b"h3-30".to_vec()];
 
+    fn is_dev_mode() -> bool {
+        std::env::var("PRIME_NET_DEV").is_ok()
+    }
+
     if client.config.transport.http3_insecure_skip_verify {
-        cfg.dangerous()
-            .set_certificate_verifier(Arc::new(InsecureSkipVerify));
+        if is_dev_mode() {
+            tracing::warn!("HTTP/3 TLS verification is DISABLED (insecure_skip_verify=true). This allows MITM attacks and should ONLY be used for local testing/debugging.");
+            cfg.dangerous()
+                .set_certificate_verifier(Arc::new(crate::tls::InsecureSkipVerify));
+        } else {
+            tracing::error!("http3_insecure_skip_verify=true ignored in production mode. Set PRIME_NET_DEV=1 to enable for local testing.");
+        }
     }
 
     Ok(cfg)

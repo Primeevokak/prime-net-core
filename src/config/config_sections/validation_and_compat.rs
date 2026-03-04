@@ -22,11 +22,11 @@ impl EngineConfig {
                 serde_json::from_str(&content).map_err(|e| EngineError::Config(e.to_string()))?
             }
             "yaml" | "yml" => {
-                serde_yaml::from_str(&content).map_err(|e| EngineError::Config(e.to_string()))?
+                serde_yaml_ng::from_str(&content).map_err(|e| EngineError::Config(e.to_string()))?
             }
             _ => toml::from_str(&content)
                 .or_else(|_| serde_json::from_str(&content))
-                .or_else(|_| serde_yaml::from_str(&content))
+                .or_else(|_| serde_yaml_ng::from_str(&content))
                 .map_err(|e| EngineError::Config(e.to_string()))?,
         };
         let _ = config.apply_compat_repairs();
@@ -256,9 +256,9 @@ impl EngineConfig {
                             "pt.trojan.server must not be empty".to_owned(),
                         ));
                     }
-                    if t.password.trim().is_empty() {
+                    if t.password.trim().len() < 8 {
                         return Err(EngineError::Config(
-                            "pt.trojan.password must not be empty".to_owned(),
+                            "pt.trojan.password must be at least 8 characters long".to_owned(),
                         ));
                     }
                 }
@@ -273,9 +273,9 @@ impl EngineConfig {
                             "pt.shadowsocks.server must not be empty".to_owned(),
                         ));
                     }
-                    if s.password.trim().is_empty() {
+                    if s.password.trim().len() < 8 {
                         return Err(EngineError::Config(
-                            "pt.shadowsocks.password must not be empty".to_owned(),
+                            "pt.shadowsocks.password must be at least 8 characters long".to_owned(),
                         ));
                     }
                     if s.method.trim().is_empty() {

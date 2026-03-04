@@ -466,8 +466,9 @@ impl UniversalDnsResolver {
             Ok(v) => v,
             Err(e) => {
                 // Cleanup guard if build failed to allow future attempts
-                let guards = RESOLVER_BUILD_GUARDS.get().unwrap();
-                guards.lock().remove(&key);
+                if let Some(guards) = RESOLVER_BUILD_GUARDS.get() {
+                    guards.lock().remove(&key);
+                }
                 return Err(e);
             }
         };
@@ -613,7 +614,7 @@ impl UniversalDnsResolver {
             DnsResolverType::CustomUdp(server) => {
                 let (host, port) = split_host_port(server, 53)?;
                 let addrs =
-                    resolve_socket_addrs(&host, port, &self.config.bootstrap_ips, true).await?;
+                    resolve_socket_addrs(&host, port, &self.config.bootstrap_ips, false).await?;
                 let mut group = NameServerConfigGroup::new();
                 for sa in addrs {
                     group.push(NameServerConfig::new(sa, Protocol::Udp));
@@ -635,7 +636,7 @@ impl UniversalDnsResolver {
             DnsResolverType::CustomTcp(server) => {
                 let (host, port) = split_host_port(server, 53)?;
                 let addrs =
-                    resolve_socket_addrs(&host, port, &self.config.bootstrap_ips, true).await?;
+                    resolve_socket_addrs(&host, port, &self.config.bootstrap_ips, false).await?;
                 let mut group = NameServerConfigGroup::new();
                 for sa in addrs {
                     group.push(NameServerConfig::new(sa, Protocol::Tcp));

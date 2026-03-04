@@ -8,7 +8,7 @@ default = ["hickory-dns", "websocket", "observability"]
 hickory-dns = ["dep:hickory-resolver"]
 websocket = []
 observability = []
-signature-verification = ["dep:gpgme", "dep:tempfile"]
+signature-verification = ["dep:gpgme"]
 require-signatures = ["signature-verification"]
 
 [lib]
@@ -56,12 +56,13 @@ self_update = "0.39"
 sentry = { version = "0.32", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yaml = "0.9"
+serde_yaml_ng = "0.10.0"
+sha1 = "0.10"
 sha2 = "0.10.9"
 socket2 = "0.5.7"
 gpgme = { version = "0.11", optional = true }
-tempfile = { version = "3.8", optional = true }
-shadowsocks = { version = "1.24.0", default-features = false, features = ["aead-cipher", "aead-cipher-2022", "stream-cipher"] }
+tempfile = "3.10"
+shadowsocks = { version = "1.24.0", default-features = false, features = ["aead-cipher", "aead-cipher-2022"] }
 thiserror = "2.0.18"
 tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util", "io-std", "fs", "process", "signal"] }
 tokio-util = { version = "0.7.16", features = ["io"] }
@@ -101,7 +102,7 @@ mockito = "1.2"
 rcgen = "0.13.2"
 assert_cmd = "2.0"
 predicates = "3.0"
-tempfile = "3.8"
+tempfile = "3.10"
 serde_json = "1.0"
 reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls"] }
 
@@ -116,6 +117,8 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+panic = "abort"
+overflow-checks = true
 
 [profile.dev]
 debug = 0

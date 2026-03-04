@@ -476,6 +476,7 @@ pub unsafe extern "C" fn prime_request_wait(
                 );
             };
             // SAFETY: pointer was allocated by prime_engine_fetch_async.
+            // SAFETY: Lifecycle map ensures pointer is valid and not already freed.
             let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
 
             // If already cancelled, return immediately.
@@ -553,6 +554,7 @@ pub unsafe extern "C" fn prime_request_cancel(handle: *mut PrimeRequestHandle) -
                 return PRIME_ERR_INVALID_REQUEST;
             };
             // SAFETY: pointer was allocated by prime_engine_fetch_async.
+            // SAFETY: Lifecycle map ensures pointer is valid and not already freed.
             let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
 
             let cur = inner.status.load(Ordering::SeqCst);
@@ -600,6 +602,7 @@ pub unsafe extern "C" fn prime_request_status(
                 return PrimeRequestStatus::FAILED;
             };
             // SAFETY: pointer was allocated by prime_engine_fetch_async.
+            // SAFETY: Lifecycle map ensures pointer is valid and not already freed.
             let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
             match inner.status.load(Ordering::SeqCst) {
                 0 => PrimeRequestStatus::PENDING,
@@ -627,6 +630,7 @@ pub unsafe extern "C" fn prime_request_free(handle: *mut PrimeRequestHandle) {
                 return;
             };
             // Best-effort: cancel underlying task to avoid background network activity after handle free.
+            // SAFETY: Lifecycle map ensures pointer is valid and not already freed.
             let inner = unsafe { &*(handle as *mut PrimeRequestHandleInner) };
             let cur = inner.status.load(Ordering::SeqCst);
             if cur != PrimeRequestStatus::COMPLETED as u8
@@ -702,58 +706,75 @@ fn create_engine(config_path: *const c_char) -> Result<PrimeEngineHandle, Engine
 
     let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<EngineMsg>();
     let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), EngineError>>();
+    let init_tx_panic = init_tx.clone();
 
     let worker = std::thread::Builder::new()
         .name("prime-engine-runtime".to_owned())
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-
-            rt.block_on(async move {
-                let engine = match RustPrimeEngine::new(config).await {
+            let result = std::panic::catch_unwind(move || {
+                let rt = match tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                {
                     Ok(v) => v,
-                    Err(e) => {
-                        let _ = init_tx.send(Err(e));
-                        return;
-                    }
+                    Err(_) => return,
                 };
-                let client = engine.client();
-                let _keep_alive = engine;
-                let _ = init_tx.send(Ok(()));
 
-                while let Some(msg) = msg_rx.recv().await {
-                    match msg {
-                        EngineMsg::Task(task) => {
-                            let client = client.clone();
-                            task.status
-                                .store(PrimeRequestStatus::RUNNING as u8, Ordering::SeqCst);
-                            let status = task.status.clone();
-                            let result_tx = task.result_tx;
-                            let request = task.request;
-                            let progress = task.progress;
-                            let j = tokio::spawn(async move {
-                                let res = client.fetch(request, progress).await;
-                                match &res {
-                                    Ok(_) => status.store(
-                                        PrimeRequestStatus::COMPLETED as u8,
-                                        Ordering::SeqCst,
-                                    ),
-                                    Err(_) => status
-                                        .store(PrimeRequestStatus::FAILED as u8, Ordering::SeqCst),
-                                };
-                                let _ = result_tx.send(res);
-                            });
-                            let _ = task.abort_tx.send(j.abort_handle());
+                rt.block_on(async move {
+                    let engine = match RustPrimeEngine::new(config).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = init_tx.send(Err(e));
+                            return;
                         }
-                        EngineMsg::Shutdown => break,
+                    };
+                    let client = engine.client();
+                    let _keep_alive = engine;
+                    let _ = init_tx.send(Ok(()));
+
+                    while let Some(msg) = msg_rx.recv().await {
+                        match msg {
+                            EngineMsg::Task(task) => {
+                                let client = client.clone();
+                                task.status
+                                    .store(PrimeRequestStatus::RUNNING as u8, Ordering::SeqCst);
+                                let status = task.status.clone();
+                                let result_tx = task.result_tx;
+                                let request = task.request;
+                                let progress = task.progress;
+                                let j = tokio::spawn(async move {
+                                    let res = client.fetch(request, progress).await;
+                                    match &res {
+                                        Ok(_) => status.store(
+                                            PrimeRequestStatus::COMPLETED as u8,
+                                            Ordering::SeqCst,
+                                        ),
+                                        Err(_) => status.store(
+                                            PrimeRequestStatus::FAILED as u8,
+                                            Ordering::SeqCst,
+                                        ),
+                                    };
+                                    let _ = result_tx.send(res);
+                                });
+                                let _ = task.abort_tx.send(j.abort_handle());
+                            }
+                            EngineMsg::Shutdown => break,
+                        }
                     }
-                }
+                });
             });
+
+            if let Err(panic_info) = result {
+                let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                tracing::error!(panic = %msg, "FFI runtime thread panicked");
+                let _ = init_tx_panic.send(Err(EngineError::Internal(format!("Runtime panic: {msg}"))));
+            }
         })
         .map_err(|e| EngineError::Internal(format!("runtime thread spawn failed: {e}")))?;
 

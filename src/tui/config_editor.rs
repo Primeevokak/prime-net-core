@@ -220,13 +220,20 @@ fn parse_pt_kind(value: &str) -> Result<PluggableTransportKind> {
 }
 
 fn default_pt_config() -> PluggableTransportConfig {
+    use rand::{distributions::Alphanumeric, Rng};
+    let random_password: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(16)
+        .map(char::from)
+        .collect();
+
     PluggableTransportConfig {
         kind: PluggableTransportKind::Trojan,
         local_socks5_bind: "127.0.0.1:1080".to_owned(),
         silent_drop: false,
         trojan: Some(TrojanPtConfig {
             server: "server.example.com:443".to_owned(),
-            password: "change-me".to_owned(),
+            password: random_password,
             sni: Some("server.example.com".to_owned()),
             alpn_protocols: vec!["http/1.1".to_owned()],
             insecure_skip_verify: false,
