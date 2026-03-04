@@ -213,6 +213,10 @@ pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream,
                     updated_at_unix: now_unix_secs(),
                 });
             }
+            
+            // Record success for the classifier
+            classifier_and_persistence::record_destination_success(route_key, tuned.stage, tuned.source, &cfg);
+
             let mut upstream = route.stream;
             let start_time = Instant::now();
             let relay_res = relay_bidirectional(&mut tcp, &mut upstream, relay_opts, route.initial_client_data, route.initial_upstream_data, route.client_data_sent).await;
@@ -226,7 +230,11 @@ pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream,
                 Err(e) => {
                     let signal = classify_io_error(&e);
                     complete_route_outcome_event(conn_id, route_key, Some(&route.candidate), false, false, 0, start_time.elapsed().as_millis() as u64, &format!("{:?}", signal), &cfg);
+                    
+                    // Record failure for the classifier if it's a strong blocking signal
                     if signal == BlockingSignal::Reset || signal == BlockingSignal::Timeout {
+                        classifier_and_persistence::record_destination_failure(route_key, signal, 0, tuned.stage, &cfg);
+                        
                         debug!(conn_id, error = %e, signal = ?signal, "upstream failure, invalidating cache for {}", route_key);
                         let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
                         map.remove(route_key);

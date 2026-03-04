@@ -41,13 +41,19 @@ fn main() {
                 .unwrap_or(1)
         });
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads.max(1))
         .enable_all()
         // Aggressive I/O polling for lower latency in packet forwarding
         .global_queue_interval(31)
         .build()
-        .expect("Failed to build tokio runtime");
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: failed to build tokio runtime: {e}");
+            std::process::exit(1);
+        }
+    };
 
     runtime.block_on(async {
         if let Err(e) = real_main().await {

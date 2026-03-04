@@ -564,6 +564,10 @@ async fn connect_and_run(
             frame = read_frame(&mut rd, cfg.max_message_size) => {
                 let frame = frame?;
 
+                if frame.rsv1 && !handshake.deflate {
+                    return Err(EngineError::Internal("RSV1 bit set in websocket frame without deflate negotiation".to_owned()));
+                }
+
                 if frame.opcode.is_control() {
                     match frame.opcode {
                         OpCode::Ping => {

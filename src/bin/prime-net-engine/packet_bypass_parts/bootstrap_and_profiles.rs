@@ -351,8 +351,16 @@ async fn start_packet_bypass_process_with_port_retry(
 }
 
 fn bootstrap_install_dir() -> Result<PathBuf> {
-    let p = if let Ok(v) = std::env::var("PRIME_PT_BOOTSTRAP_DIR") { PathBuf::from(v) } else { std::env::current_exe()?.parent().unwrap().join("pt-tools") };
-    let _ = fs::create_dir_all(&p); Ok(p)
+    let p = if let Ok(v) = std::env::var("PRIME_PT_BOOTSTRAP_DIR") {
+        PathBuf::from(v)
+    } else {
+        std::env::current_exe()?
+            .parent()
+            .map(|p| p.join("pt-tools"))
+            .unwrap_or_else(|| PathBuf::from("pt-tools"))
+    };
+    let _ = fs::create_dir_all(&p);
+    Ok(p)
 }
 
 async fn resolve_or_bootstrap_binary(install_dir: &Path) -> Result<PathBuf> {

@@ -151,9 +151,7 @@ impl EngineConfig {
         }
         if self.privacy.user_agent.enabled {
             if let crate::config::UserAgentPreset::Custom = self.privacy.user_agent.preset {
-                if self.privacy.user_agent.custom_value.trim().is_empty() {
-                    return Err(EngineError::Config("privacy.user_agent.custom_value must not be empty when using 'custom' preset".to_owned()));
-                }
+                // Empty custom_value is allowed; it effectively suppresses the User-Agent header.
             }
         }
         if self.anticensorship.dot_enabled {

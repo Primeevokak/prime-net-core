@@ -351,14 +351,18 @@ impl PrimeHttpClient {
                 record_blocked_domain(&hit.host);
                 tracing::info!(
                     target: "privacy.tracker",
-                    "[BLOCKED][TRACKER] host={} rule={} url={}",
+                    "[BLOCKED][TRACKER] host={} rule={}",
                     hit.host,
-                    hit.matched_rule,
+                    hit.matched_rule
+                );
+                tracing::debug!(
+                    target: "privacy.tracker",
+                    "[BLOCKED][TRACKER] full_url={}",
                     request.url
                 );
 
                 if blocker.is_log_only() {
-                    tracing::info!(
+                    tracing::debug!(
                         target: "privacy.tracker",
                         "[PRIVACY][TRACKER] log_only mode, request allowed: {}",
                         request.url

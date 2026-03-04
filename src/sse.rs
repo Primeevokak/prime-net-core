@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures_util::Stream;
 use reqwest::Method;
-use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncBufRead;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::core::{PrimeHttpClient, RequestData};
@@ -136,6 +136,63 @@ impl EventAcc {
     }
 }
 
+async fn read_line_sse<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    use tokio::io::AsyncBufReadExt;
+    let mut total_read = 0;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(total_read);
+        }
+
+        let mut i = 0;
+        while i < available.len() {
+            let b = available[i];
+            if b == b'\n' {
+                reader.consume(i + 1);
+                return Ok(total_read + i + 1);
+            }
+            if b == b'\r' {
+                let has_next = i + 1 < available.len();
+                if has_next {
+                    if available[i + 1] == b'\n' {
+                        reader.consume(i + 2);
+                        return Ok(total_read + i + 2);
+                    } else {
+                        reader.consume(i + 1);
+                        return Ok(total_read + i + 1);
+                    }
+                } else {
+                    // CR is at the end of the buffer. 
+                    // To handle \r\n, we consume everything up to CR, push to buf,
+                    // and then we must peek one more byte from the stream.
+                    reader.consume(i);
+                    total_read += i;
+                    
+                    // Consume the CR now.
+                    reader.consume(1);
+                    total_read += 1;
+                    
+                    // Peek if next is LF.
+                    let available = reader.fill_buf().await?;
+                    if !available.is_empty() && available[0] == b'\n' {
+                        reader.consume(1);
+                        return Ok(total_read + 1);
+                    }
+                    return Ok(total_read);
+                }
+            }
+            buf.push(b);
+            i += 1;
+        }
+        reader.consume(i);
+        total_read += i;
+    }
+}
+
 async fn run_sse(
     client: Arc<PrimeHttpClient>,
     req_template: RequestData,
@@ -190,9 +247,11 @@ async fn run_sse(
 
         loop {
             buf.clear();
+            
+            // Spec-compliant line reading: handles \n, \r, and \r\n as terminators.
             let n = tokio::select! {
                 _ = &mut stop_rx => return,
-                r = reader.read_until(b'\n', &mut buf) => match r {
+                r = read_line_sse(&mut reader, &mut buf) => match r {
                     Ok(v) => v,
                     Err(e) => {
                         let _ = out.send(Err(EngineError::Io(e))).await;
@@ -200,6 +259,7 @@ async fn run_sse(
                     }
                 }
             };
+            
             if n == 0 {
                 if let Some(ev) = acc.take_event() {
                     if out.send(Ok(ev)).await.is_err() {
@@ -209,11 +269,6 @@ async fn run_sse(
                 break; // EOF
             }
             stream_had_activity = true;
-
-            // Trim trailing LF/CRLF.
-            while matches!(buf.last(), Some(b'\n' | b'\r')) {
-                buf.pop();
-            }
 
             let line = match std::str::from_utf8(&buf) {
                 Ok(v) => v,

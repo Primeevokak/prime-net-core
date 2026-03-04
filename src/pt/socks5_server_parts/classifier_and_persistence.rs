@@ -7,7 +7,7 @@ pub fn record_destination_failure(destination: &str, signal: BlockingSignal, _em
     let _ = cfg;
 }
 
-pub fn record_destination_failure_sync(destination: &str, signal: BlockingSignal, _stage: u8, _cfg: &EngineConfig) {
+pub fn record_destination_failure_sync(destination: &str, signal: BlockingSignal, stage: u8, _cfg: &EngineConfig) {
     let now = now_unix_secs();
     {
         let map = DEST_FAILURES.get_or_init(dashmap::DashMap::new);
@@ -24,6 +24,7 @@ pub fn record_destination_failure_sync(destination: &str, signal: BlockingSignal
             _ => {}
         }
         stats.last_seen_unix = now;
+        stats.preferred_stage = Some(stage);
     }
 }
 
@@ -31,7 +32,7 @@ pub fn record_destination_success(destination: &str, stage: u8, _source: StageSe
     send_telemetry(TelemetryEvent::DestinationSuccess { destination: destination.to_owned(), stage });
 }
 
-pub fn record_destination_success_sync(destination: &str, _stage: u8, _cfg: &EngineConfig) {
+pub fn record_destination_success_sync(destination: &str, stage: u8, _cfg: &EngineConfig) {
     let now = now_unix_secs();
     {
         let map = DEST_FAILURES.get_or_init(dashmap::DashMap::new);
@@ -42,6 +43,7 @@ pub fn record_destination_success_sync(destination: &str, _stage: u8, _cfg: &Eng
         let mut stats = map.entry(destination.to_owned()).or_default();
         stats.successes += 1;
         stats.last_seen_unix = now;
+        stats.preferred_stage = Some(stage);
     }
 }
 
@@ -66,10 +68,28 @@ pub fn load_classifier_store_if_needed(cfg: Arc<EngineConfig>) {
             match serde_json::from_str::<std::collections::HashMap<String, DestinationClassifier>>(&json) {
                 Ok(data) => {
                     let map = DEST_CLASSIFIER.get_or_init(dashmap::DashMap::new);
+                    let winners = DEST_ROUTE_WINNER.get_or_init(dashmap::DashMap::new);
+                    let stages = DEST_PREFERRED_STAGE.get_or_init(dashmap::DashMap::new);
+                    
+                    let now = now_unix_secs();
                     for (k, v) in data {
+                        // Only load if not too old (e.g. 7 days)
+                        if now.saturating_sub(v.last_seen_unix) > 604800 { continue; }
+                        
+                        if let Some(ref winner) = v.winner {
+                             // Only restore winner if it's still fresh enough (e.g. 24 hours for persistence)
+                             if now.saturating_sub(winner.updated_at_unix) < 86400 {
+                                 winners.insert(k.clone(), winner.clone());
+                             }
+                        }
+                        
+                        if let Some(stage) = v.preferred_stage {
+                            stages.insert(k.clone(), stage);
+                        }
+                        
                         map.insert(k, v);
                     }
-                    tracing::info!("Loaded {} classifier entries from {}", map.len(), path);
+                    tracing::info!("Loaded {} classifier entries (with winners) from {}", map.len(), path);
                 }
                 Err(e) => tracing::warn!("Failed to parse classifier cache {}: {}", path, e),
             }
@@ -93,7 +113,32 @@ pub fn maybe_flush_classifier_store(force: bool, cfg: Arc<EngineConfig>) {
 
     if map.is_empty() && !force { return; }
 
-    let data: std::collections::HashMap<String, DestinationClassifier> = map.iter().map(|r| (r.key().clone(), r.value().clone())).collect();
+    let winners = DEST_ROUTE_WINNER.get();
+    let stages = DEST_PREFERRED_STAGE.get();
+
+    let mut data: std::collections::HashMap<String, DestinationClassifier> = std::collections::HashMap::new();
+    
+    // Iterate over all known destinations in the classifier
+    for entry in map.iter() {
+        let k = entry.key();
+        let mut v = entry.value().clone();
+        
+        // Sync winner and preferred stage from their respective hot caches
+        if let Some(w_map) = winners {
+            if let Some(winner) = w_map.get(k) {
+                v.winner = Some(winner.clone());
+            }
+        }
+        
+        if let Some(s_map) = stages {
+            if let Some(stage) = s_map.get(k) {
+                v.preferred_stage = Some(*stage);
+            }
+        }
+        
+        data.insert(k.clone(), v);
+    }
+    
     match serde_json::to_string_pretty(&data) {
         Ok(json) => {
             if let Err(e) = std::fs::write(path, json) {

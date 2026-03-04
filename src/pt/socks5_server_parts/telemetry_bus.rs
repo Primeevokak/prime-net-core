@@ -57,6 +57,7 @@ pub fn init_telemetry_bus(cfg: Arc<EngineConfig>) {
 
             if last_prune.elapsed() > Duration::from_secs(30) {
                 classifier_and_persistence::maybe_prune_runtime_classifier_state(now_unix_secs(), cfg.clone());
+                classifier_and_persistence::maybe_flush_classifier_store(false, cfg.clone());
                 last_prune = Instant::now();
             }
         }

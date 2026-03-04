@@ -72,7 +72,7 @@ PrimeRequestHandle* prime_engine_fetch_async(
 /*
  * Blocks the calling thread until the request is done or timeout expires.
  * timeout_ms = 0 means wait indefinitely.
- * On success, the handle is freed and a PrimeResponse is returned.
+ * On terminal completion (success or failure), the handle is automatically freed and a PrimeResponse is returned.
  * On timeout, the handle remains valid and can be waited on again.
  */
 PrimeResponse* prime_request_wait(PrimeRequestHandle* handle, uint64_t timeout_ms);

@@ -11,10 +11,39 @@ async fn read_frame(
         .map_err(|e| EngineError::Internal(format!("websocket read failed: {e}")))?;
     let fin = (h[0] & 0x80) != 0;
     let rsv1 = (h[0] & 0x40) != 0;
+    let rsv2 = (h[0] & 0x20) != 0;
+    let rsv3 = (h[0] & 0x10) != 0;
+
+    if rsv2 || rsv3 {
+        return Err(EngineError::Internal(
+            "reserved bits (RSV2/RSV3) set in websocket frame without negotiation".to_owned(),
+        ));
+    }
+
     let opcode = OpCode::from_u8(h[0] & 0x0f)
         .ok_or_else(|| EngineError::Internal("unknown websocket opcode".to_owned()))?;
+
     let masked = (h[1] & 0x80) != 0;
     let mut len = (h[1] & 0x7f) as u64;
+
+    if opcode.is_control() {
+        if !fin {
+            return Err(EngineError::Internal(
+                "fragmented websocket control frame (fin=0)".to_owned(),
+            ));
+        }
+        if rsv1 {
+            return Err(EngineError::Internal(
+                "RSV1 bit set on websocket control frame".to_owned(),
+            ));
+        }
+        if len > 125 {
+            return Err(EngineError::Internal(
+                "websocket control frame too large (>125 bytes)".to_owned(),
+            ));
+        }
+    }
+
     if len == 126 {
         let mut b = [0u8; 2];
         rd.read_exact(&mut b)

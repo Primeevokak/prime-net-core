@@ -507,17 +507,21 @@ pub unsafe extern "C" fn prime_request_wait(
                     inner
                         .status
                         .store(PrimeRequestStatus::COMPLETED as u8, Ordering::SeqCst);
+                    mark_request_freed(handle);
                     pack_ok(response)
                 }
                 Ok(Err(err)) => {
                     let mut code = error_code_from(&err);
                     if err.to_string() == "timeout" {
                         code = PRIME_ERR_RUNTIME;
+                        pack_error(code, "timeout")
+                    } else {
+                        inner
+                            .status
+                            .store(PrimeRequestStatus::FAILED as u8, Ordering::SeqCst);
+                        mark_request_freed(handle);
+                        pack_error(code, &err.to_string())
                     }
-                    inner
-                        .status
-                        .store(PrimeRequestStatus::FAILED as u8, Ordering::SeqCst);
-                    pack_error(code, &err.to_string())
                 }
                 Err(EngineError::Internal(msg)) if msg == "timeout" => {
                     pack_error(PRIME_ERR_RUNTIME, "timeout")
@@ -526,6 +530,7 @@ pub unsafe extern "C" fn prime_request_wait(
                     inner
                         .status
                         .store(PrimeRequestStatus::FAILED as u8, Ordering::SeqCst);
+                    mark_request_freed(handle);
                     pack_error(error_code_from(&err), &err.to_string())
                 }
             }
