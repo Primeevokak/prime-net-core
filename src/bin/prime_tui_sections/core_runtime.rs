@@ -1,3 +1,146 @@
+// ─── TUN/VPN constants ────────────────────────────────────────────────────
+
+const TUN_NAME: &str = "prime0";
+const TUN_ADDR: &str = "10.88.0.1";
+const TUN_PREFIX: &str = "16";
+
+// ─── TUN route management ─────────────────────────────────────────────────
+
+fn apply_tun_routes(_tun_name: &str, tun_addr: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = Command::new("route")
+            .args(["add", "0.0.0.0", "mask", "128.0.0.0", tun_addr, "metric", "5"])
+            .status();
+        let _ = Command::new("route")
+            .args(["add", "128.0.0.0", "mask", "128.0.0.0", tun_addr, "metric", "5"])
+            .status();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = Command::new("ip")
+            .args(["route", "add", "0.0.0.0/1", "dev", _tun_name])
+            .status();
+        let _ = Command::new("ip")
+            .args(["route", "add", "128.0.0.0/1", "dev", _tun_name])
+            .status();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("route")
+            .args(["add", "-net", "0.0.0.0/1", "-interface", _tun_name])
+            .status();
+        let _ = Command::new("route")
+            .args(["add", "-net", "128.0.0.0/1", "-interface", _tun_name])
+            .status();
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    let _ = tun_addr;
+}
+
+fn remove_tun_routes(_tun_name: &str, _tun_addr: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = Command::new("route").args(["delete", "0.0.0.0", "mask", "128.0.0.0"]).status();
+        let _ = Command::new("route").args(["delete", "128.0.0.0", "mask", "128.0.0.0"]).status();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = Command::new("ip")
+            .args(["route", "del", "0.0.0.0/1", "dev", _tun_name])
+            .status();
+        let _ = Command::new("ip")
+            .args(["route", "del", "128.0.0.0/1", "dev", _tun_name])
+            .status();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("route").args(["delete", "-net", "0.0.0.0/1"]).status();
+        let _ = Command::new("route").args(["delete", "-net", "128.0.0.0/1"]).status();
+    }
+}
+
+// ─── TUN/VPN lifecycle ────────────────────────────────────────────────────
+
+fn activate_tun(app: &mut App) -> Result<()> {
+    // Stop proxy core if running
+    if app.core_process.is_some() {
+        if let Some(mut child) = app.core_process.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        app.core_event_rx = None;
+        app.core_start_pending = None;
+        if app.proxy_managed_by_tui {
+            let _ = system_proxy_manager().disable();
+            app.proxy_managed_by_tui = false;
+        }
+    }
+
+    let mut bin = std::env::current_exe()?;
+    bin.set_file_name(if cfg!(windows) {
+        "prime-net-engine.exe"
+    } else {
+        "prime-net-engine"
+    });
+    if !bin.exists() {
+        return Err(EngineError::Internal(format!(
+            "ядро не найдено ({}): убедитесь, что оба бинарника скомпилированы вместе",
+            bin.display()
+        )));
+    }
+
+    let endpoint = app.config_editor.config.system_proxy.socks_endpoint.clone();
+    let child = Command::new(&bin)
+        .arg("--config")
+        .arg(&app.config_path)
+        .arg("--log-level")
+        .arg("info")
+        .arg("--log-format")
+        .arg("text")
+        .arg("tun")
+        .arg("--tun-name")
+        .arg(TUN_NAME)
+        .arg("--tun-addr")
+        .arg(TUN_ADDR)
+        .arg("--tun-prefix")
+        .arg(TUN_PREFIX)
+        .arg("--socks-addr")
+        .arg(&endpoint)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| EngineError::Internal(format!("не удалось запустить TUN ядро: {e}")))?;
+
+    app.core_process = Some(child);
+    let (event_tx, event_rx) = mpsc::channel();
+    if let Some(child) = app.core_process.as_mut() {
+        attach_core_log_pump(child, app.log_viewer.clone(), event_tx);
+    }
+    app.core_event_rx = Some(event_rx);
+    app.network_mode = NetworkMode::Vpn;
+    // Reuse core_start_pending — poll_core_startup will detect SOCKS5 up and apply routes
+    app.core_start_pending = Some((endpoint.clone(), Instant::now()));
+    app.status_line = format!("Запуск TUN/VPN ({TUN_NAME} {TUN_ADDR}/{TUN_PREFIX})...");
+    Ok(())
+}
+
+fn deactivate_tun(app: &mut App) -> Result<()> {
+    remove_tun_routes(TUN_NAME, TUN_ADDR);
+    if let Some(mut child) = app.core_process.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    app.core_event_rx = None;
+    app.core_start_pending = None;
+    app.network_mode = NetworkMode::Proxy;
+    app.status_line = "TUN/VPN остановлен, маршруты удалены".to_owned();
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+
 fn handle_logs_key(app: &mut App, key: KeyEvent) -> Result<()> {
     if app.log_input_mode == LogInputMode::Search {
         match key.code {
@@ -247,10 +390,15 @@ fn poll_core_startup(app: &mut App) -> Result<()> {
 
     let socks_check = ProxyDiagnostics::check_socks5_listening(&endpoint);
     if matches!(socks_check.level, DiagnosticLevel::Ok) {
-        system_proxy_manager().enable(&endpoint)?;
-        app.proxy_managed_by_tui = true;
         app.core_start_pending = None;
-        app.status_line = format!("Ядро запущено, системный прокси -> {endpoint}");
+        if app.network_mode == NetworkMode::Vpn {
+            apply_tun_routes(TUN_NAME, TUN_ADDR);
+            app.status_line = format!("TUN/VPN запущен ({TUN_NAME} {TUN_ADDR}), маршруты применены");
+        } else {
+            system_proxy_manager().enable(&endpoint)?;
+            app.proxy_managed_by_tui = true;
+            app.status_line = format!("Ядро запущено, системный прокси -> {endpoint}");
+        }
         return Ok(());
     }
 
@@ -261,7 +409,12 @@ fn poll_core_startup(app: &mut App) -> Result<()> {
         app.core_event_rx = None;
         app.core_start_pending = None;
         app.proxy_managed_by_tui = false;
-        app.status_line = "Таймаут запуска ядра (см. вкладку «Логи»)".to_owned();
+        if app.network_mode == NetworkMode::Vpn {
+            app.network_mode = NetworkMode::Proxy;
+            app.status_line = "Таймаут запуска TUN/VPN (см. вкладку «Логи»)".to_owned();
+        } else {
+            app.status_line = "Таймаут запуска ядра (см. вкладку «Логи»)".to_owned();
+        }
     }
     Ok(())
 }
@@ -738,13 +891,24 @@ fn export_filtered_logs(app: &App, path: &Path) -> Result<()> {
 
 fn compose_status_line(app: &App) -> Line<'static> {
     let mut spans = Vec::new();
-    
+
     // 1. Core Process Status
     let core_running = app.core_process.is_some();
-    if core_running {
-        spans.push(Span::styled(" ЯДРО: ВКЛ ", Style::default().bg(Color::Green).fg(Color::Black)));
-    } else {
-        spans.push(Span::styled(" ЯДРО: ВЫКЛ ", Style::default().bg(Color::Red).fg(Color::White)));
+    match app.network_mode {
+        NetworkMode::Vpn => {
+            if core_running {
+                spans.push(Span::styled(" VPN: ВКЛ ", Style::default().bg(Color::Cyan).fg(Color::Black)));
+            } else {
+                spans.push(Span::styled(" VPN: ВЫКЛ ", Style::default().bg(Color::Red).fg(Color::White)));
+            }
+        }
+        NetworkMode::Proxy => {
+            if core_running {
+                spans.push(Span::styled(" ЯДРО: ВКЛ ", Style::default().bg(Color::Green).fg(Color::Black)));
+            } else {
+                spans.push(Span::styled(" ЯДРО: ВЫКЛ ", Style::default().bg(Color::Red).fg(Color::White)));
+            }
+        }
     }
     spans.push(Span::raw("  "));
 

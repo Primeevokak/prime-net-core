@@ -66,6 +66,14 @@ enum UserMode {
     Advanced,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkMode {
+    /// SOCKS5 proxy + optional system proxy
+    Proxy,
+    /// TUN/VPN — routes all IP traffic through the engine
+    Vpn,
+}
+
 const AUTHOR_TELEGRAM_URL: &str = "https://t.me/o00000000i";
 
 pub(crate) struct App {
@@ -96,6 +104,7 @@ pub(crate) struct App {
     core_event_rx: Option<mpsc::Receiver<CoreUiEvent>>,
     proxy_managed_by_tui: bool,
     core_start_pending: Option<(String, Instant)>,
+    network_mode: NetworkMode,
 }
 
 #[derive(Debug, Clone)]
@@ -131,7 +140,7 @@ impl App {
         log_viewer.set_auto_scroll(true);
 
         Self {
-            tab: Tab::Config,
+            tab: Tab::Proxy,
             config_path,
             config_editor: ConfigEditor::new(config),
             conn_monitor: ConnectionMonitor::new(),
@@ -158,6 +167,7 @@ impl App {
             core_event_rx: None,
             proxy_managed_by_tui: false,
             core_start_pending: None,
+            network_mode: NetworkMode::Proxy,
         }
     }
 
@@ -238,12 +248,9 @@ impl App {
             UserMode::Advanced => UxMode::Advanced,
         });
         if self.user_mode == UserMode::Simple
-            && !matches!(
-                self.tab,
-                Tab::Config | Tab::Privacy | Tab::PrivacyHeaders | Tab::Proxy
-            )
+            && !matches!(self.tab, Tab::Proxy | Tab::Config | Tab::Privacy)
         {
-            self.tab = Tab::Config;
+            self.tab = Tab::Proxy;
         }
     }
 }
@@ -255,6 +262,9 @@ impl Drop for App {
             let _ = child.wait();
         }
         self.core_start_pending = None;
+        if self.network_mode == NetworkMode::Vpn {
+            remove_tun_routes(TUN_NAME, TUN_ADDR);
+        }
         if self.proxy_managed_by_tui {
             let _ = system_proxy_manager().disable();
         }
@@ -453,7 +463,7 @@ fn render(frame: &mut Frame, app: &mut App) {
 Источник: {source}\n\n\
 Что можно сделать:\n\
   [r]/[Enter] Повторить безопасный запуск (рекомендуется)\n\
-  [u] Небезопасный режим отключён (strict trust mode)\n\
+  [u] Запустить без проверки целостности (небезопасно)\n\
   [n]/[Esc] Оставить direct-режим\n\n\
 Режим без проверки включается только вручную и только на один запуск."
         );
@@ -511,17 +521,17 @@ fn render(frame: &mut Frame, app: &mut App) {
 fn tab_bar(tab: Tab, mode: UserMode) -> Paragraph<'static> {
     let tabs = match mode {
         UserMode::Simple => vec![
-            (Tab::Config, "1 Конфиг"),
-            (Tab::Privacy, "2 Приватность"),
-            (Tab::Proxy, "3 Прокси"),
+            (Tab::Proxy, "1 Прокси"),
+            (Tab::Config, "2 Конфиг"),
+            (Tab::Privacy, "3 Приватность"),
         ],
         UserMode::Advanced => vec![
-            (Tab::Config, "1 Конфиг"),
-            (Tab::Monitor, "2 Монитор"),
-            (Tab::Privacy, "3 Приватность"),
-            (Tab::PrivacyHeaders, "4 Заголовки приватности"),
-            (Tab::Logs, "5 Логи"),
-            (Tab::Proxy, "6 Прокси"),
+            (Tab::Proxy, "1 Прокси"),
+            (Tab::Config, "2 Конфиг"),
+            (Tab::Monitor, "3 Монитор"),
+            (Tab::Privacy, "4 Приватность"),
+            (Tab::PrivacyHeaders, "5 Заголовки приватности"),
+            (Tab::Logs, "6 Логи"),
         ],
     };
     let spans = tabs
@@ -693,14 +703,25 @@ fn render_proxy(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
     lines.push(Line::from(""));
+    let mode_label = match app.network_mode {
+        NetworkMode::Proxy => "ПРОКСИ (SOCKS5)",
+        NetworkMode::Vpn   => "VPN (TUN — весь трафик)",
+    };
+    lines.push(Line::from(format!("Режим сети: {mode_label}")));
     lines.push(Line::from(
-        "[a] включить ядро  [x] выключить ядро  [u] обновить диагностику",
+        "[a] включить прокси  [x] выключить  [v] переключить VPN/Прокси  [u] диагностика",
     ));
-
     lines.push(Line::from(""));
     lines.push(Line::from(
         "[d] очистить кэш relay-классификатора (с подтверждением)",
     ));
+    lines.push(Line::from(""));
+    lines.push(Line::from("─── VPN / TUN режим ───"));
+    lines.push(Line::from(
+        "Маршрутизирует весь IP-трафик через движок. [v] — запустить / остановить.",
+    ));
+    lines.push(Line::from("  На Linux/macOS требуется root или CAP_NET_ADMIN."));
+    lines.push(Line::from("  На Windows — Administrator (wintun.dll скачивается автоматически)."));
     lines.push(Line::from(""));
     lines.push(Line::from("Ссылки автора:"));
     lines.push(Line::from(format!(
@@ -711,7 +732,7 @@ fn render_proxy(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
-                .title("Системный прокси")
+                .title("Прокси и управление")
                 .borders(Borders::ALL),
         ),
         area,
@@ -836,50 +857,46 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     if matches!(key.code, KeyCode::Tab) {
         app.tab = match app.user_mode {
             UserMode::Simple => match app.tab {
+                Tab::Proxy => Tab::Config,
                 Tab::Config => Tab::Privacy,
                 Tab::Privacy => Tab::Proxy,
-                Tab::Proxy => Tab::Config,
-                _ => Tab::Config,
+                _ => Tab::Proxy,
             },
             UserMode::Advanced => match app.tab {
+                Tab::Proxy => Tab::Config,
                 Tab::Config => Tab::Monitor,
                 Tab::Monitor => Tab::Privacy,
                 Tab::Privacy => Tab::PrivacyHeaders,
                 Tab::PrivacyHeaders => Tab::Logs,
                 Tab::Logs => Tab::Proxy,
-                Tab::Proxy => Tab::Config,
             },
         };
         return Ok(false);
     }
 
     match key.code {
-        KeyCode::Char('1') => app.tab = Tab::Config,
-        KeyCode::Char('2') => {
+        KeyCode::Char('1') => app.tab = Tab::Proxy,
+        KeyCode::Char('2') => app.tab = Tab::Config,
+        KeyCode::Char('3') => {
             app.tab = match app.user_mode {
                 UserMode::Simple => Tab::Privacy,
                 UserMode::Advanced => Tab::Monitor,
             }
         }
-        KeyCode::Char('3') => {
-            app.tab = match app.user_mode {
-                UserMode::Simple => Tab::Proxy,
-                UserMode::Advanced => Tab::Privacy,
-            }
-        }
         KeyCode::Char('4') => {
-            if app.user_mode == UserMode::Advanced {
-                app.tab = Tab::PrivacyHeaders;
+            app.tab = match app.user_mode {
+                UserMode::Simple => Tab::Proxy, // no-op fallback
+                UserMode::Advanced => Tab::Privacy,
             }
         }
         KeyCode::Char('5') => {
             if app.user_mode == UserMode::Advanced {
-                app.tab = Tab::Logs;
+                app.tab = Tab::PrivacyHeaders;
             }
         }
         KeyCode::Char('6') => {
             if app.user_mode == UserMode::Advanced {
-                app.tab = Tab::Proxy;
+                app.tab = Tab::Logs;
             }
         }
         _ => {}
@@ -947,11 +964,27 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                 app.status_line = "Подтвердите очистку кэша relay-классификатора".to_owned();
             }
             KeyCode::Char('a') => {
+                if app.network_mode == NetworkMode::Vpn {
+                    deactivate_tun(app)?;
+                }
                 activate_core(app, false)?;
             }
             KeyCode::Char('x') => {
-                deactivate_core(app)?;
-                app.refresh_proxy_diagnostics().await;
+                if app.network_mode == NetworkMode::Vpn {
+                    deactivate_tun(app)?;
+                } else {
+                    deactivate_core(app)?;
+                    app.refresh_proxy_diagnostics().await;
+                }
+            }
+            KeyCode::Char('v') => {
+                match app.network_mode {
+                    NetworkMode::Proxy => activate_tun(app)?,
+                    NetworkMode::Vpn   => {
+                        deactivate_tun(app)?;
+                        app.refresh_proxy_diagnostics().await;
+                    }
+                }
             }
             KeyCode::Enter => {
                 open_author_telegram_channel()?;
@@ -1007,14 +1040,14 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 
 fn tabs_for_mode(mode: UserMode) -> Vec<Tab> {
     match mode {
-        UserMode::Simple => vec![Tab::Config, Tab::Privacy, Tab::Proxy],
+        UserMode::Simple => vec![Tab::Proxy, Tab::Config, Tab::Privacy],
         UserMode::Advanced => vec![
+            Tab::Proxy,
             Tab::Config,
             Tab::Monitor,
             Tab::Privacy,
             Tab::PrivacyHeaders,
             Tab::Logs,
-            Tab::Proxy,
         ],
     }
 }

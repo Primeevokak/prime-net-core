@@ -99,18 +99,11 @@ pub fn candidate_binary_names() -> Vec<String> {
 pub async fn build_mirror_urls(_name: &str) -> Vec<String> {
     let tag = resolve_packet_bypass_tag().await;
     let version = release_asset_version(&tag);
-    let compact = version.replace('.', "");
     let mut assets = Vec::new();
     if cfg!(windows) {
         assets.push(format!("byedpi-{version}-x86_64-w64.zip"));
-        if compact != version {
-            assets.push(format!("byedpi-{compact}-x86_64-w64.zip"));
-        }
     } else {
         assets.push(format!("byedpi-{version}-x86_64-linux.zip"));
-        if compact != version {
-            assets.push(format!("byedpi-{compact}-x86_64-linux.zip"));
-        }
     }
     assets
         .into_iter()
@@ -260,65 +253,74 @@ fn set_port_arg(args: &mut Vec<String>, port: u16) {
 }
 
 fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
+    // ── Cloudflare-safe profiles (NO --disorder, NO --disoob) ────────────────
+    // Cloudflare (Discord, Instagram, etc.) requires strict TCP segment ordering.
+    // Any --disorder causes the server to stall waiting for missing segments.
+    // Safe techniques: --tlsrec (TLS record split), --fake (low-TTL decoy), --oob, --split.
+    //
+    // ── Disorder profiles ────────────────────────────────────────────────────
+    // Effective for non-Cloudflare targets (Roskomnadzor-blocked sites, VK, etc.)
+    // that are blocked by SNI but served on origin servers tolerant of TCP reorder.
     let mut profiles = vec![
+        // 1. Pure TLS record split at SNI — safest and most universal for Cloudflare.
+        //    DPI cannot extract SNI because the TLS record is split right before it.
+        //    Server receives both fragments in order → TLS completes normally.
         PacketBypassProfile {
-            name: "disorder-split-1".to_owned(),
-            args: vec!["--split".into(), "1".into(), "--disorder".into(), "1".into(), "--auto".into(), "none".into()],
+            name: "discord-tlsrec-1s".to_owned(),
+            args: vec!["--tlsrec".into(), "1+s".into(), "--auto".into(), "none".into()],
         },
+        // 2. TLS record split + fake decoy packet with low TTL.
+        //    Fake packet (TTL=3) doesn't reach server, DPI confused by two hellos.
         PacketBypassProfile {
-            name: "tlsrec-disorder-3".to_owned(),
-            args: vec!["--tlsrec".into(), "3+s".into(), "--disorder".into(), "1".into(), "--auto".into(), "none".into()],
+            name: "discord-tlsrec-fake".to_owned(),
+            args: vec!["--tlsrec".into(), "2+s".into(), "--fake".into(), "1".into(), "--ttl".into(), "3".into(), "--auto".into(), "none".into()],
         },
+        // 3. TCP split at SNI offset — splits ClientHello at the SNI byte boundary.
         PacketBypassProfile {
-            name: "split-2-oob-disorder".to_owned(),
-            args: vec!["--split".into(), "2".into(), "--oob".into(), "1".into(), "--disorder".into(), "1".into(), "--auto".into(), "none".into()],
+            name: "discord-split-sni".to_owned(),
+            args: vec!["--split".into(), "1+s".into(), "--auto".into(), "none".into()],
         },
-        // discord-disorder-dropsack: --drop-sack prevents ISP from using TCP SACK to
-        // reassemble disordered segments and inspect the WebSocket Upgrade request.
-        // Confirmed working for Discord in RU community research (byedpi discussion #179).
+        // 4. TLS record split at SNI + UDP fake for Discord voice (QUIC fallback).
         PacketBypassProfile {
-            name: "discord-disorder-dropsack".to_owned(),
-            args: vec!["--disorder".into(), "1".into(), "--drop-sack".into(), "--auto".into(), "none".into()],
+            name: "discord-tlsrec-udpfake".to_owned(),
+            args: vec!["--tlsrec".into(), "1+s".into(), "--udp-fake".into(), "1".into(), "--auto".into(), "none".into()],
         },
+        // 5. OOB byte + TCP split at SNI — OOB confuses DPI, split hides SNI boundary.
+        PacketBypassProfile {
+            name: "discord-oob-split-sni".to_owned(),
+            args: vec!["--oob".into(), "1".into(), "--split".into(), "1+s".into(), "--auto".into(), "none".into()],
+        },
+        // 6. TLS record split deep + fake + TTL (confirmed effective in RU for Cloudflare).
         PacketBypassProfile {
             name: "tlsrec-5-fake-ttl".to_owned(),
             args: vec!["--tlsrec".into(), "5+s".into(), "--fake".into(), "1".into(), "--ttl".into(), "5".into(), "--auto".into(), "none".into()],
         },
-        // disorder-shuffle-3 + drop-sack + udp-fake: covers Discord voice (UDP fake)
-        // and WebSocket (drop-sack prevents SACK-based DPI reassembly).
+        // 7. OOB + TLS record split + UDP fake — broad Cloudflare/Discord combo.
         PacketBypassProfile {
-            name: "disorder-shuffle-3".to_owned(),
-            args: vec!["--disorder".into(), "3".into(), "--drop-sack".into(), "--auto".into(), "none".into(), "--udp-fake".into(), "1".into()],
+            name: "discord-oob2-tlsrec".to_owned(),
+            args: vec!["--oob".into(), "2".into(), "--tlsrec".into(), "3+s".into(), "--udp-fake".into(), "1".into(), "--auto".into(), "none".into()],
+        },
+        // 8. Clean split at position 2 + OOB — for sites that aren't Cloudflare.
+        PacketBypassProfile {
+            name: "split-2-oob".to_owned(),
+            args: vec!["--split".into(), "2".into(), "--oob".into(), "1".into(), "--auto".into(), "none".into()],
+        },
+        // 9-12: Disorder profiles — effective for non-Cloudflare blocked sites.
+        PacketBypassProfile {
+            name: "disorder-split-1".to_owned(),
+            args: vec!["--disorder".into(), "1".into(), "--split".into(), "1".into(), "--auto".into(), "none".into()],
         },
         PacketBypassProfile {
-            name: "oob-1-deep-split-60".to_owned(),
-            args: vec!["--oob".into(), "1".into(), "--split".into(), "60".into(), "--auto".into(), "none".into()],
+            name: "disorder-oob-3".to_owned(),
+            args: vec!["--disorder".into(), "3".into(), "--oob".into(), "1".into(), "--auto".into(), "none".into()],
         },
         PacketBypassProfile {
-            name: "tlsrec-1-disorder-shuffle".to_owned(),
-            args: vec!["--tlsrec".into(), "1+s".into(), "--disorder".into(), "3+s".into(), "--auto".into(), "none".into()],
-        },
-        // discord-disoob-dropsack: disordered out-of-band data (--disoob) is specifically
-        // effective for Discord WebSocket — disrupts post-handshake stream inspection.
-        // Combined with --drop-sack to prevent DPI SACK-based reassembly.
-        PacketBypassProfile {
-            name: "discord-disoob-dropsack".to_owned(),
-            args: vec!["--split".into(), "1".into(), "--disoob".into(), "1".into(), "--drop-sack".into(), "--auto".into(), "none".into()],
+            name: "disoob-split-1".to_owned(),
+            args: vec!["--split".into(), "1".into(), "--disoob".into(), "1".into(), "--auto".into(), "none".into()],
         },
         PacketBypassProfile {
-            name: "modern-mix-all".to_owned(),
-            args: vec!["--split".into(), "2".into(), "--disorder".into(), "1".into(), "--oob".into(), "1".into(), "--tlsrec".into(), "3+s".into(), "--auto".into(), "none".into()],
-        },
-        PacketBypassProfile {
-            name: "meta-special-oob".to_owned(),
-            args: vec!["--split".into(), "1".into(), "--oob".into(), "1".into(), "--disorder".into(), "3+s".into(), "--auto".into(), "none".into()],
-        },
-        // discord-oob2-tlsrec-dropsack: OOB at position 2 (more effective than 1 for Discord),
-        // TLS record splitting, SACK drop, and UDP fake for voice. Mirrors the config from
-        // byedpi community: --oob 2 --tlsrec 3+s --udp-fake 1 --drop-sack --auto=none
-        PacketBypassProfile {
-            name: "discord-oob2-tlsrec-dropsack".to_owned(),
-            args: vec!["--oob".into(), "2".into(), "--tlsrec".into(), "3+s".into(), "--drop-sack".into(), "--udp-fake".into(), "1".into(), "--auto".into(), "none".into()],
+            name: "disorder-fake-ttl3".to_owned(),
+            args: vec!["--disorder".into(), "1".into(), "--fake".into(), "1".into(), "--ttl".into(), "3".into(), "--auto".into(), "none".into()],
         },
     ];
     for p in &mut profiles {

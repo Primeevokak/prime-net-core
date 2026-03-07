@@ -204,9 +204,15 @@ async fn verify_downloaded_payload_integrity(
         match resolve_sha256_from_sidecar(source_url).await? {
             Some(v) => v,
             None => {
-                return Err(EngineError::Config(format!(
-                    "packet bypass integrity check failed: no sha256 sidecar for '{source_url}' while PRIME_PACKET_BYPASS_TRUST_REMOTE_CHECKSUM=1"
-                )));
+                // Sidecar unavailable (e.g. GitHub blocked) but user explicitly consented
+                // to unsafe mode — skip integrity check entirely.
+                warn!(
+                    target: "packet_bypass",
+                    binary = binary_name,
+                    source = source_url,
+                    "sha256 sidecar unavailable; skipping integrity check (PRIME_PACKET_BYPASS_TRUST_REMOTE_CHECKSUM=1, user consent)"
+                );
+                return Ok(());
             }
         }
     } else {

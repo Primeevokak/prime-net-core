@@ -4,12 +4,13 @@ version = "0.6.3"
 edition = "2021"
 
 [features]
-default = ["hickory-dns", "websocket", "observability"]
+default = ["hickory-dns", "websocket", "observability", "tun"]
 hickory-dns = ["dep:hickory-resolver"]
 websocket = []
 observability = []
 signature-verification = ["dep:gpgme"]
 require-signatures = ["signature-verification"]
+tun = ["dep:tun2", "dep:smoltcp"]
 
 [lib]
 name = "prime_net_engine_core"
@@ -80,6 +81,10 @@ webpki-roots = "0.26.11"
 regex = "1.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 hex = "0.4.3"
+tun2 = { version = "3", optional = true, features = ["async"] }
+smoltcp = { version = "0.11", default-features = false, optional = true, features = [
+    "socket-tcp", "socket-udp", "medium-ip", "proto-ipv4", "proto-ipv6", "std",
+] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

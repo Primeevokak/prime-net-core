@@ -180,8 +180,7 @@ pub async fn handle_socks5_connection(conn_id: u64, mut tcp: TcpStream, peer: So
         };
 
         let mut p = [0u8; 4096];
-        let is_discord = target_str.contains("discord");
-        let wait_ms = if is_discord { 500 } else if target.port == 443 { 2000 } else if has_cached_winner { 500 } else { 1500 };
+        let wait_ms = if target.port == 443 { 2000 } else if has_cached_winner { 500 } else { 1500 };
         
         let icd = match tokio::time::timeout(Duration::from_millis(wait_ms), tcp.read(&mut p)).await {
             Ok(Ok(n)) if n > 0 => Some(p[..n].to_vec()),

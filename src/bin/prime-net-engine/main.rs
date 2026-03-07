@@ -9,6 +9,8 @@ mod preset;
 mod proxy_cmd;
 mod socks_cmd;
 mod test_cmd;
+#[cfg(feature = "tun")]
+mod tun_cmd;
 mod tui_cmd;
 mod update_cmd;
 mod wizard;
@@ -164,6 +166,8 @@ async fn real_main() -> Result<()> {
         Some(Cmd::Blocklist(opts)) => run_blocklist(&opts, &cfg.blocklist).await?,
         Some(Cmd::Update(opts)) => run_update(&opts, &cfg.updater).await?,
         Some(Cmd::Test(opts)) => run_test(cfg, &opts).await?,
+        #[cfg(feature = "tun")]
+        Some(Cmd::Tun(opts)) => crate::tun_cmd::run_tun(cfg, &opts).await?,
         None => {
             print_help();
         }
@@ -197,6 +201,8 @@ enum Cmd {
     Blocklist(BlocklistOpts),
     Update(UpdateOpts),
     Test(TestOpts),
+    #[cfg(feature = "tun")]
+    Tun(crate::tun_cmd::TunOpts),
 }
 
 fn parse_cli(args: &[String]) -> Result<ParsedCli> {
@@ -275,6 +281,8 @@ fn parse_cli(args: &[String]) -> Result<ParsedCli> {
         "blocklist" => Cmd::Blocklist(parse_blocklist(rest)?),
         "update" => Cmd::Update(parse_update(rest)?),
         "test" => Cmd::Test(parse_test(rest)?),
+        #[cfg(feature = "tun")]
+        "tun" => Cmd::Tun(parse_tun(rest)?),
         _ => {
             return Err(EngineError::InvalidInput(format!("unknown command: {cmd}")));
         }
@@ -734,6 +742,7 @@ USAGE:
   prime-net-engine [GLOBAL_OPTS] blocklist <update|status>
   prime-net-engine [GLOBAL_OPTS] update <check|install|rollback> [OPTS]
   prime-net-engine [GLOBAL_OPTS] test [--url <url>] [--check-leaks]
+  prime-net-engine [GLOBAL_OPTS] tun [TUN_OPTS]   (requires --features tun)
 
 GLOBAL_OPTS:
   -v, --version            Print version information
@@ -771,6 +780,58 @@ UPDATE_OPTS:
 
 BLOCKLIST_OPTS:
   update --source <url>    Override blocklist source URL for this run
+
+TUN_OPTS (feature = tun):
+  --tun-name <name>        Interface name (default: prime0)
+  --tun-addr <ip>          TUN interface IP (default: 10.88.0.1)
+  --tun-prefix <n>         CIDR prefix length (default: 16)
+  --socks-addr <host:port> SOCKS5 backend (default: 127.0.0.1:1080)
+  --mtu <n>                MTU (default: 1500)
+  --print-routes           Print routing setup commands and exit
 "#
     );
+}
+
+#[cfg(feature = "tun")]
+fn parse_tun(args: &[String]) -> Result<crate::tun_cmd::TunOpts> {
+    let mut opts = crate::tun_cmd::TunOpts::default();
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--tun-name" => {
+                i += 1;
+                opts.tun_name = arg_value(args, i, "--tun-name")?.to_owned();
+            }
+            "--tun-addr" => {
+                i += 1;
+                opts.tun_addr = arg_value(args, i, "--tun-addr")?
+                    .parse()
+                    .map_err(|_| EngineError::InvalidInput("tun: invalid --tun-addr".to_owned()))?;
+            }
+            "--tun-prefix" => {
+                i += 1;
+                opts.tun_prefix = arg_value(args, i, "--tun-prefix")?
+                    .parse()
+                    .map_err(|_| EngineError::InvalidInput("tun: invalid --tun-prefix".to_owned()))?;
+            }
+            "--socks-addr" => {
+                i += 1;
+                opts.socks_addr = arg_value(args, i, "--socks-addr")?
+                    .parse()
+                    .map_err(|_| EngineError::InvalidInput("tun: invalid --socks-addr".to_owned()))?;
+            }
+            "--mtu" => {
+                i += 1;
+                opts.mtu = arg_value(args, i, "--mtu")?
+                    .parse()
+                    .map_err(|_| EngineError::InvalidInput("tun: invalid --mtu".to_owned()))?;
+            }
+            "--print-routes" => opts.print_routes_only = true,
+            v => {
+                return Err(EngineError::InvalidInput(format!("tun: unknown arg: {v}")));
+            }
+        }
+        i += 1;
+    }
+    Ok(opts)
 }
