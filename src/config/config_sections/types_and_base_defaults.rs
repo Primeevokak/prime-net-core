@@ -265,6 +265,12 @@ pub struct RoutingConfig {
     pub censored_groups: std::collections::HashMap<String, Vec<String>>,
     #[serde(default = "default_ml_routing_enabled")]
     pub ml_routing_enabled: bool,
+    /// Explicit domain → bypass arm overrides that skip ML entirely.
+    /// Keys are domain suffixes (e.g. "discord.com"), values are route IDs
+    /// such as "bypass:4". Subdomains are matched automatically.
+    /// Example: `[routing.domain_profiles] "discord.com" = "bypass:4"`
+    #[serde(default)]
+    pub domain_profiles: std::collections::HashMap<String, String>,
 }
 
 impl Default for RoutingConfig {
@@ -272,6 +278,7 @@ impl Default for RoutingConfig {
         Self {
             censored_groups: default_censored_groups(),
             ml_routing_enabled: true,
+            domain_profiles: std::collections::HashMap::new(),
         }
     }
 }
@@ -477,8 +484,11 @@ impl Default for UpdaterConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum UpdateChannel { #[default] Stable, Beta, Nightly }
 
+/// Crash reporting telemetry. `include_config` has been removed — the engine never sends
+/// the raw config to prevent accidental PT password leakage. Only a SHA-256 hash of the
+/// config is included in crash reports via `CrashReport::config_hash`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct TelemetryConfig { pub crash_reports: bool, pub endpoint: String, pub include_config: bool }
+pub struct TelemetryConfig { pub crash_reports: bool, pub endpoint: String }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransportConfig { pub http3_connect_timeout_ms: u64, pub http3_request_timeout_ms: u64, pub http3_only: bool, pub prefer_http3: bool, pub http3_idle_timeout_ms: u64, pub http3_keep_alive_interval_ms: Option<u64>, pub http3_insecure_skip_verify: bool }
@@ -495,9 +505,12 @@ pub enum EvasionStrategy { Fragment, Desync, Auto }
 
 // Helpers
 fn default_prime_mode() -> bool { true }
-fn default_classifier_cache_path() -> String { 
+fn default_classifier_cache_path() -> String {
     if let Some(dir) = dirs::cache_dir() {
-        return dir.join("prime-net-engine").join("relay-classifier.json").to_string_lossy().to_string();
+        let path = dir.join("prime-net-engine").join("relay-classifier.json");
+        if let Ok(s) = path.into_os_string().into_string() {
+            return s;
+        }
     }
     "relay-classifier.json".to_owned()
 }
@@ -534,7 +547,10 @@ fn default_blocklist_update_interval_hours() -> u64 { 24 }
 fn default_blocklist_source() -> String { "https://raw.githubusercontent.com/prime-net/blocklist/main/blocklist.json".to_owned() }
 fn default_blocklist_cache_path() -> String {
     if let Some(dir) = dirs::cache_dir() {
-        return dir.join("prime-net-engine").join("blocklist.json").to_string_lossy().to_string();
+        let path = dir.join("prime-net-engine").join("blocklist.json");
+        if let Ok(s) = path.into_os_string().into_string() {
+            return s;
+        }
     }
     "blocklist.json".to_owned()
 }

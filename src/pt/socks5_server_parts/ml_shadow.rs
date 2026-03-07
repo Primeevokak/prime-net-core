@@ -40,9 +40,7 @@ const PHASE2_CANARY_SWITCH_WINDOW_SECS: u64 = 30;
 const PHASE2_CANARY_MAX_SWITCHES_PER_WINDOW: u8 = 1;
 #[allow(dead_code)]
 const PHASE2_CANARY_PROFILE_ROTATION_COOLDOWN_SECS: u64 = 45;
-#[allow(dead_code)]
 const SHADOW_DECAY_HALFLIFE_SECS: u64 = 1800;
-#[allow(dead_code)]
 const SHADOW_DECAY_MIN_ELAPSED_SECS: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +90,28 @@ pub fn next_route_decision_id() -> u64 { NEXT_ROUTE_DECISION_ID.fetch_add(1, Ord
 pub fn apply_phase3_ml_override(route_key: &str, candidates: Vec<RouteCandidate>, cfg: &EngineConfig) -> (Vec<RouteCandidate>, ShadowCanaryDecision) {
     if candidates.is_empty() { return (candidates, ShadowCanaryDecision::default()); }
     let host = route_destination_host(route_key);
+
+    // Explicit domain_profiles override: skip ML entirely and force the configured arm.
+    // Keys are matched as exact host or suffix (e.g. "discord.com" matches "gateway.discord.com").
+    if !cfg.routing.domain_profiles.is_empty() {
+        for (domain, forced_arm) in &cfg.routing.domain_profiles {
+            let domain = domain.trim();
+            if host == domain || host.ends_with(&format!(".{domain}")) {
+                let pos = candidates.iter().position(|c: &RouteCandidate| c.route_id() == forced_arm.trim());
+                if let Some(position) = pos {
+                    if position != 0 {
+                        let mut reordered = candidates;
+                        let selected = reordered.remove(position);
+                        reordered.insert(0, selected);
+                        return (reordered, ShadowCanaryDecision { applied: true, route_arm: forced_arm.trim().to_owned(), confidence_milli: 10000, reason: "domain-profile-override" });
+                    }
+                    return (candidates, ShadowCanaryDecision { applied: false, route_arm: forced_arm.trim().to_owned(), confidence_milli: 10000, reason: "domain-profile-override-already-first" });
+                }
+                break;
+            }
+        }
+    }
+
     let bucket = shadow_bucket_name(route_key, &host, cfg);
     let selected_arm = shadow_choose_route_arm(&bucket, route_key, &candidates);
     let pos = candidates.iter().position(|c: &RouteCandidate| c.route_id() == selected_arm);
@@ -177,8 +197,27 @@ fn update_shadow_bandit_sync(bucket: &str, arm: &str, reward: i64, now: u64) {
 fn shadow_effective_stats(bucket: &str, arm: &str, map: &DashMap<String, ShadowBanditArmStats>) -> (u64, i64) {
     let prior = shadow_arm_prior(bucket, arm);
     let key = format!("{bucket}|{arm}");
-    if let Some(stats) = map.get(&key) { (prior.pseudo_pulls + stats.pulls, prior.pseudo_reward_sum + stats.reward_sum) }
-    else { (prior.pseudo_pulls, prior.pseudo_reward_sum) }
+    if let Some(stats) = map.get(&key) {
+        // Apply exponential time-decay so stale observations lose weight over time.
+        // If an ISP updates its DPI, the bandit adapts faster instead of waiting for
+        // enough failures to overcome a large accumulated reward_sum.
+        let decay = if stats.last_seen_unix > 0 {
+            let elapsed = now_unix_secs().saturating_sub(stats.last_seen_unix);
+            if elapsed >= SHADOW_DECAY_MIN_ELAPSED_SECS {
+                let factor = 2.0_f64.powf(-(elapsed as f64 / SHADOW_DECAY_HALFLIFE_SECS as f64));
+                factor.clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+        } else {
+            1.0
+        };
+        let effective_pulls = (stats.pulls as f64 * decay).round() as u64;
+        let effective_reward = (stats.reward_sum as f64 * decay).round() as i64;
+        (prior.pseudo_pulls + effective_pulls, prior.pseudo_reward_sum + effective_reward)
+    } else {
+        (prior.pseudo_pulls, prior.pseudo_reward_sum)
+    }
 }
 
 fn shadow_arm_prior(bucket: &str, arm: &str) -> ShadowArmPrior {

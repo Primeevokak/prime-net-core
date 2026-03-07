@@ -131,11 +131,24 @@ async fn handle_client_to_remote(
             if data.len() < 5 + len + 2 { return Ok(None); }
             let domain = String::from_utf8_lossy(&data[5..5 + len]);
             let port = u16::from_be_bytes([data[5 + len], data[5 + len + 1]]);
-            
+
             if port == 443 {
                 let key = route_destination_key(&domain);
                 if key == "googlevideo.com" || key == "ytimg.com" || domain.contains("google") || domain.contains("youtube") {
                     debug!(conn_id, "blocking QUIC to domain {} for fallback", domain);
+                    return Ok(None);
+                }
+                // Force Discord onto TCP so DPI-bypass profiles can handle it.
+                // Discord QUIC (UDP 443) bypasses the ciadpi pool entirely and
+                // goes unprotected; dropping it here makes the client fall back
+                // to HTTP/2 over TCP, which is routed through bypass profiles.
+                if domain.contains("discord.com")
+                    || domain.contains("discordapp.com")
+                    || domain.contains("discordapp.net")
+                    || domain.contains("discord.gg")
+                    || domain.contains("discord.media")
+                {
+                    debug!(conn_id, "blocking QUIC to Discord domain {} for TCP bypass fallback", domain);
                     return Ok(None);
                 }
             }

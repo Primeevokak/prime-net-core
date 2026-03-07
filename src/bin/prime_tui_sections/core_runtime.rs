@@ -122,7 +122,7 @@ fn open_url_in_browser(url: &str) -> Result<()> {
     ))
 }
 
-fn activate_core(app: &mut App) -> Result<()> {
+fn activate_core(app: &mut App, allow_unverified_packet_bypass: bool) -> Result<()> {
     let endpoint = app.config_editor.config.system_proxy.socks_endpoint.clone();
     let socks_check = ProxyDiagnostics::check_socks5_listening(&endpoint);
     if matches!(socks_check.level, DiagnosticLevel::Ok) {
@@ -154,6 +154,13 @@ fn activate_core(app: &mut App) -> Result<()> {
         "prime-net-engine"
     });
 
+    if !bin.exists() {
+        return Err(EngineError::Internal(format!(
+            "ядро не найдено ({}): убедитесь, что оба бинарника скомпилированы вместе (cargo build --workspace)",
+            bin.display()
+        )));
+    }
+
     let mut command = Command::new(&bin);
     command
         .arg("--config")
@@ -168,6 +175,9 @@ fn activate_core(app: &mut App) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    if allow_unverified_packet_bypass {
+        command.env("PRIME_PACKET_BYPASS_TRUST_REMOTE_CHECKSUM", "1");
+    }
     let child = command.spawn().map_err(|e| {
         EngineError::Internal(format!(
             "не удалось запустить ядро ({}) : {e}",
@@ -203,11 +213,7 @@ fn restart_core_for_packet_bypass_prompt(app: &mut App, allow_unverified: bool) 
     if app.core_process.is_some() {
         deactivate_core(app)?;
     }
-    if allow_unverified {
-        app.status_line =
-            "Небезопасный запуск packet bypass отклонен: включен строгий trust mode".to_owned();
-    }
-    activate_core(app)
+    activate_core(app, allow_unverified)
 }
 
 fn poll_core_startup(app: &mut App) -> Result<()> {

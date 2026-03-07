@@ -266,7 +266,46 @@ impl EngineConfig {
                         ));
                     }
                 }
-                _ => {}
+                PluggableTransportKind::Obfs4 => {
+                    let o = pt.obfs4.as_ref().ok_or_else(|| {
+                        EngineError::Config("pt.kind=obfs4 requires [pt].obfs4".to_owned())
+                    })?;
+                    if o.server.trim().is_empty() {
+                        return Err(EngineError::Config(
+                            "pt.obfs4.server must not be empty".to_owned(),
+                        ));
+                    }
+                    if o.cert.trim().is_empty() {
+                        return Err(EngineError::Config(
+                            "pt.obfs4.cert must not be empty (required for obfs4 handshake)".to_owned(),
+                        ));
+                    }
+                    if o.tor_bin.trim().is_empty() {
+                        return Err(EngineError::Config(
+                            "pt.obfs4.tor_bin must not be empty".to_owned(),
+                        ));
+                    }
+                    if o.obfs4proxy_bin.trim().is_empty() {
+                        return Err(EngineError::Config(
+                            "pt.obfs4.obfs4proxy_bin must not be empty".to_owned(),
+                        ));
+                    }
+                }
+                PluggableTransportKind::Snowflake => {
+                    let s = pt.snowflake.as_ref().ok_or_else(|| {
+                        EngineError::Config("pt.kind=snowflake requires [pt].snowflake".to_owned())
+                    })?;
+                    if s.tor_bin.trim().is_empty() {
+                        return Err(EngineError::Config(
+                            "pt.snowflake.tor_bin must not be empty".to_owned(),
+                        ));
+                    }
+                    if s.snowflake_bin.trim().is_empty() {
+                        return Err(EngineError::Config(
+                            "pt.snowflake.snowflake_bin must not be empty".to_owned(),
+                        ));
+                    }
+                }
             }
         }
         if let Some(v) = self.evasion.tls_record_max_fragment_size {
@@ -322,10 +361,55 @@ impl EngineConfig {
                 "system_proxy.pac_port must be in 1..=65535".to_owned(),
             ));
         }
+        {
+            let ep = self.system_proxy.socks_endpoint.trim();
+            if ep.is_empty() {
+                return Err(EngineError::Config(
+                    "system_proxy.socks_endpoint must not be empty".to_owned(),
+                ));
+            }
+            if ep.parse::<std::net::SocketAddr>().is_err() {
+                return Err(EngineError::Config(format!(
+                    "system_proxy.socks_endpoint is not a valid socket address: {ep}"
+                )));
+            }
+        }
         if self.updater.check_interval_hours == 0 {
             return Err(EngineError::Config(
                 "updater.check_interval_hours must be > 0".to_owned(),
             ));
+        }
+        {
+            let repo = self.updater.repo.trim();
+            if !repo.is_empty() {
+                let parts: Vec<&str> = repo.splitn(2, '/').collect();
+                let valid = parts.len() == 2
+                    && !parts[0].is_empty()
+                    && !parts[1].is_empty()
+                    && parts[1] != "/";
+                if !valid {
+                    return Err(EngineError::Config(format!(
+                        "updater.repo must be in 'owner/repo' format, got: {repo}"
+                    )));
+                }
+            }
+        }
+        for (domain, arm) in &self.routing.domain_profiles {
+            if domain.trim().is_empty() {
+                return Err(EngineError::Config(
+                    "routing.domain_profiles contains an empty domain key".to_owned(),
+                ));
+            }
+            if arm.trim().is_empty() {
+                return Err(EngineError::Config(format!(
+                    "routing.domain_profiles[{domain}]: route arm must not be empty"
+                )));
+            }
+            if arm != "direct" && !arm.starts_with("bypass:") {
+                return Err(EngineError::Config(format!(
+                    "routing.domain_profiles[{domain}]: invalid route arm '{arm}'; must be 'direct' or 'bypass:N'"
+                )));
+            }
         }
         Ok(())
     }

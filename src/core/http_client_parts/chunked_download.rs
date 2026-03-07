@@ -80,7 +80,11 @@ impl PrimeHttpClient {
         use tokio::io::AsyncWriteExt;
 
         let mut resumed = false;
-        let parts_dir: PathBuf = PathBuf::from(format!("{}.prime.parts", path.to_string_lossy()));
+        let parts_dir: PathBuf = {
+            let mut s = path.as_os_str().to_owned();
+            s.push(".prime.parts");
+            PathBuf::from(s)
+        };
         let parts_dir_preexists = parts_dir.exists();
         std::fs::create_dir_all(&parts_dir)?;
         let manifest_path = parts_dir.join("resume.key");
@@ -202,7 +206,11 @@ impl PrimeHttpClient {
         }
 
         // Merge parts sequentially into a temp file, then rename into place.
-        let tmp_path: PathBuf = PathBuf::from(format!("{}.prime.tmp", path.to_string_lossy()));
+        let tmp_path: PathBuf = {
+            let mut s = path.as_os_str().to_owned();
+            s.push(".prime.tmp");
+            PathBuf::from(s)
+        };
         let mut out = tokio::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -451,7 +459,11 @@ impl PrimeHttpClient {
         }
 
         let expected_hex = if spec.eq_ignore_ascii_case("auto") {
-            let sha_path = PathBuf::from(format!("{}.sha256", path.to_string_lossy()));
+            let sha_path: PathBuf = {
+            let mut s = path.as_os_str().to_owned();
+            s.push(".sha256");
+            PathBuf::from(s)
+        };
             let content = tokio::fs::read_to_string(&sha_path).await.map_err(|e| {
                 EngineError::Internal(format!(
                     "download integrity failed: unable to read sha256 file '{}': {e}",

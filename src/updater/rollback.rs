@@ -94,6 +94,19 @@ impl RollbackManager {
         #[cfg(windows)]
         {
             let dest_backup = dest.with_extension("old");
+
+            // Remove any stale .old left by a previous failed update before we move the
+            // current binary there. Without this, fs::rename would fail on Windows if the
+            // file already exists.
+            if dest_backup.exists() {
+                fs::remove_file(&dest_backup).map_err(|e| {
+                    EngineError::Internal(format!(
+                        "failed to remove stale binary backup ({}): {e}",
+                        dest_backup.display()
+                    ))
+                })?;
+            }
+
             fs::rename(dest, &dest_backup).map_err(|e| EngineError::Internal(format!("failed to move current binary to backup: {e}")))?;
             match fs::copy(source, dest) {
                 Ok(_) => {
@@ -101,13 +114,21 @@ impl RollbackManager {
                         tracing::warn!(error = %e, path = %dest_backup.display(), "failed to remove old binary backup (non-critical)");
                     }
                 }
-                Err(e) => {
-                    fs::rename(&dest_backup, dest).map_err(|e2| {
-                        EngineError::Internal(format!(
-                            "CRITICAL: update failed and recovery failed too. Original: {e}, Recovery: {e2}"
-                        ))
-                    })?;
-                    return Err(e.into());
+                Err(copy_err) => {
+                    // Recovery: restore the old binary only if the backup still exists.
+                    // It may have been removed by antivirus or a concurrent process.
+                    if dest_backup.exists() {
+                        fs::rename(&dest_backup, dest).map_err(|e2| {
+                            EngineError::Internal(format!(
+                                "CRITICAL: update failed and recovery failed too. Original: {copy_err}, Recovery: {e2}"
+                            ))
+                        })?;
+                    } else {
+                        return Err(EngineError::Internal(format!(
+                            "CRITICAL: update failed and backup is missing — binary may be gone. Original error: {copy_err}"
+                        )));
+                    }
+                    return Err(copy_err.into());
                 }
             }
         }

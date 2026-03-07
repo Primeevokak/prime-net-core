@@ -352,9 +352,13 @@ async fn connect_transport(
                     SocketAddr::new(ip, port)
                 }
             };
-            tokio::net::TcpStream::connect(addr)
-                .await
-                .map_err(|e| EngineError::Internal(format!("tcp connect failed: {e}")))?
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::net::TcpStream::connect(addr),
+            )
+            .await
+            .map_err(|_| EngineError::Internal("tcp connect timed out after 10s".to_owned()))?
+            .map_err(|e| EngineError::Internal(format!("tcp connect failed: {e}")))?
         }
     } else {
         let addr: SocketAddr = match host.parse::<IpAddr>() {
@@ -367,9 +371,13 @@ async fn connect_transport(
                 SocketAddr::new(ip, port)
             }
         };
-        tokio::net::TcpStream::connect(addr)
-            .await
-            .map_err(|e| EngineError::Internal(format!("tcp connect failed: {e}")))?
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        .map_err(|_| EngineError::Internal("tcp connect timed out after 10s".to_owned()))?
+        .map_err(|e| EngineError::Internal(format!("tcp connect failed: {e}")))?
     };
 
     tcp.set_nodelay(true).ok();

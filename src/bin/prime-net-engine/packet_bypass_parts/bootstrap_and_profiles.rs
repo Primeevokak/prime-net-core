@@ -189,10 +189,22 @@ fn packet_bypass_enabled(enabled_by_config: bool) -> bool {
 
 fn resolve_packet_profiles() -> Vec<PacketBypassProfile> {
     if let Ok(v) = std::env::var("PRIME_PACKET_BYPASS_ARGS") {
-        if !v.trim().is_empty() {
-            let parsed = parse_env_packet_profiles(&v);
-            if !parsed.is_empty() {
-                return parsed;
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            // A leading '+' means "append to defaults" rather than replace them.
+            // e.g. PRIME_PACKET_BYPASS_ARGS="+--disorder 1 --drop-sack"
+            if let Some(extra_raw) = trimmed.strip_prefix('+') {
+                let extra = parse_env_packet_profiles(extra_raw);
+                if !extra.is_empty() {
+                    let mut profiles = default_bypass_profiles();
+                    profiles.extend(extra);
+                    return profiles;
+                }
+            } else {
+                let parsed = parse_env_packet_profiles(trimmed);
+                if !parsed.is_empty() {
+                    return parsed;
+                }
             }
         }
     }
@@ -261,17 +273,22 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
             name: "split-2-oob-disorder".to_owned(),
             args: vec!["--split".into(), "2".into(), "--oob".into(), "1".into(), "--disorder".into(), "1".into(), "--auto".into(), "none".into()],
         },
+        // discord-disorder-dropsack: --drop-sack prevents ISP from using TCP SACK to
+        // reassemble disordered segments and inspect the WebSocket Upgrade request.
+        // Confirmed working for Discord in RU community research (byedpi discussion #179).
         PacketBypassProfile {
-            name: "deep-split-40".to_owned(),
-            args: vec!["--split".into(), "40".into(), "--disorder".into(), "1".into(), "--auto".into(), "none".into()],
+            name: "discord-disorder-dropsack".to_owned(),
+            args: vec!["--disorder".into(), "1".into(), "--drop-sack".into(), "--auto".into(), "none".into()],
         },
         PacketBypassProfile {
             name: "tlsrec-5-fake-ttl".to_owned(),
             args: vec!["--tlsrec".into(), "5+s".into(), "--fake".into(), "1".into(), "--ttl".into(), "5".into(), "--auto".into(), "none".into()],
         },
+        // disorder-shuffle-3 + drop-sack + udp-fake: covers Discord voice (UDP fake)
+        // and WebSocket (drop-sack prevents SACK-based DPI reassembly).
         PacketBypassProfile {
             name: "disorder-shuffle-3".to_owned(),
-            args: vec!["--disorder".into(), "3".into(), "--auto".into(), "none".into(), "--udp-fake".into(), "1".into()],
+            args: vec!["--disorder".into(), "3".into(), "--drop-sack".into(), "--auto".into(), "none".into(), "--udp-fake".into(), "1".into()],
         },
         PacketBypassProfile {
             name: "oob-1-deep-split-60".to_owned(),
@@ -281,9 +298,12 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
             name: "tlsrec-1-disorder-shuffle".to_owned(),
             args: vec!["--tlsrec".into(), "1+s".into(), "--disorder".into(), "3+s".into(), "--auto".into(), "none".into()],
         },
+        // discord-disoob-dropsack: disordered out-of-band data (--disoob) is specifically
+        // effective for Discord WebSocket — disrupts post-handshake stream inspection.
+        // Combined with --drop-sack to prevent DPI SACK-based reassembly.
         PacketBypassProfile {
-            name: "split-1-fake-1".to_owned(),
-            args: vec!["--split".into(), "1".into(), "--fake".into(), "1".into(), "--auto".into(), "none".into()],
+            name: "discord-disoob-dropsack".to_owned(),
+            args: vec!["--split".into(), "1".into(), "--disoob".into(), "1".into(), "--drop-sack".into(), "--auto".into(), "none".into()],
         },
         PacketBypassProfile {
             name: "modern-mix-all".to_owned(),
@@ -293,9 +313,12 @@ fn default_bypass_profiles() -> Vec<PacketBypassProfile> {
             name: "meta-special-oob".to_owned(),
             args: vec!["--split".into(), "1".into(), "--oob".into(), "1".into(), "--disorder".into(), "3+s".into(), "--auto".into(), "none".into()],
         },
+        // discord-oob2-tlsrec-dropsack: OOB at position 2 (more effective than 1 for Discord),
+        // TLS record splitting, SACK drop, and UDP fake for voice. Mirrors the config from
+        // byedpi community: --oob 2 --tlsrec 3+s --udp-fake 1 --drop-sack --auto=none
         PacketBypassProfile {
-            name: "ttl-hop-desync".to_owned(),
-            args: vec!["--split".into(), "2".into(), "--fake".into(), "1".into(), "--ttl".into(), "8".into(), "--auto".into(), "none".into()],
+            name: "discord-oob2-tlsrec-dropsack".to_owned(),
+            args: vec!["--oob".into(), "2".into(), "--tlsrec".into(), "3+s".into(), "--drop-sack".into(), "--udp-fake".into(), "1".into(), "--auto".into(), "none".into()],
         },
     ];
     for p in &mut profiles {

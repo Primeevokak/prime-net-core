@@ -322,6 +322,18 @@ async fn run_app(
 ) -> Result<()> {
     loop {
         poll_core_startup(app)?;
+        // If the core started successfully (no pending startup) but exited later without TUI
+        // knowing, detect that here so compose_status_line shows the correct "ВЫКЛ" state.
+        if app.core_start_pending.is_none() {
+            if let Some(child) = app.core_process.as_mut() {
+                if let Ok(Some(_)) = child.try_wait() {
+                    app.core_process = None;
+                    app.core_event_rx = None;
+                    app.proxy_managed_by_tui = false;
+                    app.status_line = "Ядро завершилось неожиданно".to_owned();
+                }
+            }
+        }
         drain_core_events(app);
         app.conn_monitor.tick();
         if app.log_auto_scroll {
@@ -337,7 +349,7 @@ async fn run_app(
         if event::poll(Duration::from_millis(50)).map_err(EngineError::Io)? {
             match event::read().map_err(EngineError::Io)? {
                 Event::Key(key) => {
-                    if key.kind != KeyEventKind::Press {
+                    if key.kind == KeyEventKind::Release {
                         continue;
                     }
                     match handle_key(app, key).await {
@@ -723,9 +735,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                 } else {
                     app.packet_bypass_unsafe_confirm_prompt = None;
                     app.packet_bypass_bootstrap_prompt = None;
-                    restart_core_for_packet_bypass_prompt(app, false)?;
+                    restart_core_for_packet_bypass_prompt(app, true)?;
                     app.status_line =
-                        "Небезопасный режим отключен: выполнен обычный безопасный запуск"
+                        "Запуск в небезопасном режиме: проверка целостности отключена"
                             .to_owned();
                 }
             }
@@ -741,8 +753,15 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                 app.status_line = "Повтор безопасного запуска packet bypass".to_owned();
             }
             KeyCode::Char('u') | KeyCode::Char('U') => {
-                app.status_line = "Небезопасный запуск отключен: работает строгий trust mode"
-                    .to_owned();
+                let source_url = app.packet_bypass_bootstrap_prompt
+                    .as_ref()
+                    .and_then(|p| p.source_url.clone());
+                app.packet_bypass_bootstrap_prompt = None;
+                app.packet_bypass_unsafe_confirm_prompt = Some(PacketBypassUnsafeConfirmPrompt {
+                    source_url,
+                    started_at: Instant::now(),
+                });
+                app.status_line = "Подтвердите запуск без проверки целостности".to_owned();
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 app.packet_bypass_bootstrap_prompt = None;
@@ -928,7 +947,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                 app.status_line = "Подтвердите очистку кэша relay-классификатора".to_owned();
             }
             KeyCode::Char('a') => {
-                activate_core(app)?;
+                activate_core(app, false)?;
             }
             KeyCode::Char('x') => {
                 deactivate_core(app)?;
@@ -946,6 +965,25 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
 }
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if app.tab == Tab::Logs {
+                app.log_viewer.scroll_up();
+                app.log_selected_line = app.log_viewer.selected_line();
+                app.log_auto_scroll = app.log_viewer.auto_scroll();
+            }
+            return;
+        }
+        MouseEventKind::ScrollDown => {
+            if app.tab == Tab::Logs {
+                app.log_viewer.scroll_down();
+                app.log_selected_line = app.log_viewer.selected_line();
+                app.log_auto_scroll = app.log_viewer.auto_scroll();
+            }
+            return;
+        }
+        _ => {}
+    }
     if !matches!(
         mouse.kind,
         MouseEventKind::Down(crossterm::event::MouseButton::Left)

@@ -169,23 +169,25 @@ fn end_request_op(ptr: *mut PrimeRequestHandle) -> bool {
 }
 
 fn try_hydrate_abort_handle(inner: &PrimeRequestHandleInner) {
-    if inner.abort.lock().is_some() {
+    // Lock abort_rx first (consistent ordering: abort_rx → abort throughout the module).
+    // Invariant: abort_rx is Some iff abort is None; once abort is populated, abort_rx is cleared.
+    // So if abort_rx is None there is nothing to do — abort is already populated.
+    let mut rx_slot = inner.abort_rx.lock();
+    if rx_slot.is_none() {
         return;
     }
-    let mut rx_slot = inner.abort_rx.lock();
-    let Some(rx) = rx_slot.as_ref() else {
-        return;
-    };
-    match rx.try_recv() {
-        Ok(abort) => {
-            *inner.abort.lock() = Some(abort);
-            *rx_slot = None;
-        }
+    let abort_handle = match rx_slot.as_ref().unwrap().try_recv() {
+        Ok(handle) => handle,
         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
             *rx_slot = None;
+            return;
         }
-        Err(std::sync::mpsc::TryRecvError::Empty) => {}
-    }
+        Err(std::sync::mpsc::TryRecvError::Empty) => return,
+    };
+    // Received the handle: store it and clear the receiver slot.
+    // Acquire abort lock while still holding rx_slot (abort_rx → abort order).
+    *inner.abort.lock() = Some(abort_handle);
+    *rx_slot = None;
 }
 
 fn mark_request_freed(ptr: *mut PrimeRequestHandle) {
@@ -508,17 +510,19 @@ pub unsafe extern "C" fn prime_request_wait(
                     pack_ok(response)
                 }
                 Ok(Err(err)) => {
-                    let mut code = error_code_from(&err);
-                    if err.to_string() == "timeout" {
-                        code = PRIME_ERR_RUNTIME;
-                        pack_error(code, "timeout")
-                    } else {
+                    // The task completed with an error, or was cancelled (cancel() sends
+                    // Err("cancelled") into the channel to wake a waiting caller).
+                    // Only transition to FAILED if the request was not already cancelled;
+                    // never overwrite CANCELLED with FAILED.
+                    let already_cancelled = inner.status.load(Ordering::SeqCst)
+                        == PrimeRequestStatus::CANCELLED as u8;
+                    if !already_cancelled {
                         inner
                             .status
                             .store(PrimeRequestStatus::FAILED as u8, Ordering::SeqCst);
-                        mark_request_freed(handle);
-                        pack_error(code, &err.to_string())
                     }
+                    mark_request_freed(handle);
+                    pack_error(error_code_from(&err), &err.to_string())
                 }
                 Err(EngineError::Internal(msg)) if msg == "timeout" => {
                     pack_error(PRIME_ERR_RUNTIME, "timeout")
