@@ -2850,7 +2850,7 @@ dependencies = [
 
 [[package]]
 name = "prime-net-engine"
-version = "0.6.3"
+version = "0.6.5"
 dependencies = [
  "arboard",
  "assert_cmd",

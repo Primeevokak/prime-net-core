@@ -57,7 +57,7 @@ pub async fn connect_via_best_route(
     let mut winners: JoinSet<Result<(RouteCandidate, BoxStream, Vec<u8>, bool)>> = JoinSet::new();
     let cand_count = candidates.len();
     let cfg_arc = Arc::new(cfg.clone());
-    
+
     for (idx, cand) in candidates.into_iter().enumerate() {
         let c = cand.clone();
         let t = target.clone();
@@ -66,15 +66,15 @@ pub async fn connect_via_best_route(
         let ro = relay_opts.clone();
         let config = cfg_arc.clone(); // CORRECT: Clone Arc, don't move cfg
         let icd = initial_client_data.clone();
-        
+
         winners.spawn(async move {
             let delay = (idx as u64) * 100;
             if delay > 0 { tokio::time::sleep(Duration::from_millis(delay)).await; }
-            
+
             let mut stream = connect_route_candidate(conn_id, &t, &tl, &c, out, &ro, config.clone()).await?;
             let mut initial_u2c = Vec::new();
             let mut sent = false;
-            
+
             if let Some(ref data) = icd {
                 // IMPORTANT: Only fragment internally for DIRECT connections.
                 // For Bypass, let the external proxy (ByeDPI) handle it.
@@ -82,11 +82,11 @@ pub async fn connect_via_best_route(
                     let _ = fragment_and_send_tls_hello(data, &mut stream, &ro).await
                         .map_err(|e| EngineError::Io(e))?;
                 } else {
-                    stream.write_all(data).await?; 
-                    stream.flush().await?; 
+                    stream.write_all(data).await?;
+                    stream.flush().await?;
                 }
                 sent = true;
-                
+
                 let mut buf = [0u8; 4096];
                 // Wait for the TLS record header or some response data.
                 // Increase timeout to 3s for slower bypass routes like Discord
@@ -102,7 +102,7 @@ pub async fn connect_via_best_route(
                             return Err(EngineError::Internal("DPI block page detected".to_owned()));
                         }
                         initial_u2c.extend_from_slice(&buf[..n]);
-                        
+
                         // TRY TO READ MORE: Strict Meta servers might send Server Hello in multiple segments.
                         // Capture as much as possible in 50ms to avoid breaking the flight.
                         let mut extra = [0u8; 4096];
@@ -113,7 +113,7 @@ pub async fn connect_via_best_route(
                         }
                     }
                 }
-                
+
                 if initial_u2c.is_empty() && (t.port == 443 || t.port == 80) {
                     return Err(EngineError::Internal("no response from candidate".to_owned()));
                 }
@@ -135,14 +135,14 @@ pub async fn connect_via_best_route(
 
     if let Some((cand, stream, u2c, sent)) = final_res {
         reap_route_race_losers_v3(winners, conn_id, target_label.to_owned());
-        return Ok(ConnectedRoute { 
-            stream, 
-            candidate: cand, 
-            route_key: target_label.to_owned(), 
-            decision_id: 0, 
-            initial_client_data: initial_client_data.unwrap_or_default(), 
-            initial_upstream_data: u2c, 
-            client_data_sent: sent 
+        return Ok(ConnectedRoute {
+            stream,
+            candidate: cand,
+            route_key: target_label.to_owned(),
+            decision_id: 0,
+            initial_client_data: initial_client_data.unwrap_or_default(),
+            initial_upstream_data: u2c,
+            client_data_sent: sent
         });
     }
     Err(EngineError::Internal("race failed: no working route found".to_owned()))
@@ -160,7 +160,7 @@ pub async fn handle_socks5_connection(conn_id: u64, mut tcp: TcpStream, peer: So
         tcp.write_all(&[0x05, 0x00]).await?;
         let mut req = [0u8; 4];
         tcp.read_exact(&mut req).await?;
-        
+
         let target = read_socks5_target_endpoint_with_atyp(&mut tcp, req[3]).await?;
         if req[1] == 0x03 {
             let resolver = outbound
@@ -181,7 +181,7 @@ pub async fn handle_socks5_connection(conn_id: u64, mut tcp: TcpStream, peer: So
 
         let mut p = [0u8; 4096];
         let wait_ms = if target.port == 443 { 2000 } else if has_cached_winner { 500 } else { 1500 };
-        
+
         let icd = match tokio::time::timeout(Duration::from_millis(wait_ms), tcp.read(&mut p)).await {
             Ok(Ok(n)) if n > 0 => Some(p[..n].to_vec()),
             _ => None,
@@ -202,9 +202,9 @@ pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream,
     let target_label = target.to_string();
     let tuned = tune_relay_for_target(relay_opts, target.port, &target_label, false, false);
     let relay_opts = tuned.options;
-    
+
     let route_key = route_destination_key(&target_label);
-    
+
     let cached_winner = {
         let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
         map.get(route_key).map(|w| w.clone())
@@ -217,14 +217,14 @@ pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream,
             if !cands.is_empty() { cands } else { select_route_candidates(&relay_opts, &target.addr, target.port, &target_label, &cfg) }
         } else { select_route_candidates(&relay_opts, &target.addr, target.port, &target_label, &cfg) }
     } else { select_route_candidates(&relay_opts, &target.addr, target.port, &target_label, &cfg) };
-    
+
     let route_res = connect_via_best_route(conn_id, target, &target_label, candidates, outbound, &relay_opts, &cfg, icd).await;
-    
+
     match route_res {
         Ok(route) => {
             let label = route.candidate.route_label();
             info!(conn_id, target = %target_label, route = %label, "connection established");
-            
+
             {
                 let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
                 map.insert(route_key.to_owned(), RouteWinner {
@@ -232,13 +232,13 @@ pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream,
                     updated_at_unix: now_unix_secs(),
                 });
             }
-            
+
             // Record success for the classifier
             classifier_and_persistence::record_destination_success(route_key, tuned.stage, tuned.source, &cfg);
 
             let mut upstream = route.stream;
             let start_time = Instant::now();
-            
+
             // CRITICAL: If the route is via Bypass (ByeDPI), disable internal fragmentation
             // to avoid "double-evasion" which causes Facebook to reset connections.
             let mut final_opts = relay_opts;
@@ -247,7 +247,7 @@ pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream,
             }
 
             let relay_res = relay_bidirectional(&mut tcp, &mut upstream, final_opts, route.initial_client_data, route.initial_upstream_data, route.client_data_sent).await;
-            
+
             match relay_res {
                 Ok((c2u, u2c)) => {
                     info!(conn_id, tx = c2u, rx = u2c, "session finished normally");
@@ -257,11 +257,11 @@ pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream,
                 Err(e) => {
                     let signal = classify_io_error(&e);
                     complete_route_outcome_event(conn_id, route_key, Some(&route.candidate), false, false, 0, start_time.elapsed().as_millis() as u64, &format!("{:?}", signal), &cfg);
-                    
+
                     // Record failure for the classifier if it's a strong blocking signal
                     if signal == BlockingSignal::Reset || signal == BlockingSignal::Timeout {
                         classifier_and_persistence::record_destination_failure(route_key, signal, 0, tuned.stage, &cfg);
-                        
+
                         debug!(conn_id, error = %e, signal = ?signal, "upstream failure, invalidating cache for {}", route_key);
                         let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
                         map.remove(route_key);

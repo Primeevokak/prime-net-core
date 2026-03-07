@@ -307,7 +307,7 @@ impl AutoUpdater {
             EngineError::Internal(format!("failed to write update data to temporary file: {e}"))
         })?;
 
-        let (_file, path) = temp_file.keep().map_err(|e| {
+        let (file, path) = temp_file.keep().map_err(|e| {
             EngineError::Internal(format!("failed to persist temporary update file: {e}"))
         })?;
 
