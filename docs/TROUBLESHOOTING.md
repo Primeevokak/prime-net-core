@@ -1,4 +1,4 @@
-﻿# TROUBLESHOOTING
+# TROUBLESHOOTING
 
 ## 1. `SOCKS5 connection refused`
 
@@ -46,8 +46,15 @@ prime-net-engine --config prime-net-engine.toml --config-check --offline
 Проверьте:
 
 - включение `evasion.packet_bypass_enabled` и отсутствие `PRIME_PACKET_BYPASS=0`;
+- наличие бинаря движка рядом (packet bypass требует `prime-net-engine` в той же директории);
 - доступность pinned release asset;
 - корректность digest-переменных (`PRIME_PACKET_BYPASS_PAYLOAD_SHA256` / `PRIME_PACKET_BYPASS_BINARY_SHA256`).
+
+При ненадёжной сети для загрузки byedpi можно разрешить remote checksum:
+
+```bash
+PRIME_PACKET_BYPASS_TRUST_REMOTE_CHECKSUM=1 prime-net-engine ...
+```
 
 ## 6. PT (`obfs4`/`snowflake`) не стартует
 
@@ -57,7 +64,29 @@ prime-net-engine --config prime-net-engine.toml --config-check --offline
 - `obfs4proxy` (для obfs4)
 - `snowflake-client` (для snowflake)
 
-## 7. Низкая скорость / нестабильный throughput
+Убедитесь, что пути к бинарям указаны в `[pt.obfs4]` / `[pt.snowflake]` секциях конфига.
+
+## 7. Discord / мессенджеры не работают
+
+Discord использует **QUIC (UDP)** и часто блокируется через RST-инъекцию после TCP-рукопожатия.
+
+Шаги диагностики:
+
+1. Убедитесь, что движок запущен и принимает трафик (проверьте `proxy status`).
+2. Дайте ML-маршрутизатору 2–3 минуты: он пробует разные bypass-профили и запоминает рабочие.
+3. Если Discord зависает в браузере — проверьте, что QUIC отключён в настройках браузера (`chrome://flags/#enable-quic` → Disabled). Движок делает это автоматически для Electron-клиента через SOCKS5 UDP ASSOCIATE.
+4. Явно задайте Discord маршрут через `routing.domain_profiles`:
+
+```toml
+[routing.domain_profiles]
+"discord.com" = "bypass:1"
+"discordapp.com" = "bypass:1"
+"discord.media" = "bypass:1"
+```
+
+5. Запустите движок с `--log-level debug` и ищите в логах строки с `discord` — там будет видно, какой профиль выбирается.
+
+## 8. Низкая скорость / нестабильный throughput
 
 Проверьте:
 
@@ -66,7 +95,24 @@ prime-net-engine --config prime-net-engine.toml --config-check --offline
 - `download.*` таймауты/конкурентность;
 - влияние `traffic_shaping_enabled`.
 
-## 8. CI падает на `tempfile`/`fmt`
+Для максимальной скорости попробуйте пресет `max-compatibility` — он отключает агрессивные техники:
+
+```bash
+prime-net-engine --preset max-compatibility --config prime-net-engine.toml socks
+```
+
+## 9. Сайты не открываются, хотя раньше работали
+
+ML-маршрутизатор накапливает историю. Если ISP изменил политику блокировок, старые «победители» могут стать нерабочими.
+
+Статистика обновится автоматически (экспоненциальное затухание, halflife 30 минут). Для немедленного сброса:
+
+```bash
+# Удалить файл статистики (путь из evasion.classifier_cache_path):
+rm ~/.cache/prime-net-engine/relay-classifier.json
+```
+
+## 10. CI падает на `tempfile`/`fmt`
 
 Если ошибка вида `use of unresolved crate tempfile`:
 
@@ -76,10 +122,10 @@ prime-net-engine --config prime-net-engine.toml --config-check --offline
 
 - выполните локально `cargo fmt --all` и перезапустите checks.
 
-## 9. Что прикладывать к баг-репорту
+## 11. Что прикладывать к баг-репорту
 
 - ОС и архитектуру;
 - команду запуска;
-- редактированный конфиг (без секретов);
+- редактированный конфиг (без секретов — убрать пароли, cert, сервера PT);
 - логи с `--log-level debug --log-format json`;
 - при необходимости: browser/network консоль и таймштампы.

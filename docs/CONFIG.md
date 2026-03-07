@@ -219,11 +219,26 @@
 - `repo = "your-username/prime-net-engine"`
 - `channel = "stable"`
 
+### `[routing]`
+
+- `censored_groups = {}` — группы доменов, которые всегда идут через bypass. Ключ: название группы, значение: список доменов.
+- `domain_profiles = {}` — явное закрепление домена за маршрутом. Ключ: домен, значение: `"direct"` или `"bypass:<N>"` (например `"bypass:1"`). Переопределяет ML-выбор.
+
+Пример:
+
+```toml
+[routing.domain_profiles]
+"discord.com" = "bypass:1"
+"youtube.com" = "bypass:2"
+"github.com" = "direct"
+```
+
+Валидация: значение должно быть `"direct"` или соответствовать шаблону `"bypass:<число>"`.
+
 ### `[telemetry]`
 
 - `crash_reports = false`
 - `endpoint = "https://crashes.example.com"`
-- `include_config = false`
 
 ## Основные валидации
 
