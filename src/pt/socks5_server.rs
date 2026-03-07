@@ -96,7 +96,7 @@ pub static DEST_ROUTE_HEALTH: OnceLock<DashMap<String, DashMap<String, RouteHeal
 pub static GLOBAL_BYPASS_PROFILE_HEALTH: OnceLock<DashMap<String, BypassProfileHealth>> = OnceLock::new();
 pub static ROUTE_CAPABILITIES: OnceLock<RwLock<RouteCapabilities>> = OnceLock::new();
 pub static ROUTE_METRICS: OnceLock<RouteMetrics> = OnceLock::new();
-pub static BLOCKLIST_DOMAINS: OnceLock<RwLock<std::collections::HashSet<String>>> = OnceLock::new();
+pub static BLOCKLIST_DOMAINS: OnceLock<crate::blocklist::DomainBloom> = OnceLock::new();
 
 // --- MODULES ---
 #[path = "socks5_server_parts/telemetry_bus.rs"]

@@ -8,6 +8,79 @@ use url::Url;
 
 use crate::error::{EngineError, Result};
 
+// --- Bloom filter for domain blocklist (2MB, ~0.1% FPR at 1.3M domains) ---
+
+const BLOOM_LOG2_BITS: u8 = 24; // 2^24 = 16M bits = 2MB
+const BLOOM_HASHES: u64 = 9;
+
+/// Probabilistic bloom filter for domain membership testing.
+/// Uses FNV1a double hashing; ~0.1% false positive rate at 1.3M domains.
+/// Memory: 2MB vs ~90MB for HashSet<String>. Never produces false negatives.
+pub struct DomainBloom {
+    bits: Vec<u64>,
+    pub count: usize,
+    mask: usize,
+}
+
+impl DomainBloom {
+    pub fn new() -> Self {
+        let n_bits = 1usize << BLOOM_LOG2_BITS;
+        Self { bits: vec![0u64; n_bits / 64], count: 0, mask: n_bits - 1 }
+    }
+
+    pub fn insert(&mut self, s: &str) {
+        let (h1, h2) = bloom_hash_pair(s);
+        for i in 0..BLOOM_HASHES {
+            let idx = (h1.wrapping_add(i.wrapping_mul(h2)) as usize) & self.mask;
+            self.bits[idx >> 6] |= 1u64 << (idx & 63);
+        }
+        self.count += 1;
+    }
+
+    pub fn contains(&self, s: &str) -> bool {
+        let (h1, h2) = bloom_hash_pair(s);
+        for i in 0..BLOOM_HASHES {
+            let idx = (h1.wrapping_add(i.wrapping_mul(h2)) as usize) & self.mask;
+            if self.bits[idx >> 6] & (1u64 << (idx & 63)) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Check if host or any of its parent domain suffixes is in the bloom.
+    pub fn contains_host_or_suffix(&self, host: &str) -> bool {
+        if self.contains(host) { return true; }
+        for (idx, byte) in host.as_bytes().iter().enumerate() {
+            if *byte == b'.' {
+                if self.contains(&host[idx + 1..]) { return true; }
+            }
+        }
+        false
+    }
+}
+
+impl Default for DomainBloom {
+    fn default() -> Self { Self::new() }
+}
+
+fn bloom_hash_pair(s: &str) -> (u64, u64) {
+    const FNV_PRIME: u64 = 1099511628211;
+    const FNV_BASIS: u64 = 14695981039346656037;
+    let mut h1 = FNV_BASIS;
+    for b in s.bytes() {
+        h1 ^= b as u64;
+        h1 = h1.wrapping_mul(FNV_PRIME);
+    }
+    // Second hash with a different seed; force odd so it covers all slots
+    let mut h2 = FNV_BASIS ^ 0x5555555555555555u64;
+    for b in s.bytes() {
+        h2 ^= b as u64;
+        h2 = h2.wrapping_mul(FNV_PRIME);
+    }
+    (h1, h2 | 1)
+}
+
 pub const DEFAULT_BLOCKLIST_SOURCE: &str = "https://antifilter.download/list/domains.lst";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

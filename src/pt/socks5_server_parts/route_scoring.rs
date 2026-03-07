@@ -99,15 +99,8 @@ pub fn is_censored_domain(domain: &str, _relay_opts: &RelayOptions, cfg: &Engine
     }
 
     // 2. Check global engine blocklist
-    if let Some(lock) = BLOCKLIST_DOMAINS.get() {
-        if let Ok(set) = lock.read() {
-            if set.contains(&dest_lower) { return true; }
-            for (idx, byte) in dest_lower.as_bytes().iter().enumerate() {
-                if *byte == b'.' {
-                    if set.contains(&dest_lower[idx + 1..]) { return true; }
-                }
-            }
-        }
+    if let Some(bloom) = BLOCKLIST_DOMAINS.get() {
+        if bloom.contains_host_or_suffix(&dest_lower) { return true; }
     }
 
     // 3. Custom check function fallback

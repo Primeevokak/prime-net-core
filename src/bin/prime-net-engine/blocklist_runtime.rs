@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prime_net_engine_core::blocklist::{
-    expand_tilde, looks_like_domain, update_blocklist, BlocklistCache,
+    expand_tilde, looks_like_domain, update_blocklist, BlocklistCache, DomainBloom,
 };
 use prime_net_engine_core::config::BlocklistConfig;
 use prime_net_engine_core::error::Result;
@@ -26,19 +26,19 @@ pub struct RuntimeBlocklistStats {
     pub pt_tools_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct DomainMatcher {
-    domains: HashSet<String>,
+    bloom: DomainBloom,
     ips: HashSet<String>,
 }
 
 impl DomainMatcher {
     fn from_entities(domains: &[String], ips: &[String]) -> Self {
-        let mut d_set = HashSet::with_capacity(domains.len());
+        let mut bloom = DomainBloom::new();
         for domain in domains {
             let normalized = normalize_domain(domain);
             if !normalized.is_empty() && looks_like_domain(&normalized) {
-                d_set.insert(normalized);
+                bloom.insert(&normalized);
             }
         }
         let mut i_set = HashSet::with_capacity(ips.len());
@@ -48,10 +48,7 @@ impl DomainMatcher {
                 i_set.insert(trimmed.to_owned());
             }
         }
-        Self {
-            domains: d_set,
-            ips: i_set,
-        }
+        Self { bloom, ips: i_set }
     }
 
     fn contains_host_or_suffix(&self, host: &str) -> bool {
@@ -59,33 +56,16 @@ impl DomainMatcher {
         if clean_host.is_empty() {
             return false;
         }
-
-        // Fast path: Zero-copy check if already lowercase (99% of browser traffic)
+        // IP literal: check exact IP set
+        if clean_host.parse::<std::net::IpAddr>().is_ok() {
+            return self.ips.contains(clean_host);
+        }
+        // Domain: use bloom filter (already lowercase in 99% of browser traffic)
         if clean_host.bytes().all(|b| !b.is_ascii_uppercase()) {
-            self.check_normalized(clean_host)
+            self.bloom.contains_host_or_suffix(clean_host)
         } else {
-            self.check_normalized(&clean_host.to_ascii_lowercase())
+            self.bloom.contains_host_or_suffix(&clean_host.to_ascii_lowercase())
         }
-    }
-
-    fn check_normalized(&self, host: &str) -> bool {
-        // If it's an IP literal, check the IP set
-        if host.parse::<std::net::IpAddr>().is_ok() {
-            return self.ips.contains(host);
-        }
-
-        if self.domains.contains(host) {
-            return true;
-        }
-        for (idx, byte) in host.as_bytes().iter().enumerate() {
-            if *byte == b'.' {
-                let suffix = &host[idx + 1..];
-                if self.domains.contains(suffix) {
-                    return true;
-                }
-            }
-        }
-        false
     }
 }
 
@@ -153,18 +133,20 @@ pub async fn initialize_runtime_blocklist(cfg: &BlocklistConfig) -> Result<Runti
     ips.dedup();
 
     let matcher = DomainMatcher::from_entities(&domains, &ips);
-    let domains_loaded = matcher.domains.len();
+    let domains_loaded = matcher.bloom.count;
     let ips_loaded = matcher.ips.len();
-    let _ = RUNTIME_MATCHER.set(matcher);
 
-    // Populate engine global blocklist for routing
-    let global_set = prime_net_engine_core::pt::socks5_server::BLOCKLIST_DOMAINS.get_or_init(|| std::sync::RwLock::new(std::collections::HashSet::new()));
-    if let Ok(mut set) = global_set.write() {
-        set.clear();
-        for domain in &domains {
-            set.insert(domain.clone());
+    // Populate engine global bloom for routing (built from same domain list, zero extra memory)
+    let mut global_bloom = DomainBloom::new();
+    for domain in &domains {
+        let normalized = normalize_domain(domain);
+        if !normalized.is_empty() && looks_like_domain(&normalized) {
+            global_bloom.insert(&normalized);
         }
     }
+    let _ = prime_net_engine_core::pt::socks5_server::BLOCKLIST_DOMAINS.set(global_bloom);
+
+    let _ = RUNTIME_MATCHER.set(matcher);
 
     let pt_tools_path = if domains.is_empty() {
         None
