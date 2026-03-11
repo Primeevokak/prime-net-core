@@ -489,3 +489,217 @@ pub fn record_route_success(rk: &str, c: &RouteCandidate, cfg: &EngineConfig) {
 pub fn record_route_failure(rk: &str, c: &RouteCandidate, r: &'static str, cfg: &EngineConfig) {
     record_route_failure_sync(rk, c, r, cfg);
 }
+
+#[cfg(test)]
+mod native_bypass_tests {
+    use super::*;
+    use crate::evasion::TcpDesyncEngine;
+    use std::sync::Arc;
+
+    fn make_relay_opts_with_engine() -> RelayOptions {
+        RelayOptions {
+            native_bypass: Some(Arc::new(TcpDesyncEngine::with_default_profiles())),
+            ..RelayOptions::default()
+        }
+    }
+
+    // ── RouteKind::Native identity ────────────────────────────────────────────
+
+    #[test]
+    fn native_route_id_uses_native_prefix() {
+        let c = RouteCandidate::native_with_family("engine", 0, 12, RouteIpFamily::Any);
+        assert_eq!(c.route_id(), "native:1");
+        let c2 = RouteCandidate::native_with_family("engine", 5, 12, RouteIpFamily::Any);
+        assert_eq!(c2.route_id(), "native:6");
+    }
+
+    #[test]
+    fn native_route_label_includes_source() {
+        let c = RouteCandidate::native_with_family("engine", 2, 12, RouteIpFamily::Any);
+        assert_eq!(c.route_label(), "native:3:engine");
+    }
+
+    #[test]
+    fn native_kind_rank_equals_bypass() {
+        let native = RouteCandidate::native_with_family("engine", 0, 12, RouteIpFamily::Any);
+        let bypass = RouteCandidate::bypass_with_family(
+            "pool",
+            "127.0.0.1:19080".parse().unwrap(),
+            0,
+            1,
+            RouteIpFamily::Any,
+        );
+        assert_eq!(native.kind_rank(), bypass.kind_rank());
+    }
+
+    // ── select_native_candidates ──────────────────────────────────────────────
+
+    #[test]
+    fn select_native_candidates_empty_when_no_engine() {
+        let opts = RelayOptions::default(); // native_bypass = None
+        let cands = select_native_candidates(&opts);
+        assert!(cands.is_empty());
+    }
+
+    #[test]
+    fn select_native_candidates_returns_all_profiles() {
+        let opts = make_relay_opts_with_engine();
+        let engine = opts.native_bypass.as_ref().unwrap();
+        let total = engine.profile_count();
+        let cands = select_native_candidates(&opts);
+        assert_eq!(cands.len(), total);
+        // Each entry: (idx, total)
+        for (i, (idx, t)) in cands.iter().enumerate() {
+            assert_eq!(*idx as usize, i);
+            assert_eq!(*t as usize, total);
+        }
+    }
+
+    // ── select_route_candidates with Native ───────────────────────────────────
+
+    #[test]
+    fn select_route_candidates_includes_native_for_blocked_domain() {
+        let opts = RelayOptions {
+            bypass_domain_check: Some(|h| h.contains("censored.example")),
+            ..make_relay_opts_with_engine()
+        };
+        let target = crate::pt::TargetAddr::Domain("censored.example.com".to_owned());
+        let cands = select_route_candidates(
+            &opts,
+            &target,
+            443,
+            "censored.example.com",
+            &EngineConfig::default(),
+        );
+
+        let native_count = cands.iter().filter(|c| c.kind == RouteKind::Native).count();
+        assert!(
+            native_count > 0,
+            "blocked domain must have Native candidates"
+        );
+        // Native score should be 900 for blocked domains
+        let native_scores: Vec<_> = cands
+            .iter()
+            .filter(|c| c.kind == RouteKind::Native)
+            .map(|c| c.score)
+            .collect();
+        assert!(native_scores.iter().all(|&s| s == 900));
+    }
+
+    #[test]
+    fn select_route_candidates_includes_native_for_normal_domain() {
+        let opts = make_relay_opts_with_engine();
+        let target = crate::pt::TargetAddr::Domain("example.com".to_owned());
+        let cands =
+            select_route_candidates(&opts, &target, 443, "example.com", &EngineConfig::default());
+
+        // For normal domains: Direct + up to 2 Native (no bypass pool)
+        let native_count = cands.iter().filter(|c| c.kind == RouteKind::Native).count();
+        assert!(
+            native_count > 0 && native_count <= 2,
+            "normal domain: up to 2 native candidates, got {}",
+            native_count
+        );
+        assert!(cands.iter().any(|c| c.kind == RouteKind::Direct));
+    }
+
+    #[test]
+    fn select_route_candidates_no_native_without_engine() {
+        let opts = RelayOptions {
+            bypass_socks5_pool: vec!["127.0.0.1:19080".parse().unwrap()],
+            ..RelayOptions::default()
+        };
+        let target = crate::pt::TargetAddr::Domain("example.com".to_owned());
+        let cands =
+            select_route_candidates(&opts, &target, 443, "example.com", &EngineConfig::default());
+        assert!(
+            cands.iter().all(|c| c.kind != RouteKind::Native),
+            "no engine → no native candidates"
+        );
+    }
+
+    // ── Scoring: native: prefix handled same as bypass: ──────────────────────
+
+    #[test]
+    fn global_bypass_profile_score_applies_to_native_prefix() {
+        let key = "native:1";
+        let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(dashmap::DashMap::new);
+        map.insert(
+            key.to_owned(),
+            BypassProfileHealth {
+                successes: 10,
+                failures: 0,
+                last_success_unix: now_unix_secs(),
+                ..Default::default()
+            },
+        );
+
+        let candidate = RouteCandidate::native_with_family("engine", 0, 12, RouteIpFamily::Any);
+        let score =
+            global_bypass_profile_score(&candidate, now_unix_secs(), &EngineConfig::default());
+        assert!(
+            score > 0,
+            "native route with successes should have positive global score"
+        );
+
+        map.remove(key);
+    }
+
+    #[test]
+    fn global_bypass_profile_score_zero_for_direct() {
+        let candidate = RouteCandidate::direct_with_family("adaptive", RouteIpFamily::Any);
+        let score =
+            global_bypass_profile_score(&candidate, now_unix_secs(), &EngineConfig::default());
+        assert_eq!(score, 0);
+    }
+
+    // ── record success/failure updates native health ──────────────────────────
+
+    #[test]
+    fn record_native_success_increments_global_health() {
+        let candidate = RouteCandidate::native_with_family("engine", 3, 12, RouteIpFamily::Any);
+        let key = bypass_profile_health_key(&candidate.route_id(), candidate.family);
+        // Clear state
+        let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(dashmap::DashMap::new);
+        map.remove(&key);
+
+        record_global_bypass_profile_success_sync(&candidate, &EngineConfig::default());
+
+        let health = map.get(&key).expect("health entry created");
+        assert_eq!(health.successes, 1);
+        map.remove(&key);
+    }
+
+    #[test]
+    fn record_native_failure_increments_global_health() {
+        let candidate = RouteCandidate::native_with_family("engine", 4, 12, RouteIpFamily::Any);
+        let key = bypass_profile_health_key(&candidate.route_id(), candidate.family);
+        let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(dashmap::DashMap::new);
+        map.remove(&key);
+
+        record_global_bypass_profile_failure_sync(
+            &candidate,
+            "handshake-io",
+            now_unix_secs(),
+            &EngineConfig::default(),
+        );
+
+        let health = map.get(&key).expect("health entry created");
+        assert_eq!(health.failures, 1);
+        map.remove(&key);
+    }
+
+    // ── Non-TLS port: no native candidates ───────────────────────────────────
+
+    #[test]
+    fn select_route_candidates_no_native_for_non_tls_port() {
+        let opts = make_relay_opts_with_engine();
+        let target = crate::pt::TargetAddr::Domain("example.com".to_owned());
+        let cands =
+            select_route_candidates(&opts, &target, 22, "example.com", &EngineConfig::default());
+        assert!(
+            cands.iter().all(|c| c.kind == RouteKind::Direct),
+            "port 22 should only use Direct"
+        );
+    }
+}
