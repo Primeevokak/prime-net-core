@@ -9,9 +9,9 @@ mod preset;
 mod proxy_cmd;
 mod socks_cmd;
 mod test_cmd;
+mod tui_cmd;
 #[cfg(feature = "tun")]
 mod tun_cmd;
-mod tui_cmd;
 mod update_cmd;
 mod wizard;
 
@@ -810,15 +810,15 @@ fn parse_tun(args: &[String]) -> Result<crate::tun_cmd::TunOpts> {
             }
             "--tun-prefix" => {
                 i += 1;
-                opts.tun_prefix = arg_value(args, i, "--tun-prefix")?
-                    .parse()
-                    .map_err(|_| EngineError::InvalidInput("tun: invalid --tun-prefix".to_owned()))?;
+                opts.tun_prefix = arg_value(args, i, "--tun-prefix")?.parse().map_err(|_| {
+                    EngineError::InvalidInput("tun: invalid --tun-prefix".to_owned())
+                })?;
             }
             "--socks-addr" => {
                 i += 1;
-                opts.socks_addr = arg_value(args, i, "--socks-addr")?
-                    .parse()
-                    .map_err(|_| EngineError::InvalidInput("tun: invalid --socks-addr".to_owned()))?;
+                opts.socks_addr = arg_value(args, i, "--socks-addr")?.parse().map_err(|_| {
+                    EngineError::InvalidInput("tun: invalid --socks-addr".to_owned())
+                })?;
             }
             "--mtu" => {
                 i += 1;

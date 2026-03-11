@@ -64,7 +64,8 @@ impl DomainMatcher {
         if clean_host.bytes().all(|b| !b.is_ascii_uppercase()) {
             self.bloom.contains_host_or_suffix(clean_host)
         } else {
-            self.bloom.contains_host_or_suffix(&clean_host.to_ascii_lowercase())
+            self.bloom
+                .contains_host_or_suffix(&clean_host.to_ascii_lowercase())
         }
     }
 }

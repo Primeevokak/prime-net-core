@@ -165,16 +165,16 @@ async fn read_line_sse<R: tokio::io::AsyncBufRead + Unpin>(
                         return Ok(total_read + i + 1);
                     }
                 } else {
-                    // CR is at the end of the buffer. 
+                    // CR is at the end of the buffer.
                     // To handle \r\n, we consume everything up to CR, push to buf,
                     // and then we must peek one more byte from the stream.
                     reader.consume(i);
                     total_read += i;
-                    
+
                     // Consume the CR now.
                     reader.consume(1);
                     total_read += 1;
-                    
+
                     // Peek if next is LF.
                     let available = reader.fill_buf().await?;
                     if !available.is_empty() && available[0] == b'\n' {
@@ -246,7 +246,7 @@ async fn run_sse(
 
         loop {
             buf.clear();
-            
+
             // Spec-compliant line reading: handles \n, \r, and \r\n as terminators.
             let n = tokio::select! {
                 _ = &mut stop_rx => return,
@@ -258,7 +258,7 @@ async fn run_sse(
                     }
                 }
             };
-            
+
             if n == 0 {
                 if let Some(ev) = acc.take_event() {
                     if out.send(Ok(ev)).await.is_err() {

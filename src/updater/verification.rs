@@ -125,8 +125,9 @@ mod tests {
 
     #[test]
     fn normalize_fingerprint_accepts_spaced_lowercase() {
-        let got = normalize_fingerprint("ab cd ef 12 34 56 78 90 ab cd ef 12 34 56 78 90 ab cd ef 12")
-            .expect("must normalize valid fingerprint");
+        let got =
+            normalize_fingerprint("ab cd ef 12 34 56 78 90 ab cd ef 12 34 56 78 90 ab cd ef 12")
+                .expect("must normalize valid fingerprint");
         assert_eq!(got, "ABCDEF1234567890ABCDEF1234567890ABCDEF12");
     }
 

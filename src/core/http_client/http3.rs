@@ -226,7 +226,8 @@ impl PrimeHttpClient {
             let mut body = Vec::new();
             let mut downloaded: u64 = 0;
             let max_bytes = (self.config.download.max_response_body_mb as u64) * 1024 * 1024;
-            let request_timeout = Duration::from_millis(self.config.transport.http3_request_timeout_ms);
+            let request_timeout =
+                Duration::from_millis(self.config.transport.http3_request_timeout_ms);
 
             loop {
                 let chunk_res = tokio::time::timeout(request_timeout, stream.recv_data()).await;
@@ -237,7 +238,9 @@ impl PrimeHttpClient {
                         return Err(EngineError::Internal(format!("h3 recv_data failed: {e}")));
                     }
                     Err(_) => {
-                        return Err(EngineError::Internal("HTTP/3 data transfer timeout".to_owned()));
+                        return Err(EngineError::Internal(
+                            "HTTP/3 data transfer timeout".to_owned(),
+                        ));
                     }
                 };
 

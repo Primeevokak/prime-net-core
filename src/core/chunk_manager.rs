@@ -177,10 +177,10 @@ impl ChunkManager {
         progress: Option<ProgressHook>,
     ) -> Result<()> {
         use std::fs::OpenOptions;
-        #[cfg(windows)]
-        use std::os::windows::fs::FileExt;
         #[cfg(unix)]
         use std::os::unix::fs::FileExt;
+        #[cfg(windows)]
+        use std::os::windows::fs::FileExt;
 
         let file = OpenOptions::new()
             .write(true)
@@ -218,7 +218,7 @@ impl ChunkManager {
 
                 let chunk_len = bytes.len() as u64;
                 let chunk_start = chunk.start;
-                
+
                 tokio::task::spawn_blocking(move || {
                     #[cfg(windows)]
                     file.seek_write(&bytes, chunk_start)?;

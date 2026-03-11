@@ -116,8 +116,8 @@ impl TrojanOutbound {
             .map_err(|_| EngineError::Internal("trojan write timeout".to_owned()))??;
 
         let req = build_trojan_connect_request(target)?;
-        // NOTE: Appending custom metadata here (like a timestamp for replay protection) 
-        // will break compatibility with standard Trojan servers. 
+        // NOTE: Appending custom metadata here (like a timestamp for replay protection)
+        // will break compatibility with standard Trojan servers.
         // Standard servers expect CRLF immediately after the SOCKS5 request.
 
         timeout(Self::IO_TIMEOUT, tls.write_all(&req))

@@ -203,7 +203,8 @@ impl DoHResolver {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| EngineError::Internal("DoH refresh failed: no results".to_owned())))
+        Err(last_err
+            .unwrap_or_else(|| EngineError::Internal("DoH refresh failed: no results".to_owned())))
     }
 
     pub async fn resolve_with_dnssec(&self, domain: &str) -> Result<(Vec<IpAddr>, bool)> {
@@ -220,7 +221,8 @@ impl DoHResolver {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| EngineError::Internal("DoH DNSSEC resolve failed".to_owned())))
+        Err(last_err
+            .unwrap_or_else(|| EngineError::Internal("DoH DNSSEC resolve failed".to_owned())))
     }
 
     async fn query_doh_provider(
@@ -305,7 +307,6 @@ impl DoHResolver {
             ad: parsed.ad.unwrap_or(false),
         })
     }
-
 }
 
 #[derive(Debug, Deserialize)]

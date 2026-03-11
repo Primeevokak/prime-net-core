@@ -25,7 +25,11 @@ pub struct DomainBloom {
 impl DomainBloom {
     pub fn new() -> Self {
         let n_bits = 1usize << BLOOM_LOG2_BITS;
-        Self { bits: vec![0u64; n_bits / 64], count: 0, mask: n_bits - 1 }
+        Self {
+            bits: vec![0u64; n_bits / 64],
+            count: 0,
+            mask: n_bits - 1,
+        }
     }
 
     pub fn insert(&mut self, s: &str) {
@@ -50,10 +54,14 @@ impl DomainBloom {
 
     /// Check if host or any of its parent domain suffixes is in the bloom.
     pub fn contains_host_or_suffix(&self, host: &str) -> bool {
-        if self.contains(host) { return true; }
+        if self.contains(host) {
+            return true;
+        }
         for (idx, byte) in host.as_bytes().iter().enumerate() {
             if *byte == b'.' {
-                if self.contains(&host[idx + 1..]) { return true; }
+                if self.contains(&host[idx + 1..]) {
+                    return true;
+                }
             }
         }
         false
@@ -61,7 +69,9 @@ impl DomainBloom {
 }
 
 impl Default for DomainBloom {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn bloom_hash_pair(s: &str) -> (u64, u64) {

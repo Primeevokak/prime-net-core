@@ -1,16 +1,16 @@
 use super::*;
+use crate::anticensorship::ResolverChain;
 use crate::config::EngineConfig;
 use crate::error::{EngineError, Result};
-use crate::pt::{TargetAddr, TargetEndpoint, DynOutbound};
-use crate::anticensorship::ResolverChain;
 use crate::pt::socks5_server::route_connection::handle_socks5_connection;
 use crate::pt::socks5_server::telemetry_bus::init_telemetry_bus;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, debug, error};
-use tokio::task::JoinSet;
-use tokio::net::TcpListener;
+use crate::pt::{DynOutbound, TargetAddr, TargetEndpoint};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::task::JoinSet;
+use tracing::{debug, error, info};
 
 pub static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 pub static WARNED_SOCKS4_LIMITATIONS: AtomicBool = AtomicBool::new(false);
@@ -25,7 +25,9 @@ pub async fn start_socks5_server(
 ) -> Result<Socks5ServerGuard> {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
     let relay_opts = Arc::new(relay_opts);
-    let listener = TcpListener::bind(listen_addr).await.map_err(EngineError::Io)?;
+    let listener = TcpListener::bind(listen_addr)
+        .await
+        .map_err(EngineError::Io)?;
     let local_addr = listener.local_addr().map_err(EngineError::Io)?;
 
     init_telemetry_bus(cfg.clone());
@@ -55,21 +57,30 @@ pub async fn start_socks5_server(
             }
         }
     });
-    Ok(Socks5ServerGuard { shutdown_tx: Some(shutdown_tx), listen_addr: local_addr })
+    Ok(Socks5ServerGuard {
+        shutdown_tx: Some(shutdown_tx),
+        listen_addr: local_addr,
+    })
 }
 
 #[derive(Debug)]
-pub struct Socks5ServerGuard { 
+pub struct Socks5ServerGuard {
     pub(super) shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub(super) listen_addr: SocketAddr,
 }
 
 impl Socks5ServerGuard {
-    pub fn listen_addr(&self) -> SocketAddr { self.listen_addr }
+    pub fn listen_addr(&self) -> SocketAddr {
+        self.listen_addr
+    }
 }
 
-impl Drop for Socks5ServerGuard { 
-    fn drop(&mut self) { if let Some(tx) = self.shutdown_tx.take() { let _ = tx.send(()); } } 
+impl Drop for Socks5ServerGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -92,6 +103,8 @@ pub struct RelayOptions {
     pub classifier_cache_path: Option<PathBuf>,
     pub classifier_entry_ttl_secs: u64,
     pub strategy_race_enabled: bool,
+    /// In-process TLS/TCP desync engine (Native bypass). `None` = disabled.
+    pub native_bypass: Option<Arc<crate::evasion::TcpDesyncEngine>>,
 }
 
 pub async fn connect_bypass_upstream(
@@ -105,33 +118,70 @@ pub async fn connect_bypass_upstream(
     cfg: Arc<EngineConfig>,
     _relay_opts: RelayOptions,
 ) -> Result<TcpStream> {
-    let mut bypass = TcpStream::connect(bypass_addr).await.map_err(EngineError::Io)?;
-    bypass.write_all(&[0x05, 0x01, 0x00]).await.map_err(EngineError::Io)?;
+    let mut bypass = TcpStream::connect(bypass_addr)
+        .await
+        .map_err(EngineError::Io)?;
+    bypass
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .map_err(EngineError::Io)?;
     let mut auth_res = [0u8; 2];
-    bypass.read_exact(&mut auth_res).await.map_err(EngineError::Io)?;
-    
+    bypass
+        .read_exact(&mut auth_res)
+        .await
+        .map_err(EngineError::Io)?;
+
     let mut req = vec![0x05, 0x01, 0x00];
     match &target.addr {
-        TargetAddr::Ip(std::net::IpAddr::V4(v4)) => { req.push(0x01); req.extend_from_slice(&v4.octets()); }
-        TargetAddr::Domain(host) => { req.push(0x03); req.push(host.len() as u8); req.extend_from_slice(host.as_bytes()); }
-        TargetAddr::Ip(std::net::IpAddr::V6(v6)) => { req.push(0x04); req.extend_from_slice(&v6.octets()); }
+        TargetAddr::Ip(std::net::IpAddr::V4(v4)) => {
+            req.push(0x01);
+            req.extend_from_slice(&v4.octets());
+        }
+        TargetAddr::Domain(host) => {
+            req.push(0x03);
+            req.push(host.len() as u8);
+            req.extend_from_slice(host.as_bytes());
+        }
+        TargetAddr::Ip(std::net::IpAddr::V6(v6)) => {
+            req.push(0x04);
+            req.extend_from_slice(&v6.octets());
+        }
     }
     let port_bytes = target.port.to_be_bytes();
     req.extend_from_slice(&port_bytes);
     bypass.write_all(&req).await.map_err(EngineError::Io)?;
 
     let mut reply_hdr = [0u8; 4];
-    bypass.read_exact(&mut reply_hdr).await.map_err(EngineError::Io)?;
+    bypass
+        .read_exact(&mut reply_hdr)
+        .await
+        .map_err(EngineError::Io)?;
     if reply_hdr[1] != 0x00 {
-        crate::pt::socks5_server::route_scoring::record_bypass_profile_failure(target_label, bypass_profile_idx, bypass_profile_total, "proxy-err", &cfg);
-        return Err(EngineError::Internal("SOCKS5 proxy refused connection".to_owned()));
+        crate::pt::socks5_server::route_scoring::record_bypass_profile_failure(
+            target_label,
+            bypass_profile_idx,
+            bypass_profile_total,
+            "proxy-err",
+            &cfg,
+        );
+        return Err(EngineError::Internal(
+            "SOCKS5 proxy refused connection".to_owned(),
+        ));
     }
-    
+
     let mut addr_buf = match reply_hdr[3] {
         0x01 => vec![0u8; 4],
-        0x03 => { let mut len = [0u8; 1]; bypass.read_exact(&mut len).await?; vec![0u8; len[0] as usize] }
+        0x03 => {
+            let mut len = [0u8; 1];
+            bypass.read_exact(&mut len).await?;
+            vec![0u8; len[0] as usize]
+        }
         0x04 => vec![0u8; 16],
-        _ => return Err(EngineError::Internal("invalid SOCKS5 reply ATYP".to_owned())),
+        _ => {
+            return Err(EngineError::Internal(
+                "invalid SOCKS5 reply ATYP".to_owned(),
+            ))
+        }
     };
     bypass.read_exact(&mut addr_buf).await?;
     let mut p_buf = [0u8; 2];

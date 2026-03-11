@@ -146,15 +146,15 @@ impl LogViewer {
 
         let logs = self.logs.read();
         let mut storage = self.filtered_storage.write();
-        
+
         // Full re-filter if storage state is suspicious
         if storage.is_empty() && !logs.is_empty() || storage.len() > logs.len() {
-             let filtered = logs
+            let filtered = logs
                 .iter()
                 .filter(|entry| self.entry_matches_filters(entry))
                 .cloned()
                 .collect::<Vec<_>>();
-             *storage = filtered;
+            *storage = filtered;
         }
 
         *snapshot = Arc::new(storage.clone());

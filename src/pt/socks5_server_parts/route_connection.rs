@@ -1,25 +1,27 @@
 use crate::config::EngineConfig;
 use crate::error::{EngineError, Result};
-use crate::pt::{BoxStream, DynOutbound, TargetEndpoint, TargetAddr};
-use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::task::JoinSet;
-use tokio::time::Duration;
-use std::time::Instant;
-use crate::pt::socks5_server::protocol_handlers::tune_relay_for_target;
 use crate::pt::socks5_server::ml_shadow::complete_route_outcome_event;
+use crate::pt::socks5_server::protocol_handlers::tune_relay_for_target;
+use crate::pt::{BoxStream, DynOutbound, TargetAddr, TargetEndpoint};
+use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::task::JoinSet;
+use tokio::time::Duration;
 use tracing::{debug, info, warn};
-use dashmap::DashMap;
 
-use crate::pt::socks5_server::*;
+use crate::pt::socks5_server::protocol_handlers::handle_http_proxy;
+use crate::pt::socks5_server::protocol_socks4::handle_socks4;
+use crate::pt::socks5_server::protocol_udp::handle_udp_associate;
+use crate::pt::socks5_server::relay_and_io_helpers::{
+    classify_io_error, fragment_and_send_tls_hello, is_tls_client_hello, relay_bidirectional,
+};
 use crate::pt::socks5_server::route_scoring::*;
 use crate::pt::socks5_server::state_and_startup::connect_bypass_upstream;
-use crate::pt::socks5_server::relay_and_io_helpers::{relay_bidirectional, classify_io_error, is_tls_client_hello, fragment_and_send_tls_hello};
-use crate::pt::socks5_server::protocol_socks4::handle_socks4;
-use crate::pt::socks5_server::protocol_handlers::handle_http_proxy;
-use crate::pt::socks5_server::protocol_udp::handle_udp_associate;
+use crate::pt::socks5_server::*;
 
 pub async fn connect_route_candidate(
     conn_id: u64,
@@ -32,14 +34,38 @@ pub async fn connect_route_candidate(
 ) -> Result<BoxStream> {
     match candidate.kind {
         RouteKind::Direct => {
-            let resolver = outbound.resolver().ok_or_else(|| EngineError::Internal("resolver missing".to_owned()))?;
+            let resolver = outbound
+                .resolver()
+                .ok_or_else(|| EngineError::Internal("resolver missing".to_owned()))?;
             let direct = crate::pt::direct::DirectOutbound::new(resolver);
             direct.connect(target.clone()).await
         }
         RouteKind::Bypass => {
-            let addr = candidate.bypass_addr.ok_or_else(|| EngineError::Config("bypass addr missing".to_owned()))?;
-            let res: Result<TcpStream> = connect_bypass_upstream(conn_id, target, target_label, addr, candidate.bypass_profile_idx, candidate.bypass_profile_total, None, cfg, relay_opts.clone()).await;
+            let addr = candidate
+                .bypass_addr
+                .ok_or_else(|| EngineError::Config("bypass addr missing".to_owned()))?;
+            let res: Result<TcpStream> = connect_bypass_upstream(
+                conn_id,
+                target,
+                target_label,
+                addr,
+                candidate.bypass_profile_idx,
+                candidate.bypass_profile_total,
+                None,
+                cfg,
+                relay_opts.clone(),
+            )
+            .await;
             res.map(|s| Box::new(s) as BoxStream)
+        }
+        RouteKind::Native => {
+            // Native: direct TCP connect — the TcpDesyncEngine transforms the
+            // ClientHello in connect_via_best_route before the relay starts.
+            let resolver = outbound
+                .resolver()
+                .ok_or_else(|| EngineError::Internal("resolver missing".to_owned()))?;
+            let direct = crate::pt::direct::DirectOutbound::new(resolver);
+            direct.connect(target.clone()).await
         }
     }
 }
@@ -76,11 +102,27 @@ pub async fn connect_via_best_route(
             let mut sent = false;
 
             if let Some(ref data) = icd {
-                // IMPORTANT: Only fragment internally for DIRECT connections.
-                // For Bypass, let the external proxy (ByeDPI) handle it.
-                if c.kind == RouteKind::Direct && ro.fragment_client_hello && is_tls_client_hello(data) {
-                    let _ = fragment_and_send_tls_hello(data, &mut stream, &ro).await
-                        .map_err(|e| EngineError::Io(e))?;
+                // Send data using the appropriate technique for this route kind:
+                // - Native:  apply TcpDesyncEngine (TLS record split / TCP segment split)
+                // - Direct:  optional internal ClientHello fragmentation
+                // - Bypass:  pass raw bytes; the external proxy handles evasion
+                if c.kind == RouteKind::Native {
+                    if let Some(ref engine) = ro.native_bypass {
+                        engine
+                            .apply(c.bypass_profile_idx as usize, &mut stream, data)
+                            .await
+                            .map_err(EngineError::Io)?;
+                    } else {
+                        stream.write_all(data).await?;
+                        stream.flush().await?;
+                    }
+                } else if c.kind == RouteKind::Direct
+                    && ro.fragment_client_hello
+                    && is_tls_client_hello(data)
+                {
+                    let _ = fragment_and_send_tls_hello(data, &mut stream, &ro)
+                        .await
+                        .map_err(EngineError::Io)?;
                 } else {
                     stream.write_all(data).await?;
                     stream.flush().await?;
@@ -139,18 +181,37 @@ pub async fn connect_via_best_route(
             stream,
             candidate: cand,
             route_key: target_label.to_owned(),
-            decision_id: 0,
+            decision_id: conn_id,
             initial_client_data: initial_client_data.unwrap_or_default(),
             initial_upstream_data: u2c,
-            client_data_sent: sent
+            client_data_sent: sent,
         });
     }
-    Err(EngineError::Internal("race failed: no working route found".to_owned()))
+    Err(EngineError::Internal(
+        "race failed: no working route found".to_owned(),
+    ))
 }
 
-pub struct ConnectedRoute { pub stream: BoxStream, pub candidate: RouteCandidate, pub route_key: String, pub decision_id: u64, pub initial_client_data: Vec<u8>, pub initial_upstream_data: Vec<u8>, pub client_data_sent: bool }
+pub struct ConnectedRoute {
+    pub stream: BoxStream,
+    pub candidate: RouteCandidate,
+    pub route_key: String,
+    pub decision_id: u64,
+    pub initial_client_data: Vec<u8>,
+    pub initial_upstream_data: Vec<u8>,
+    pub client_data_sent: bool,
+}
 
-pub async fn handle_socks5_connection(conn_id: u64, mut tcp: TcpStream, peer: SocketAddr, _label: &str, outbound: DynOutbound, cfg: Arc<EngineConfig>, _silent_drop: bool, relay_opts: RelayOptions) -> Result<()> {
+pub async fn handle_socks5_connection(
+    conn_id: u64,
+    mut tcp: TcpStream,
+    peer: SocketAddr,
+    _label: &str,
+    outbound: DynOutbound,
+    cfg: Arc<EngineConfig>,
+    _silent_drop: bool,
+    relay_opts: RelayOptions,
+) -> Result<()> {
     let mut hdr = [0u8; 2];
     tcp.read_exact(&mut hdr).await?;
 
@@ -163,14 +224,15 @@ pub async fn handle_socks5_connection(conn_id: u64, mut tcp: TcpStream, peer: So
 
         let target = read_socks5_target_endpoint_with_atyp(&mut tcp, req[3]).await?;
         if req[1] == 0x03 {
-            let resolver = outbound
-                .resolver()
-                .ok_or_else(|| EngineError::Internal("resolver missing for UDP associate".to_owned()))?;
-            return handle_udp_associate(conn_id, tcp, peer, resolver).await;
+            let resolver = outbound.resolver().ok_or_else(|| {
+                EngineError::Internal("resolver missing for UDP associate".to_owned())
+            })?;
+            return handle_udp_associate(conn_id, tcp, peer, resolver, cfg, relay_opts).await;
         }
 
         // UNBLOCK CLIENT: Send SOCKS5 success reply NOW so the client can send its first payload (e.g. TLS Client Hello)
-        tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+        tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await?;
 
         let target_str = target.to_string();
         let route_key = route_destination_key(&target_str);
@@ -180,25 +242,66 @@ pub async fn handle_socks5_connection(conn_id: u64, mut tcp: TcpStream, peer: So
         };
 
         let mut p = [0u8; 4096];
-        let wait_ms = if target.port == 443 { 2000 } else if has_cached_winner { 500 } else { 1500 };
+        let wait_ms = if target.port == 443 {
+            2000
+        } else if has_cached_winner {
+            500
+        } else {
+            1500
+        };
 
-        let icd = match tokio::time::timeout(Duration::from_millis(wait_ms), tcp.read(&mut p)).await {
+        let icd = match tokio::time::timeout(Duration::from_millis(wait_ms), tcp.read(&mut p)).await
+        {
             Ok(Ok(n)) if n > 0 => Some(p[..n].to_vec()),
             _ => None,
         };
-        handle_socks5_request_with_target(conn_id, tcp, peer, "client", &target, outbound, cfg, relay_opts, icd).await
+        handle_socks5_request_with_target(
+            conn_id, tcp, peer, "client", &target, outbound, cfg, relay_opts, icd,
+        )
+        .await
     } else if hdr[0] == 0x04 {
         let cmd = hdr[1];
-        handle_socks4(conn_id, tcp, peer, "client".to_owned(), outbound, cfg, cmd, _silent_drop, relay_opts).await
+        handle_socks4(
+            conn_id,
+            tcp,
+            peer,
+            "client".to_owned(),
+            outbound,
+            cfg,
+            cmd,
+            _silent_drop,
+            relay_opts,
+        )
+        .await
     } else if hdr[0] == b'G' || hdr[0] == b'C' || hdr[0] == b'P' || hdr[0] == b'H' {
-        handle_http_proxy(conn_id, tcp, peer, "client".to_owned(), outbound, cfg, hdr, relay_opts).await
+        handle_http_proxy(
+            conn_id,
+            tcp,
+            peer,
+            "client".to_owned(),
+            outbound,
+            cfg,
+            hdr,
+            relay_opts,
+        )
+        .await
     } else {
         warn!(target: "socks5", conn_id, first_byte = hdr[0], "unknown protocol detected");
         Err(EngineError::Internal("unsupported protocol".to_owned()))
     }
 }
 
-pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream, _peer: SocketAddr, _cl: &str, target: &TargetEndpoint, outbound: DynOutbound, cfg: Arc<EngineConfig>, relay_opts: RelayOptions, icd: Option<Vec<u8>>) -> Result<()> {
+pub async fn handle_socks5_request_with_target(
+    conn_id: u64,
+    mut tcp: TcpStream,
+    _peer: SocketAddr,
+    _cl: &str,
+    target: &TargetEndpoint,
+    outbound: DynOutbound,
+    cfg: Arc<EngineConfig>,
+    relay_opts: RelayOptions,
+    icd: Option<Vec<u8>>,
+) -> Result<()> {
     let target_label = target.to_string();
     let tuned = tune_relay_for_target(relay_opts, target.port, &target_label, false, false);
     let relay_opts = tuned.options;
@@ -212,13 +315,37 @@ pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream,
 
     let candidates = if let Some(winner) = cached_winner {
         if now_unix_secs().saturating_sub(winner.updated_at_unix) < ROUTE_WINNER_TTL_SECS {
-            let mut cands = select_route_candidates(&relay_opts, &target.addr, target.port, &target_label, &cfg);
+            let mut cands = select_route_candidates(
+                &relay_opts,
+                &target.addr,
+                target.port,
+                &target_label,
+                &cfg,
+            );
             cands.retain(|c| c.route_id() == winner.route_id);
-            if !cands.is_empty() { cands } else { select_route_candidates(&relay_opts, &target.addr, target.port, &target_label, &cfg) }
-        } else { select_route_candidates(&relay_opts, &target.addr, target.port, &target_label, &cfg) }
-    } else { select_route_candidates(&relay_opts, &target.addr, target.port, &target_label, &cfg) };
+            if !cands.is_empty() {
+                cands
+            } else {
+                select_route_candidates(&relay_opts, &target.addr, target.port, &target_label, &cfg)
+            }
+        } else {
+            select_route_candidates(&relay_opts, &target.addr, target.port, &target_label, &cfg)
+        }
+    } else {
+        select_route_candidates(&relay_opts, &target.addr, target.port, &target_label, &cfg)
+    };
 
-    let route_res = connect_via_best_route(conn_id, target, &target_label, candidates, outbound, &relay_opts, &cfg, icd).await;
+    let route_res = connect_via_best_route(
+        conn_id,
+        target,
+        &target_label,
+        candidates,
+        outbound,
+        &relay_opts,
+        &cfg,
+        icd,
+    )
+    .await;
 
     match route_res {
         Ok(route) => {
@@ -227,46 +354,93 @@ pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream,
 
             {
                 let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
-                map.insert(route_key.to_owned(), RouteWinner {
-                    route_id: route.candidate.route_id(),
-                    updated_at_unix: now_unix_secs(),
-                });
+                map.insert(
+                    route_key.to_owned(),
+                    RouteWinner {
+                        route_id: route.candidate.route_id(),
+                        updated_at_unix: now_unix_secs(),
+                    },
+                );
             }
 
             // Record success for the classifier
-            classifier_and_persistence::record_destination_success(route_key, tuned.stage, tuned.source, &cfg);
+            classifier_and_persistence::record_destination_success(
+                route_key,
+                tuned.stage,
+                tuned.source,
+                &cfg,
+            );
 
             let mut upstream = route.stream;
             let start_time = Instant::now();
 
-            // CRITICAL: If the route is via Bypass (ByeDPI), disable internal fragmentation
-            // to avoid "double-evasion" which causes Facebook to reset connections.
+            // CRITICAL: Bypass and Native both handle evasion themselves.
+            // Disable internal fragmentation to avoid double-evasion (e.g. Facebook resets).
             let mut final_opts = relay_opts;
-            if route.candidate.kind == RouteKind::Bypass {
+            if route.candidate.kind == RouteKind::Bypass
+                || route.candidate.kind == RouteKind::Native
+            {
                 final_opts.fragment_client_hello = false;
             }
 
-            let relay_res = relay_bidirectional(&mut tcp, &mut upstream, final_opts, route.initial_client_data, route.initial_upstream_data, route.client_data_sent).await;
+            let relay_res = relay_bidirectional(
+                &mut tcp,
+                &mut upstream,
+                final_opts,
+                route.initial_client_data,
+                route.initial_upstream_data,
+                route.client_data_sent,
+            )
+            .await;
 
             match relay_res {
                 Ok((c2u, u2c)) => {
                     info!(conn_id, tx = c2u, rx = u2c, "session finished normally");
-                    complete_route_outcome_event(conn_id, route_key, Some(&route.candidate), true, true, u2c, start_time.elapsed().as_millis() as u64, "", &cfg);
+                    complete_route_outcome_event(
+                        conn_id,
+                        route_key,
+                        Some(&route.candidate),
+                        true,
+                        true,
+                        u2c,
+                        start_time.elapsed().as_millis() as u64,
+                        "",
+                        &cfg,
+                    );
                     Ok(())
                 }
                 Err(e) => {
                     let signal = classify_io_error(&e);
-                    complete_route_outcome_event(conn_id, route_key, Some(&route.candidate), false, false, 0, start_time.elapsed().as_millis() as u64, &format!("{:?}", signal), &cfg);
+                    complete_route_outcome_event(
+                        conn_id,
+                        route_key,
+                        Some(&route.candidate),
+                        false,
+                        false,
+                        0,
+                        start_time.elapsed().as_millis() as u64,
+                        &format!("{:?}", signal),
+                        &cfg,
+                    );
 
                     // Record failure for the classifier if it's a strong blocking signal
                     if signal == BlockingSignal::Reset || signal == BlockingSignal::Timeout {
-                        classifier_and_persistence::record_destination_failure(route_key, signal, 0, tuned.stage, &cfg);
+                        classifier_and_persistence::record_destination_failure(
+                            route_key,
+                            signal,
+                            0,
+                            tuned.stage,
+                            &cfg,
+                        );
 
                         debug!(conn_id, error = %e, signal = ?signal, "upstream failure, invalidating cache for {}", route_key);
                         let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
                         map.remove(route_key);
                     }
-                    Err(EngineError::Io(std::io::Error::new(e.kind(), e.to_string())))
+                    Err(EngineError::Io(std::io::Error::new(
+                        e.kind(),
+                        e.to_string(),
+                    )))
                 }
             }
         }
@@ -278,17 +452,38 @@ pub async fn handle_socks5_request_with_target(conn_id: u64, mut tcp: TcpStream,
     }
 }
 
-async fn read_socks5_target_endpoint_with_atyp(tcp: &mut TcpStream, atyp: u8) -> Result<TargetEndpoint> {
+async fn read_socks5_target_endpoint_with_atyp(
+    tcp: &mut TcpStream,
+    atyp: u8,
+) -> Result<TargetEndpoint> {
     let addr = match atyp {
-        0x01 => { let mut ip = [0u8; 4]; tcp.read_exact(&mut ip).await?; TargetAddr::Ip(std::net::IpAddr::V4(ip.into())) }
-        0x03 => { let mut l = [0u8; 1]; tcp.read_exact(&mut l).await?; let mut d = vec![0u8; l[0] as usize]; tcp.read_exact(&mut d).await?; TargetAddr::Domain(String::from_utf8_lossy(&d).to_string()) }
+        0x01 => {
+            let mut ip = [0u8; 4];
+            tcp.read_exact(&mut ip).await?;
+            TargetAddr::Ip(std::net::IpAddr::V4(ip.into()))
+        }
+        0x03 => {
+            let mut l = [0u8; 1];
+            tcp.read_exact(&mut l).await?;
+            let mut d = vec![0u8; l[0] as usize];
+            tcp.read_exact(&mut d).await?;
+            TargetAddr::Domain(String::from_utf8_lossy(&d).to_string())
+        }
         _ => return Err(EngineError::Internal("unsupported atyp".to_owned())),
     };
-    let mut p = [0u8; 2]; tcp.read_exact(&mut p).await?;
-    Ok(TargetEndpoint { addr, port: u16::from_be_bytes(p) })
+    let mut p = [0u8; 2];
+    tcp.read_exact(&mut p).await?;
+    Ok(TargetEndpoint {
+        addr,
+        port: u16::from_be_bytes(p),
+    })
 }
 
-fn reap_route_race_losers_v3(mut winners: JoinSet<Result<(RouteCandidate, BoxStream, Vec<u8>, bool)>>, _cid: u64, _tl: String) {
+fn reap_route_race_losers_v3(
+    mut winners: JoinSet<Result<(RouteCandidate, BoxStream, Vec<u8>, bool)>>,
+    _cid: u64,
+    _tl: String,
+) {
     winners.abort_all();
     tokio::spawn(async move { while let Some(_) = winners.join_next().await {} });
 }

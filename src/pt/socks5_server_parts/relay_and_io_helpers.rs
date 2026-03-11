@@ -1,6 +1,6 @@
 use super::*;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use rand::Rng;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub async fn relay_bidirectional(
     client: &mut TcpStream,
@@ -15,9 +15,8 @@ pub async fn relay_bidirectional(
 
     if !client_data_already_sent && !initial_client_to_upstream.is_empty() {
         if relay_opts.fragment_client_hello && is_tls_client_hello(&initial_client_to_upstream) {
-            let _ =
-                fragment_and_send_tls_hello(&initial_client_to_upstream, upstream, &relay_opts)
-                    .await?;
+            let _ = fragment_and_send_tls_hello(&initial_client_to_upstream, upstream, &relay_opts)
+                .await?;
         } else {
             upstream.write_all(&initial_client_to_upstream).await?;
         }
@@ -30,7 +29,7 @@ pub async fn relay_bidirectional(
     }
 
     let (c2u, u2c) = tokio::io::copy_bidirectional(client, upstream).await?;
-    
+
     Ok((c2u + initial_c2u_len, u2c + initial_u2c_len))
 }
 
@@ -48,9 +47,8 @@ pub async fn relay_bidirectional_with_first_byte_timeout(
 
     if !client_data_already_sent && !initial_client_to_upstream.is_empty() {
         if relay_opts.fragment_client_hello && is_tls_client_hello(&initial_client_to_upstream) {
-            let _ =
-                fragment_and_send_tls_hello(&initial_client_to_upstream, upstream, &relay_opts)
-                    .await?;
+            let _ = fragment_and_send_tls_hello(&initial_client_to_upstream, upstream, &relay_opts)
+                .await?;
         } else {
             upstream.write_all(&initial_client_to_upstream).await?;
         }
@@ -72,7 +70,10 @@ pub async fn relay_bidirectional_with_first_byte_timeout(
             }
             Ok(Err(e)) => return Err(e),
             Err(_) => {
-                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "first byte timeout"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "first byte timeout",
+                ));
             }
         }
     }

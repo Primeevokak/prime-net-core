@@ -1,18 +1,22 @@
-use std::net::{SocketAddr, IpAddr};
-use tokio::net::{UdpSocket, TcpStream};
-use tokio::io::AsyncReadExt;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
+use tokio::net::{TcpStream, UdpSocket};
 use tracing::debug;
 
-use crate::error::Result;
 use crate::anticensorship::ResolverChain;
-use crate::pt::socks5_server::route_scoring::route_destination_key;
+use crate::config::EngineConfig;
+use crate::error::Result;
+use crate::pt::socks5_server::route_scoring::is_censored_domain;
+use crate::pt::socks5_server::state_and_startup::RelayOptions;
 
 pub async fn handle_udp_associate(
     conn_id: u64,
     mut tcp: TcpStream,
     _client_addr: SocketAddr,
     resolver: Arc<ResolverChain>,
+    cfg: Arc<EngineConfig>,
+    relay_opts: RelayOptions,
 ) -> Result<()> {
     // 1. Bind a local UDP socket for the relay
     let local_addr = tcp.local_addr()?;
@@ -37,7 +41,7 @@ pub async fn handle_udp_associate(
     // 3. Start the UDP relay loop
     let (mut tcp_read, _tcp_write) = tcp.into_split();
     let udp_arc = Arc::new(udp_socket);
-    
+
     let udp_recv = udp_arc.clone();
     let udp_send = udp_arc.clone();
 
@@ -69,7 +73,7 @@ pub async fn handle_udp_associate(
 
                         if Some(src) == client_source_addr {
                             // Packet from client -> remote
-                            match handle_client_to_remote(conn_id, &udp_send, &buf[..n], &resolver).await {
+                            match handle_client_to_remote(conn_id, &udp_send, &buf[..n], &resolver, &cfg, &relay_opts).await {
                                 Ok(Some(target_addr)) => {
                                     remote_to_target.insert(target_addr, target_addr);
                                 }
@@ -107,19 +111,27 @@ async fn handle_client_to_remote(
     socket: &UdpSocket,
     data: &[u8],
     resolver: &ResolverChain,
+    cfg: &EngineConfig,
+    relay_opts: &RelayOptions,
 ) -> std::io::Result<Option<SocketAddr>> {
-    if data.len() < 4 { return Ok(None); }
+    if data.len() < 4 {
+        return Ok(None);
+    }
     let frag = data[2];
-    if frag != 0 { return Ok(None); } 
+    if frag != 0 {
+        return Ok(None);
+    }
 
     let atyp = data[3];
     let (target_addr, header_len) = match atyp {
         0x01 => {
-            if data.len() < 10 { return Ok(None); }
+            if data.len() < 10 {
+                return Ok(None);
+            }
             let ip = std::net::Ipv4Addr::new(data[4], data[5], data[6], data[7]);
             let port = u16::from_be_bytes([data[8], data[9]]);
             let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
-            
+
             if port == 443 && is_likely_google_ip(addr.ip()) {
                 debug!(conn_id, "blocking QUIC to IP {} for fallback", addr.ip());
                 return Ok(None);
@@ -128,29 +140,20 @@ async fn handle_client_to_remote(
         }
         0x03 => {
             let len = data[4] as usize;
-            if data.len() < 5 + len + 2 { return Ok(None); }
+            if data.len() < 5 + len + 2 {
+                return Ok(None);
+            }
             let domain = String::from_utf8_lossy(&data[5..5 + len]);
             let port = u16::from_be_bytes([data[5 + len], data[5 + len + 1]]);
 
-            if port == 443 {
-                let key = route_destination_key(&domain);
-                if key == "googlevideo.com" || key == "ytimg.com" || domain.contains("google") || domain.contains("youtube") {
-                    debug!(conn_id, "blocking QUIC to domain {} for fallback", domain);
-                    return Ok(None);
-                }
-                // Force Discord onto TCP so DPI-bypass profiles can handle it.
-                // Discord QUIC (UDP 443) bypasses the ciadpi pool entirely and
-                // goes unprotected; dropping it here makes the client fall back
-                // to HTTP/2 over TCP, which is routed through bypass profiles.
-                if domain.contains("discord.com")
-                    || domain.contains("discordapp.com")
-                    || domain.contains("discordapp.net")
-                    || domain.contains("discord.gg")
-                    || domain.contains("discord.media")
-                {
-                    debug!(conn_id, "blocking QUIC to Discord domain {} for TCP bypass fallback", domain);
-                    return Ok(None);
-                }
+            // Block QUIC for any censored domain so the client falls back to TCP,
+            // where DPI-bypass profiles (Bypass/Native) can handle it.
+            if port == 443 && is_censored_domain(&domain, relay_opts, cfg) {
+                debug!(
+                    conn_id,
+                    "blocking QUIC to censored domain {} — forcing TCP fallback", domain
+                );
+                return Ok(None);
             }
 
             // ANTI-LEAK: Use encrypted resolver instead of system lookup_host
@@ -169,12 +172,14 @@ async fn handle_client_to_remote(
             }
         }
         0x04 => {
-            if data.len() < 22 { return Ok(None); }
+            if data.len() < 22 {
+                return Ok(None);
+            }
             let mut ip_bytes = [0u8; 16];
             ip_bytes.copy_from_slice(&data[4..20]);
             let port = u16::from_be_bytes([data[20], data[21]]);
             let addr = SocketAddr::new(std::net::IpAddr::V6(ip_bytes.into()), port);
-            
+
             if port == 443 && is_likely_google_ip(addr.ip()) {
                 debug!(conn_id, "blocking QUIC to IPv6 {} for fallback", addr.ip());
                 return Ok(None);
@@ -218,10 +223,10 @@ fn is_likely_google_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let octets = v4.octets();
-            octets[0] == 8 && octets[1] == 8 || 
-            octets[0] == 142 && octets[1] == 250 ||
-            octets[0] == 172 && octets[1] == 217 ||
-            octets[0] == 216 && octets[1] == 58
+            octets[0] == 8 && octets[1] == 8
+                || octets[0] == 142 && octets[1] == 250
+                || octets[0] == 172 && octets[1] == 217
+                || octets[0] == 216 && octets[1] == 58
         }
         _ => false,
     }

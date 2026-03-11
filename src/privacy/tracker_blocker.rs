@@ -79,7 +79,7 @@ impl TrackerBlocker {
             .filter(|v: &Option<String>| v.as_ref().map_or(false, |s| !s.is_empty()))
             .map(|v| v.unwrap())
             .collect();
-        
+
         let mut allowlist = HashSet::new();
         for d in allowlist_vec {
             allowlist.insert(d);

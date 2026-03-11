@@ -300,11 +300,15 @@ impl AutoUpdater {
             .prefix("prime-net-engine-update-")
             .rand_bytes(8)
             .tempfile()
-            .map_err(|e| EngineError::Internal(format!("failed to create temporary file for update: {e}")))?;
+            .map_err(|e| {
+                EngineError::Internal(format!("failed to create temporary file for update: {e}"))
+            })?;
 
         use std::io::Write;
         temp_file.write_all(data).map_err(|e| {
-            EngineError::Internal(format!("failed to write update data to temporary file: {e}"))
+            EngineError::Internal(format!(
+                "failed to write update data to temporary file: {e}"
+            ))
         })?;
 
         let (file, path) = temp_file.keep().map_err(|e| {

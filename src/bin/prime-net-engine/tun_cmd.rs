@@ -23,9 +23,9 @@ use std::time::Duration;
 use prime_net_engine_core::error::{EngineError, Result};
 use prime_net_engine_core::EngineConfig;
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
-use smoltcp::socket::AnySocket;
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp as tcp_sock;
+use smoltcp::socket::AnySocket;
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{IpAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -108,8 +108,14 @@ impl smoltcp::phy::TxToken for ChanTxToken {
 }
 
 impl Device for ChanDevice {
-    type RxToken<'a> = OwnedRxToken where Self: 'a;
-    type TxToken<'a> = ChanTxToken where Self: 'a;
+    type RxToken<'a>
+        = OwnedRxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = ChanTxToken
+    where
+        Self: 'a;
 
     fn receive(&mut self, _ts: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let pkt = self.rx.pop_front()?;
@@ -136,11 +142,19 @@ impl Device for ChanDevice {
 
 /// Check whether this IPv4/TCP packet is a pure SYN (first segment of new connection).
 fn is_ipv4_tcp_syn(pkt: &[u8]) -> bool {
-    if pkt.len() < 20 { return false; }
-    if pkt[0] >> 4 != 4 { return false; }     // IPv4
-    if pkt[9] != 6 { return false; }           // TCP
+    if pkt.len() < 20 {
+        return false;
+    }
+    if pkt[0] >> 4 != 4 {
+        return false;
+    } // IPv4
+    if pkt[9] != 6 {
+        return false;
+    } // TCP
     let ihl = (pkt[0] & 0x0f) as usize * 4;
-    if pkt.len() < ihl + 14 { return false; }
+    if pkt.len() < ihl + 14 {
+        return false;
+    }
     let flags = pkt[ihl + 13];
     flags & 0x12 == 0x02 // SYN=1, ACK=0
 }
@@ -151,12 +165,20 @@ fn rewrite_dnat(
     mut pkt: Vec<u8>,
     tun_ip: Ipv4Addr,
 ) -> Option<(Vec<u8>, (Ipv4Addr, u16), Ipv4Addr, u16)> {
-    if pkt.len() < 20 { return None; }
-    if pkt[0] >> 4 != 4 { return None; } // IPv4 only
-    if pkt[9] != 6 { return None; }       // TCP only
+    if pkt.len() < 20 {
+        return None;
+    }
+    if pkt[0] >> 4 != 4 {
+        return None;
+    } // IPv4 only
+    if pkt[9] != 6 {
+        return None;
+    } // TCP only
 
     let ihl = (pkt[0] & 0x0f) as usize * 4;
-    if pkt.len() < ihl + 4 { return None; }
+    if pkt.len() < ihl + 4 {
+        return None;
+    }
 
     let src_ip = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
     let orig_dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
@@ -234,7 +256,7 @@ async fn socks5_connect(stream: &mut TcpStream, dst: SocketAddr) -> std::io::Res
     }
     // Drain bound address
     let skip = match hdr[3] {
-        1 => 4 + 2, // IPv4 + port
+        1 => 4 + 2,  // IPv4 + port
         4 => 16 + 2, // IPv6 + port
         3 => {
             let mut len = [0u8; 1];
@@ -312,10 +334,7 @@ fn smoltcp_thread(
     rt_handle: tokio::runtime::Handle,
 ) {
     let [a, b, c, d] = tun_ip.octets();
-    let tun_cidr = IpCidr::Ipv4(Ipv4Cidr::new(
-        Ipv4Address::new(a, b, c, d),
-        tun_prefix,
-    ));
+    let tun_cidr = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(a, b, c, d), tun_prefix));
 
     let mut device = ChanDevice {
         rx: VecDeque::new(),
@@ -528,7 +547,10 @@ async fn ensure_wintun() -> Result<()> {
         .await
         .map_err(|e| EngineError::Internal(format!("wintun: read body: {e}")))?;
 
-    info!("wintun zip downloaded ({} KB), extracting {inner_path}", bytes.len() / 1024);
+    info!(
+        "wintun zip downloaded ({} KB), extracting {inner_path}",
+        bytes.len() / 1024
+    );
 
     let cursor = std::io::Cursor::new(bytes);
     let mut archive = zip::ZipArchive::new(cursor)
@@ -651,7 +673,15 @@ pub async fn run_tun(cfg: EngineConfig, opts: &TunOpts) -> Result<()> {
     let mtu = opts.mtu as usize;
     let socks_addr = opts.socks_addr;
     thread::spawn(move || {
-        smoltcp_thread(tun_ip, tun_prefix, mtu, socks_addr, to_smol_rx, smol_to_tun_tx, rt_handle);
+        smoltcp_thread(
+            tun_ip,
+            tun_prefix,
+            mtu,
+            socks_addr,
+            to_smol_rx,
+            smol_to_tun_tx,
+            rt_handle,
+        );
     });
 
     // 7. Block until Ctrl-C

@@ -1,9 +1,9 @@
-use std::process::Stdio;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
 use std::env;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::io::{BufReader, AsyncBufReadExt};
 
 fn find_chrome() -> Option<PathBuf> {
     let paths = [
@@ -25,8 +25,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Found Chrome at: {:?}", chrome_path);
 
     let current_dir = env::current_dir()?;
-    let engine_bin = current_dir.join("target").join("release").join("prime-net-engine.exe");
-    
+    let engine_bin = current_dir
+        .join("target")
+        .join("release")
+        .join("prime-net-engine.exe");
+
     if !engine_bin.exists() {
         println!("Engine binary not found! Building it first...");
         let status = std::process::Command::new("cargo")
@@ -39,7 +42,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Starting Prime Net Engine on 127.0.0.1:1080 with aggressive-evasion preset...");
     let mut engine_child = Command::new(&engine_bin)
-        .args(["--preset", "aggressive-evasion", "socks", "--bind", "127.0.0.1:1080"])
+        .args([
+            "--preset",
+            "aggressive-evasion",
+            "socks",
+            "--bind",
+            "127.0.0.1:1080",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -51,7 +60,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let args: Vec<String> = env::args().collect();
-    let test_url = args.get(1).map(|s| s.as_str()).unwrap_or("https://www.youtube.com");
+    let test_url = args
+        .get(1)
+        .map(|s| s.as_str())
+        .unwrap_or("https://www.youtube.com");
     println!("Launching Chrome to visit: {}", test_url);
 
     let user_data_dir = current_dir.join("target").join("chrome-test-profile");
@@ -79,14 +91,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         let timeout_check = tokio::time::timeout(Duration::from_millis(100), lines.next_line());
-        
+
         match timeout_check.await {
             Ok(Ok(Some(line))) => {
                 println!("  [ENGINE] {}", line);
-                if line.contains("starting route selection") || line.contains("SOCKS5 connection") || line.contains("trying route candidate") {
+                if line.contains("starting route selection")
+                    || line.contains("SOCKS5 connection")
+                    || line.contains("trying route candidate")
+                {
                     connection_seen = true;
                 }
-                if line.contains("won the race!") || line.contains("relay_bidirectional") || line.contains("session finished normally") {
+                if line.contains("won the race!")
+                    || line.contains("relay_bidirectional")
+                    || line.contains("session finished normally")
+                {
                     data_flowing = true;
                 }
                 if connection_seen && data_flowing {
@@ -94,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("\n=== BROWSER TEST PASSED SUCCESSFULLY ===");
                     break;
                 }
-            },
+            }
             Ok(Ok(None)) => break,
             Ok(Err(_)) => break,
             Err(_) => {}
@@ -109,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Terminating processes...");
     let _ = browser_child.kill().await;
     let _ = engine_child.kill().await;
-    
+
     if success {
         println!("Result: SUCCESS");
         std::process::exit(0);

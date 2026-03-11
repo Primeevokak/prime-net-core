@@ -121,7 +121,10 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
     let outbound =
         Arc::new(DirectOutbound::new(resolver).with_first_packet_ttl(cfg.evasion.first_packet_ttl));
 
-    let bind_addr: std::net::SocketAddr = opts.bind.parse().map_err(|e| EngineError::Config(format!("invalid bind address: {}", e)))?;
+    let bind_addr: std::net::SocketAddr = opts
+        .bind
+        .parse()
+        .map_err(|e| EngineError::Config(format!("invalid bind address: {}", e)))?;
     let guard = start_socks5_server(
         bind_addr,
         outbound,
@@ -172,12 +175,12 @@ fn build_direct_relay_options(cfg: &EngineConfig) -> RelayOptions {
     split_offsets.retain(|v| *v > 0);
 
     let mut sleep_ms = cfg.evasion.fragment_sleep_ms;
-    
+
     // Hard-reset sleep to 0 for bypass performance, unless user explicitly set something else than wizard's 10ms
     if sleep_ms == 10 || sleep_ms == 2 {
         sleep_ms = 0;
     }
-    
+
     if sleep_ms > 50 {
         sleep_ms = 50;
     }
@@ -186,7 +189,7 @@ fn build_direct_relay_options(cfg: &EngineConfig) -> RelayOptions {
         fragment_client_hello: true,
         split_at_sni: cfg.evasion.split_at_sni,
         client_hello_split_offsets: split_offsets,
-        fragment_size_min: 40, 
+        fragment_size_min: 40,
         fragment_size_max: cfg.evasion.fragment_size_max.clamp(40, 512),
         randomize_fragment_size: true,
         fragment_sleep_ms: sleep_ms,

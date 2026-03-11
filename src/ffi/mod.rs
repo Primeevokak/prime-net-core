@@ -223,7 +223,7 @@ impl Drop for RequestOpGuard {
     fn drop(&mut self) {
         if self.finish() {
             // SAFETY: The REQUEST_LIFECYCLE map acts as a reference counter for raw FFI pointers.
-            // When finish() returns true, it confirms that all asynchronous operations and 
+            // When finish() returns true, it confirms that all asynchronous operations and
             // the user-held handle have reached a terminal state, making it safe to reclaim memory.
             unsafe {
                 drop(Box::from_raw(self.ptr as *mut PrimeRequestHandleInner));
@@ -238,7 +238,7 @@ unsafe fn engine_from_ptr<'a>(engine: *mut PrimeEngine) -> Option<&'a PrimeEngin
         return None;
     }
     // SAFETY: The FFI boundary guarantees that 'engine' is a pointer to PrimeEngineOpaque
-    // allocated via Box::into_raw in prime_engine_new. We use a magic number check to 
+    // allocated via Box::into_raw in prime_engine_new. We use a magic number check to
     // further validate the pointer's provenance.
     let opaque = unsafe { &*(engine as *mut PrimeEngineOpaque) };
     if opaque.magic != PRIME_ENGINE_MAGIC {
@@ -514,8 +514,8 @@ pub unsafe extern "C" fn prime_request_wait(
                     // Err("cancelled") into the channel to wake a waiting caller).
                     // Only transition to FAILED if the request was not already cancelled;
                     // never overwrite CANCELLED with FAILED.
-                    let already_cancelled = inner.status.load(Ordering::SeqCst)
-                        == PrimeRequestStatus::CANCELLED as u8;
+                    let already_cancelled =
+                        inner.status.load(Ordering::SeqCst) == PrimeRequestStatus::CANCELLED as u8;
                     if !already_cancelled {
                         inner
                             .status
@@ -776,7 +776,8 @@ fn create_engine(config_path: *const c_char) -> Result<PrimeEngineHandle, Engine
                     "unknown panic".to_string()
                 };
                 tracing::error!(panic = %msg, "FFI runtime thread panicked");
-                let _ = init_tx_panic.send(Err(EngineError::Internal(format!("Runtime panic: {msg}"))));
+                let _ =
+                    init_tx_panic.send(Err(EngineError::Internal(format!("Runtime panic: {msg}"))));
             }
         })
         .map_err(|e| EngineError::Internal(format!("runtime thread spawn failed: {e}")))?;

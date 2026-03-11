@@ -174,10 +174,10 @@ mod tests {
 
         let mut body = Vec::new();
         body.extend_from_slice(&[0x03, 0x03]); // Version
-        body.extend_from_slice(&[0u8; 32]);    // Random
-        body.push(0x00);                        // Session ID len
+        body.extend_from_slice(&[0u8; 32]); // Random
+        body.push(0x00); // Session ID len
         body.extend_from_slice(&2u16.to_be_bytes()); // Cipher suites len
-        body.extend_from_slice(&[0x13, 0x01]);  // TLS_AES_128_GCM_SHA256
+        body.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
         body.push(0x01); // Compression methods len
         body.push(0x00); // null compression
         body.extend_from_slice(&(exts.len() as u16).to_be_bytes());

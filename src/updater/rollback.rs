@@ -107,7 +107,9 @@ impl RollbackManager {
                 })?;
             }
 
-            fs::rename(dest, &dest_backup).map_err(|e| EngineError::Internal(format!("failed to move current binary to backup: {e}")))?;
+            fs::rename(dest, &dest_backup).map_err(|e| {
+                EngineError::Internal(format!("failed to move current binary to backup: {e}"))
+            })?;
             match fs::copy(source, dest) {
                 Ok(_) => {
                     if let Err(e) = fs::remove_file(&dest_backup) {

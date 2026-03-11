@@ -86,7 +86,10 @@ impl PrimeEngine {
             }
         };
 
-        let bind_addr: std::net::SocketAddr = pt.local_socks5_bind.parse().map_err(|e| EngineError::Config(format!("invalid bind address: {}", e)))?;
+        let bind_addr: std::net::SocketAddr = pt
+            .local_socks5_bind
+            .parse()
+            .map_err(|e| EngineError::Config(format!("invalid bind address: {}", e)))?;
         let guard = start_socks5_server(
             bind_addr,
             outbound,

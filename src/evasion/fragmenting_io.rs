@@ -510,15 +510,15 @@ mod tests {
             ..FragmentConfig::default()
         };
         let (mut io, _handle) = FragmentingIo::new(DummyWriter, cfg);
-        
+
         let limit1 = io.next_write_limit(b"hello");
         assert_eq!(limit1, 2, "Should skip first 0 and return 2");
         io.first_plan_remaining = 2; // Simulate write of 2
-        
+
         // Mocking the plan advancement that normally happens in poll_write
         io.first_plan_remaining = 0;
         io.first_plan_idx += 1;
-        
+
         let limit2 = io.next_write_limit(b"llo");
         assert_eq!(limit2, 3, "Should skip second 0 and return 3");
     }
