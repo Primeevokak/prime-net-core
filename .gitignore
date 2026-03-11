@@ -29,3 +29,7 @@ package-lock.json.tmp
 # OS junk
 .DS_Store
 Thumbs.db
+
+
+
+.claude

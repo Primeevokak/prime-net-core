@@ -132,8 +132,8 @@ debug = 0
 debug = 0
 
 [package.metadata.deb]
-maintainer = "Your Name <email@example.com>"
-copyright = "2026, Your Name"
+maintainer = "Prime evolution"
+copyright = "2026, Prime evolution"
 license-file = ["LICENSE", "4"]
 extended-description = """\
 Anti-censorship network engine with HTTP/HTTPS/WebSocket support, \
