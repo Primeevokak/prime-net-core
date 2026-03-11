@@ -3,6 +3,7 @@ use std::sync::Arc;
 use prime_net_engine_core::anticensorship::ResolverChain;
 use prime_net_engine_core::config::EvasionStrategy;
 use prime_net_engine_core::config::SystemProxyMode;
+use prime_net_engine_core::evasion::TcpDesyncEngine;
 use prime_net_engine_core::error::{EngineError, Result};
 use prime_net_engine_core::platform::system_proxy_manager;
 use prime_net_engine_core::pt::direct::DirectOutbound;
@@ -114,6 +115,19 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
             fragment_sleep_ms = relay_opts.fragment_sleep_ms,
             fragment_budget_bytes = relay_opts.fragment_budget_bytes,
             "prime-mode is enabled (offline DPI bypass relay)"
+        );
+    }
+
+    // Initialize in-process TcpDesyncEngine (native bypass) — no binary required.
+    // Enabled alongside packet bypass or whenever evasion is active.
+    if cfg.evasion.packet_bypass_enabled || relay_opts.fragment_client_hello {
+        let engine = Arc::new(TcpDesyncEngine::with_default_profiles());
+        let profiles = engine.profile_count();
+        relay_opts.native_bypass = Some(engine);
+        info!(
+            target: "socks_cmd",
+            profiles,
+            "native TLS/TCP desync engine active"
         );
     }
 
