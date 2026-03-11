@@ -483,9 +483,10 @@ impl UniversalDnsResolver {
             guard.insert(key.clone(), resolver.clone());
         }
         
-        // Remove guard from map after successful build
-        let guards = RESOLVER_BUILD_GUARDS.get().unwrap();
-        guards.lock().remove(&key);
+        // Remove guard from map after successful build (best-effort; None means map not yet init).
+        if let Some(guards) = RESOLVER_BUILD_GUARDS.get() {
+            guards.lock().remove(&key);
+        }
         
         Ok(resolver)
     }

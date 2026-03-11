@@ -118,7 +118,8 @@ pub fn is_censored_domain(domain: &str, _relay_opts: &RelayOptions, cfg: &Engine
     if let Some(winners) = DEST_ROUTE_WINNER.get() {
         for key in [&dest_lower, group_key] {
             if let Some(winner) = winners.get(key) {
-                if winner.route_id.starts_with("bypass:") {
+                if winner.route_id.starts_with("bypass:") || winner.route_id.starts_with("native:")
+                {
                     return true;
                 }
             }
@@ -130,7 +131,9 @@ pub fn is_censored_domain(domain: &str, _relay_opts: &RelayOptions, cfg: &Engine
         for key in [&dest_lower, group_key] {
             if let Some(stats) = classifier.get(key) {
                 if let Some(ref winner) = stats.winner {
-                    if winner.route_id.starts_with("bypass:") {
+                    if winner.route_id.starts_with("bypass:")
+                        || winner.route_id.starts_with("native:")
+                    {
                         return true;
                     }
                 }
@@ -287,7 +290,7 @@ pub fn select_route_candidates(
     let is_blocked = is_censored_domain(destination, relay_opts, cfg);
     let family = route_family_for_target(target);
 
-    if port == 443 || port == 80 || port == 6443 || (port >= 5000 && port <= 9000) {
+    if port == 443 || port == 80 || port == 6443 || (5000..=9000).contains(&port) {
         let bypass_cands = select_bypass_candidates(relay_opts, destination, cfg);
         let native_cands = select_native_candidates(relay_opts);
 
@@ -412,6 +415,8 @@ pub fn mark_route_capability_healthy(kind: RouteKind, family: RouteIpFamily) {
             (RouteKind::Direct, RouteIpFamily::V6) => g.direct_v6_weak_until = 0,
             (RouteKind::Bypass, RouteIpFamily::V4) => g.bypass_v4_weak_until = 0,
             (RouteKind::Bypass, RouteIpFamily::V6) => g.bypass_v6_weak_until = 0,
+            (RouteKind::Native, RouteIpFamily::V4) => g.native_v4_weak_until = 0,
+            (RouteKind::Native, RouteIpFamily::V6) => g.native_v6_weak_until = 0,
             _ => {}
         }
     }
@@ -429,6 +434,8 @@ pub fn route_capability_is_available(kind: RouteKind, family: RouteIpFamily, now
             (RouteKind::Direct, RouteIpFamily::V6) => g.direct_v6_weak_until,
             (RouteKind::Bypass, RouteIpFamily::V4) => g.bypass_v4_weak_until,
             (RouteKind::Bypass, RouteIpFamily::V6) => g.bypass_v6_weak_until,
+            (RouteKind::Native, RouteIpFamily::V4) => g.native_v4_weak_until,
+            (RouteKind::Native, RouteIpFamily::V6) => g.native_v6_weak_until,
             _ => 0,
         };
         now >= until

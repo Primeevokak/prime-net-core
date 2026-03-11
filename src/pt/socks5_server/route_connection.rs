@@ -23,6 +23,9 @@ use crate::pt::socks5_server::route_scoring::*;
 use crate::pt::socks5_server::state_and_startup::connect_bypass_upstream;
 use crate::pt::socks5_server::*;
 
+/// Result payload for a single route-race contestant task.
+type RaceTask = (RouteCandidate, BoxStream, Vec<u8>, bool);
+
 pub async fn connect_route_candidate(
     conn_id: u64,
     target: &TargetEndpoint,
@@ -34,16 +37,14 @@ pub async fn connect_route_candidate(
 ) -> Result<BoxStream> {
     match candidate.kind {
         RouteKind::Direct => {
-            let resolver = outbound
-                .resolver()
-                .ok_or_else(|| EngineError::Internal("resolver missing".to_owned()))?;
+            let resolver = outbound.resolver().ok_or(EngineError::ResolverMissing)?;
             let direct = crate::pt::direct::DirectOutbound::new(resolver);
             direct.connect(target.clone()).await
         }
         RouteKind::Bypass => {
             let addr = candidate
                 .bypass_addr
-                .ok_or_else(|| EngineError::Config("bypass addr missing".to_owned()))?;
+                .ok_or(EngineError::BypassAddrMissing)?;
             let res: Result<TcpStream> = connect_bypass_upstream(
                 conn_id,
                 target,
@@ -61,15 +62,14 @@ pub async fn connect_route_candidate(
         RouteKind::Native => {
             // Native: direct TCP connect — the TcpDesyncEngine transforms the
             // ClientHello in connect_via_best_route before the relay starts.
-            let resolver = outbound
-                .resolver()
-                .ok_or_else(|| EngineError::Internal("resolver missing".to_owned()))?;
+            let resolver = outbound.resolver().ok_or(EngineError::ResolverMissing)?;
             let direct = crate::pt::direct::DirectOutbound::new(resolver);
             direct.connect(target.clone()).await
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn connect_via_best_route(
     conn_id: u64,
     target: &TargetEndpoint,
@@ -80,7 +80,7 @@ pub async fn connect_via_best_route(
     cfg: &EngineConfig,
     initial_client_data: Option<Vec<u8>>,
 ) -> Result<ConnectedRoute> {
-    let mut winners: JoinSet<Result<(RouteCandidate, BoxStream, Vec<u8>, bool)>> = JoinSet::new();
+    let mut winners: JoinSet<Result<RaceTask>> = JoinSet::new();
     let cand_count = candidates.len();
     let cfg_arc = Arc::new(cfg.clone());
 
@@ -202,6 +202,7 @@ pub struct ConnectedRoute {
     pub client_data_sent: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_socks5_connection(
     conn_id: u64,
     mut tcp: TcpStream,
@@ -291,6 +292,7 @@ pub async fn handle_socks5_connection(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_socks5_request_with_target(
     conn_id: u64,
     mut tcp: TcpStream,
@@ -479,11 +481,7 @@ async fn read_socks5_target_endpoint_with_atyp(
     })
 }
 
-fn reap_route_race_losers_v3(
-    mut winners: JoinSet<Result<(RouteCandidate, BoxStream, Vec<u8>, bool)>>,
-    _cid: u64,
-    _tl: String,
-) {
+fn reap_route_race_losers_v3(mut winners: JoinSet<Result<RaceTask>>, _cid: u64, _tl: String) {
     winners.abort_all();
-    tokio::spawn(async move { while let Some(_) = winners.join_next().await {} });
+    tokio::spawn(async move { while winners.join_next().await.is_some() {} });
 }

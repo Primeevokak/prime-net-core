@@ -60,9 +60,7 @@ impl PrimeHttpClient {
                 tracing::warn!(error = %e, host = %host, "ECH config lookup failed; falling back to plain TLS");
                 None
             });
-        let Some(ech_list) = ech_list else {
-            return None;
-        };
+        let ech_list = ech_list?;
 
         let ech_config = match build_rustls_ech_config(&ech_list) {
             Ok(v) => v,

@@ -62,7 +62,7 @@ impl TrackerBlocker {
                 )));
             }
 
-            let raw = fs::read_to_string(&path).map_err(|e| {
+            let raw = fs::read_to_string(path).map_err(|e| {
                 EngineError::Config(format!(
                     "privacy.tracker_blocker.custom_lists could not read '{path}': {e}"
                 ))
@@ -75,9 +75,8 @@ impl TrackerBlocker {
         let allowlist_vec: Vec<String> = cfg
             .allowlist
             .iter()
-            .map(|v| normalize_domain(v))
-            .filter(|v: &Option<String>| v.as_ref().map_or(false, |s| !s.is_empty()))
-            .map(|v| v.unwrap())
+            .filter_map(|v| normalize_domain(v))
+            .filter(|s: &String| !s.is_empty())
             .collect();
 
         let mut allowlist = HashSet::new();
@@ -98,9 +97,7 @@ impl TrackerBlocker {
     }
 
     pub fn matches(&self, url: &Url) -> Option<String> {
-        let Some(host) = url.host_str() else {
-            return None;
-        };
+        let host = url.host_str()?;
         let host = host.to_ascii_lowercase();
 
         if self.allowlist.contains(&host) {

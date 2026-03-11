@@ -125,7 +125,9 @@ pub struct AntiCensorshipConfig {
 
 impl AntiCensorshipConfig {
     pub fn effective_ech_mode(&self) -> Option<EchMode> {
-        self.ech_mode.clone().or_else(|| if self.ech_enabled { Some(EchMode::Grease) } else { None })
+        self.ech_mode
+            .clone()
+            .or(if self.ech_enabled { Some(EchMode::Grease) } else { None })
     }
 }
 

@@ -11,6 +11,7 @@ use crate::pt::socks5_server::relay_and_io_helpers::*;
 use crate::pt::socks5_server::*;
 use crate::pt::{DynOutbound, TargetAddr, TargetEndpoint};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_socks4(
     conn_id: u64,
     mut tcp: TcpStream,

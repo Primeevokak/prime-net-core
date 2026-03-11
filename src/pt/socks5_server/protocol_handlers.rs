@@ -12,6 +12,7 @@ use crate::pt::socks5_server::route_connection::*;
 use crate::pt::socks5_server::route_scoring::*;
 use crate::pt::socks5_server::*;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_http_proxy(
     conn_id: u64,
     mut tcp: TcpStream,

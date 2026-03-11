@@ -290,6 +290,7 @@ pub fn begin_route_decision_event_sync(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn complete_route_outcome_event(
     decision_id: u64,
     _rk: &str,
@@ -312,6 +313,7 @@ pub fn complete_route_outcome_event(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn complete_route_outcome_event_sync(
     decision_id: u64,
     candidate: Option<&RouteCandidate>,

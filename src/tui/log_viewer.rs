@@ -135,7 +135,7 @@ impl LogViewer {
 
     pub fn filtered_logs(&self) -> Arc<Vec<LogEntry>> {
         if !self.cache_dirty.load(Ordering::Relaxed) {
-            return self.filtered_snapshot.read().clone().into();
+            return self.filtered_snapshot.read().clone();
         }
 
         let mut snapshot = self.filtered_snapshot.write();

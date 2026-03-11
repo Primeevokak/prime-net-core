@@ -13,8 +13,6 @@
 //   macOS:  sudo route add -net 0.0.0.0/1 -interface <tun_name>
 //           sudo route add -net 128.0.0.0/1 -interface <tun_name>
 
-#![cfg(feature = "tun")]
-
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::thread;
@@ -159,12 +157,13 @@ fn is_ipv4_tcp_syn(pkt: &[u8]) -> bool {
     flags & 0x12 == 0x02 // SYN=1, ACK=0
 }
 
+/// NAT key: (source IP, source port).
+type NatKey = (Ipv4Addr, u16);
+/// DNAT result: (rewritten packet, nat key, original dst IP, dst port).
+type DnatResult = (Vec<u8>, NatKey, Ipv4Addr, u16);
+
 /// Rewrite dst_ip to tun_ip (DNAT), zero checksums (smoltcp recomputes on Tx).
-/// Returns (rewritten_pkt, nat_key=(src_ip,src_port), orig_dst_ip, dst_port).
-fn rewrite_dnat(
-    mut pkt: Vec<u8>,
-    tun_ip: Ipv4Addr,
-) -> Option<(Vec<u8>, (Ipv4Addr, u16), Ipv4Addr, u16)> {
+fn rewrite_dnat(mut pkt: Vec<u8>, tun_ip: Ipv4Addr) -> Option<DnatResult> {
     if pkt.len() < 20 {
         return None;
     }
@@ -457,13 +456,8 @@ fn smoltcp_thread(
             // Forward data: relay task → smoltcp socket
             if sock.may_send() {
                 if let Some(rx) = relay_to_smol.get_mut(&handle) {
-                    loop {
-                        match rx.try_recv() {
-                            Ok(data) => {
-                                let _ = sock.send_slice(&data);
-                            }
-                            Err(_) => break,
-                        }
+                    while let Ok(data) = rx.try_recv() {
+                        let _ = sock.send_slice(&data);
                     }
                 }
             }

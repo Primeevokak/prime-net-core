@@ -107,6 +107,7 @@ pub struct RelayOptions {
     pub native_bypass: Option<Arc<crate::evasion::TcpDesyncEngine>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn connect_bypass_upstream(
     _conn_id: u64,
     target: &TargetEndpoint,

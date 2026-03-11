@@ -24,6 +24,10 @@ pub enum EngineError {
     InvalidHeaderName(#[from] http::header::InvalidHeaderName),
     #[error("task join error: {0}")]
     Join(#[from] tokio::task::JoinError),
+    #[error("resolver not initialized")]
+    ResolverMissing,
+    #[error("bypass address not set for this route candidate")]
+    BypassAddrMissing,
     #[error("internal error: {0}")]
     Internal(String),
     #[error("blocked by privacy policy: {0}")]

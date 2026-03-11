@@ -311,7 +311,7 @@ impl AutoUpdater {
             ))
         })?;
 
-        let (file, path) = temp_file.keep().map_err(|e| {
+        let (_file, path) = temp_file.keep().map_err(|e| {
             EngineError::Internal(format!("failed to persist temporary update file: {e}"))
         })?;
 

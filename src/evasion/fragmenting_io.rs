@@ -351,17 +351,18 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for FragmentingIo<T> {
                     }
 
                     let sleep_ms = self.next_sleep_ms();
-                    if sleep_ms > 0 && self.enabled() {
-                        if tokio::runtime::Handle::try_current().is_ok() {
-                            if let Some(sleep) = self.sleep.as_mut() {
-                                sleep
-                                    .as_mut()
-                                    .reset(Instant::now() + Duration::from_millis(sleep_ms));
-                            } else {
-                                self.sleep = Some(Box::pin(tokio::time::sleep(
-                                    Duration::from_millis(sleep_ms),
-                                )));
-                            }
+                    if sleep_ms > 0
+                        && self.enabled()
+                        && tokio::runtime::Handle::try_current().is_ok()
+                    {
+                        if let Some(sleep) = self.sleep.as_mut() {
+                            sleep
+                                .as_mut()
+                                .reset(Instant::now() + Duration::from_millis(sleep_ms));
+                        } else {
+                            self.sleep = Some(Box::pin(tokio::time::sleep(Duration::from_millis(
+                                sleep_ms,
+                            ))));
                         }
                     }
                 }

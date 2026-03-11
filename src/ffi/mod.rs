@@ -173,10 +173,8 @@ fn try_hydrate_abort_handle(inner: &PrimeRequestHandleInner) {
     // Invariant: abort_rx is Some iff abort is None; once abort is populated, abort_rx is cleared.
     // So if abort_rx is None there is nothing to do — abort is already populated.
     let mut rx_slot = inner.abort_rx.lock();
-    if rx_slot.is_none() {
-        return;
-    }
-    let abort_handle = match rx_slot.as_ref().unwrap().try_recv() {
+    let Some(rx) = rx_slot.as_ref() else { return };
+    let abort_handle = match rx.try_recv() {
         Ok(handle) => handle,
         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
             *rx_slot = None;

@@ -58,10 +58,8 @@ impl DomainBloom {
             return true;
         }
         for (idx, byte) in host.as_bytes().iter().enumerate() {
-            if *byte == b'.' {
-                if self.contains(&host[idx + 1..]) {
-                    return true;
-                }
+            if *byte == b'.' && self.contains(&host[idx + 1..]) {
+                return true;
             }
         }
         false
@@ -406,12 +404,10 @@ fn parse_entities_csv(body: &str, delimiter: u8) -> (Vec<String>, Vec<String>) {
         .delimiter(delimiter)
         .from_reader(body.as_bytes());
 
-    for record in rdr.records() {
-        if let Ok(rec) = record {
-            let (d, i) = pick_entities_from_record(&rec);
-            domains.extend(d);
-            ips.extend(i);
-        }
+    for rec in rdr.records().flatten() {
+        let (d, i) = pick_entities_from_record(&rec);
+        domains.extend(d);
+        ips.extend(i);
     }
     (domains, ips)
 }

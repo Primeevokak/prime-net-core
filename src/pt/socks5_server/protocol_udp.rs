@@ -222,11 +222,16 @@ async fn send_to_client(
 fn is_likely_google_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            let octets = v4.octets();
-            octets[0] == 8 && octets[1] == 8
-                || octets[0] == 142 && octets[1] == 250
-                || octets[0] == 172 && octets[1] == 217
-                || octets[0] == 216 && octets[1] == 58
+            let o = v4.octets();
+            // Google Public DNS — exact addresses only, not the whole 8.8.0.0/16
+            (o == [8, 8, 8, 8] || o == [8, 8, 4, 4])
+                // Google/YouTube content delivery
+                || (o[0] == 142 && o[1] == 250)
+                || (o[0] == 172 && o[1] == 217)
+                || (o[0] == 216 && o[1] == 58)
+                // Cloudflare ranges (Discord, Instagram, etc.) — block QUIC so TCP bypass kicks in
+                || (o[0] == 104 && o[1] >= 16 && o[1] <= 31)
+                || (o[0] == 162 && o[1] == 159)
         }
         _ => false,
     }

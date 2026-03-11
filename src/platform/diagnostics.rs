@@ -152,7 +152,7 @@ impl ProxyDiagnostics {
 
     pub fn check_network_connectivity() -> DiagnosticResult {
         // Simple check to see if we can reach a public DNS server (e.g., Google DNS)
-        let addr = "8.8.8.8:53".parse::<SocketAddr>().unwrap();
+        let addr = SocketAddr::from(([8, 8, 8, 8], 53));
         match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
             Ok(_) => DiagnosticResult::ok("Internet connectivity established (ICMP/TCP)"),
             Err(e) => DiagnosticResult::error(

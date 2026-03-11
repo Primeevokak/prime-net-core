@@ -275,10 +275,14 @@ fn split_offset_in_payload(data: &[u8], at: SplitAt, parsed: Option<&ParsedClien
 
 // ── Default profiles ──────────────────────────────────────────────────────────
 
-/// 12 default profiles that mirror the existing byedpi profile set.
+/// 8 default profiles that use distinct, implemented desync techniques.
+///
+/// OOB/URG variants are intentionally excluded until `WinDivert` or raw-socket
+/// support is available — including stub OOB profiles would teach the ML scorer
+/// on signals that are identical to plain splits.
 pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
     vec![
-        // 1. TLS record split right into SNI — safest for Cloudflare.
+        // 1. TLS record split right into the SNI extension — safest for Cloudflare.
         //    Equivalent: --tlsrec 1+s
         NativeDesyncProfile {
             name: "tlsrec-into-sni",
@@ -287,7 +291,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: true,
         },
-        // 2. TLS record split before SNI — very safe, SNI entirely in second fragment.
+        // 2. TLS record split before the SNI extension — SNI is entirely in the second fragment.
         //    Equivalent: --tlsrec SNI-1
         NativeDesyncProfile {
             name: "tlsrec-before-sni",
@@ -296,7 +300,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: true,
         },
-        // 3. TCP segment split right into SNI.
+        // 3. TCP segment split right into the SNI extension.
         //    Equivalent: --split 1+s
         NativeDesyncProfile {
             name: "split-into-sni",
@@ -305,8 +309,8 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: true,
         },
-        // 4. TLS record split through the middle of the SNI hostname — aggressive.
-        //    Equivalent: roughly --tlsrec mid+s
+        // 4. TLS record split through the middle of the SNI hostname — most aggressive.
+        //    Equivalent: --tlsrec mid+s
         NativeDesyncProfile {
             name: "tlsrec-mid-sni",
             technique: DesyncTechnique::TlsRecordSplit {
@@ -314,16 +318,8 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: true,
         },
-        // 5. TLS record split + OOB at boundary — effective for many Russian ISPs.
-        //    Equivalent: --tlsrec 1+s --oob (OOB falls back to plain split on BoxStream)
-        NativeDesyncProfile {
-            name: "tlsrec-oob-into-sni",
-            technique: DesyncTechnique::TlsRecordSplitOob {
-                at: SplitAt::IntoSni,
-            },
-            cloudflare_safe: true,
-        },
-        // 6. TLS record split at a fixed deep offset (5 bytes into payload).
+        // 5. TLS record split at a fixed deep offset (5 bytes into the payload).
+        //    Effective on ISPs that inspect only the first few bytes of the handshake.
         //    Equivalent: --tlsrec 5+s
         NativeDesyncProfile {
             name: "tlsrec-fixed-5",
@@ -332,7 +328,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: true,
         },
-        // 7. TCP segment split before SNI.
+        // 6. TCP segment split before the SNI extension.
         //    Equivalent: --split before-sni
         NativeDesyncProfile {
             name: "split-before-sni",
@@ -341,17 +337,8 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: true,
         },
-        // 8. TCP split + OOB at position 2.
-        //    Equivalent: --split 2 --oob 1
-        NativeDesyncProfile {
-            name: "split-oob-fixed-2",
-            technique: DesyncTechnique::TcpSegmentSplitOob {
-                at: SplitAt::Fixed(2),
-            },
-            cloudflare_safe: false,
-        },
-        // 9. TCP segment split at fixed offset 1.
-        //    Equivalent: --disorder 1 --split 1 (without disorder)
+        // 7. TCP segment split at fixed byte 1 — minimal first fragment.
+        //    Equivalent: --split 1
         NativeDesyncProfile {
             name: "split-fixed-1",
             technique: DesyncTechnique::TcpSegmentSplit {
@@ -359,29 +346,12 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: false,
         },
-        // 10. TCP split at fixed offset 3.
-        //     Equivalent: --disorder 3 --oob 1 (simplified)
+        // 8. TCP segment split at fixed byte 3.
+        //    Equivalent: --split 3
         NativeDesyncProfile {
             name: "split-fixed-3",
             technique: DesyncTechnique::TcpSegmentSplit {
                 at: SplitAt::Fixed(3),
-            },
-            cloudflare_safe: false,
-        },
-        // 11. TCP split + OOB at fixed offset 1.
-        //     Equivalent: --split 1 --disoob 1
-        NativeDesyncProfile {
-            name: "split-oob-fixed-1",
-            technique: DesyncTechnique::TcpSegmentSplitOob {
-                at: SplitAt::Fixed(1),
-            },
-            cloudflare_safe: false,
-        },
-        // 12. TLS record split at mid-SNI + OOB — maximum split for stubborn ISPs.
-        NativeDesyncProfile {
-            name: "tlsrec-oob-mid-sni",
-            technique: DesyncTechnique::TlsRecordSplitOob {
-                at: SplitAt::MidSni,
             },
             cloudflare_safe: false,
         },
@@ -391,7 +361,6 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
 
     fn build_tls_record(host: &str) -> Vec<u8> {
         let host = host.as_bytes();
@@ -436,7 +405,7 @@ mod tests {
     async fn tls_record_split_reassembles_correctly() {
         let record = build_tls_record("discord.com");
         let mut buf = Vec::new();
-        let parsed = parse_client_hello(&record);
+        let _parsed = parse_client_hello(&record);
         // Split at payload offset 10
         tls_record_split(&mut buf, &record, 10).await.unwrap();
 

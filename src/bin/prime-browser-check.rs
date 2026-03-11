@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut browser_child = Command::new(chrome_path)
         .args([
-            &format!("--proxy-server=socks5://127.0.0.1:1080"),
+            "--proxy-server=socks5://127.0.0.1:1080",
             &format!("--user-data-dir={}", user_data_str),
             "--incognito",
             "--no-first-run",
