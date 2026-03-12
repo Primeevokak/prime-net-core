@@ -4,7 +4,7 @@ use predicates::prelude::*;
 use serde_json::json;
 
 fn write_config(repo: &str) -> tempfile::NamedTempFile {
-    let mut file = tempfile::NamedTempFile::new().unwrap();
+    let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
     let cfg = format!(
         r#"
 [updater]
@@ -12,7 +12,7 @@ enabled = true
 auto_check = true
 check_interval_hours = 24
 repo = "{repo}"
-channel = "stable"
+channel = "Stable"
 "#
     );
     std::io::Write::write_all(&mut file, cfg.as_bytes()).unwrap();

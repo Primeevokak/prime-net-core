@@ -310,7 +310,7 @@ pub struct PrivacySignalsConfig { pub send_dnt: bool, pub send_gpc: bool }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserAgentConfig { pub enabled: bool, pub preset: UserAgentPreset, pub custom_value: String }
 impl Default for UserAgentConfig {
-    fn default() -> Self { Self { enabled: true, preset: UserAgentPreset::ChromeWindows, custom_value: String::new() } }
+    fn default() -> Self { Self { enabled: false, preset: UserAgentPreset::ChromeWindows, custom_value: String::new() } }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

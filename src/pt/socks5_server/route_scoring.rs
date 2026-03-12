@@ -672,8 +672,8 @@ mod native_bypass_tests {
 
         record_global_bypass_profile_success_sync(&candidate, &EngineConfig::default());
 
-        let health = map.get(&key).expect("health entry created");
-        assert_eq!(health.successes, 1);
+        let successes = map.get(&key).expect("health entry created").successes;
+        assert_eq!(successes, 1);
         map.remove(&key);
     }
 
@@ -691,8 +691,8 @@ mod native_bypass_tests {
             &EngineConfig::default(),
         );
 
-        let health = map.get(&key).expect("health entry created");
-        assert_eq!(health.failures, 1);
+        let failures = map.get(&key).expect("health entry created").failures;
+        assert_eq!(failures, 1);
         map.remove(&key);
     }
 
