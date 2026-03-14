@@ -15,7 +15,7 @@ pub struct NativeBypassGuard {
 }
 
 impl NativeBypassGuard {
-    /// Build a guard with the default set of 12 native desync profiles.
+    /// Build a guard with the default set of native desync profiles.
     pub fn start_with_defaults() -> Self {
         let engine = TcpDesyncEngine::with_default_profiles();
         info!(

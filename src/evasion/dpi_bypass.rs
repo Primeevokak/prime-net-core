@@ -145,7 +145,41 @@ impl DpiBypassExt for TcpStream {
     }
 }
 
-async fn write_oob_at(stream: &mut TcpStream, data: &[u8], offset: usize) -> std::io::Result<()> {
+/// Send a single byte to `stream` with the OOB/URG flag set.
+///
+/// On Windows, uses `MSG_OOB` via `WinSock::send`.  On other platforms, sends
+/// the byte as a regular byte (OOB profiles should not be included in
+/// `default_native_profiles()` on non-Windows targets).
+///
+/// # Safety (Windows path)
+/// `sock` is a valid Windows socket handle obtained from the live `TcpStream`.
+pub(crate) async fn send_oob_byte(stream: &mut TcpStream, byte: u8) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{send, MSG_OOB, SOCKET};
+        let sock = stream.as_raw_socket() as SOCKET;
+        let buf = [byte];
+        // SAFETY: sock is a valid Windows SOCKET for this live TcpStream.
+        // buf is a valid 1-byte readable buffer that outlives the send() call.
+        unsafe {
+            let res = send(sock, buf.as_ptr(), 1, MSG_OOB);
+            if res == -1 {
+                // Fallback: send as a normal byte so the connection is not broken.
+                stream.write_all(&buf).await?;
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    stream.write_all(&[byte]).await
+}
+
+pub(crate) async fn write_oob_at(
+    stream: &mut TcpStream,
+    data: &[u8],
+    offset: usize,
+) -> std::io::Result<()> {
     if data.is_empty() {
         return Ok(());
     }
@@ -180,7 +214,10 @@ async fn write_oob_at(stream: &mut TcpStream, data: &[u8], offset: usize) -> std
     Ok(())
 }
 
-async fn send_tcb_desync_probe(addr: SocketAddr, fake_ttl: u8) -> std::io::Result<()> {
+/// Send a short-lived low-TTL probe to influence DPI TCP state.
+///
+/// Best-effort: errors are ignored by callers.
+pub(crate) async fn send_tcb_desync_probe(addr: SocketAddr, fake_ttl: u8) -> std::io::Result<()> {
     // Best-effort: short-lived low-TTL probe connection to influence DPI state.
     if let Ok(Ok(mut probe)) =
         tokio::time::timeout(Duration::from_millis(150), TcpStream::connect(addr)).await
@@ -192,7 +229,10 @@ async fn send_tcb_desync_probe(addr: SocketAddr, fake_ttl: u8) -> std::io::Resul
     Ok(())
 }
 
-async fn send_fake_payload_probe(
+/// Send a low-TTL probe with random payload to desync DPI middlebox state.
+///
+/// Best-effort: errors are ignored by callers.
+pub(crate) async fn send_fake_payload_probe(
     addr: SocketAddr,
     ttl: u8,
     data_size: usize,

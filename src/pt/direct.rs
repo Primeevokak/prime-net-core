@@ -49,6 +49,86 @@ impl DirectOutbound {
         self.resolver.clone()
     }
 
+    /// Resolve `target` to a single [`SocketAddr`] for probing or raw-socket operations.
+    ///
+    /// Returns the first usable IP from DNS for domain targets, or the literal IP.
+    pub async fn resolve_target_ip(&self, target: &TargetEndpoint) -> Result<SocketAddr> {
+        let target = normalize_target_endpoint(target.clone());
+        match target.addr {
+            TargetAddr::Ip(ip) => Ok(SocketAddr::new(ip, target.port)),
+            TargetAddr::Domain(ref host) => {
+                let ips = self.resolver.resolve(host).await?;
+                let (ips, _) = filter_sinkhole_ips(ips);
+                ips.into_iter()
+                    .next()
+                    .map(|ip| SocketAddr::new(ip, target.port))
+                    .ok_or_else(|| EngineError::Internal(format!("no usable IPs for '{}'", host)))
+            }
+        }
+    }
+
+    /// Connect to `target` and return a raw [`TcpStream`] without boxing.
+    ///
+    /// Used by Native bypass routes that need direct socket access for OOB byte
+    /// injection.  Performs DNS resolution and tries up to 4 IPs in happy-eyeballs
+    /// order before giving up.
+    pub async fn connect_tcp_stream(&self, target: TargetEndpoint) -> Result<TcpStream> {
+        let target = normalize_target_endpoint(target);
+        match target.addr {
+            TargetAddr::Ip(ip) => {
+                let addr = SocketAddr::new(ip, target.port);
+                self.connect_addr_tcp(addr).await
+            }
+            TargetAddr::Domain(ref host) => {
+                let ips = self.resolver.resolve(host).await?;
+                let (ips, _) = filter_sinkhole_ips(ips);
+                if ips.is_empty() {
+                    return Err(EngineError::Internal(format!(
+                        "no usable IPs for '{}'",
+                        host
+                    )));
+                }
+                let ordered = happy_eyeballs_order(dedup_ips_preserve_order(ips));
+                let mut last_err: Option<EngineError> = None;
+                for ip in ordered.into_iter().take(4) {
+                    let addr = SocketAddr::new(ip, target.port);
+                    match self.connect_addr_tcp(addr).await {
+                        Ok(tcp) => return Ok(tcp),
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                Err(last_err.unwrap_or_else(|| {
+                    EngineError::Internal(format!("native connect failed for '{}'", host))
+                }))
+            }
+        }
+    }
+
+    /// Connect to `addr` and return a raw [`TcpStream`] (no boxing, no happy-eyeballs).
+    async fn connect_addr_tcp(&self, addr: SocketAddr) -> Result<TcpStream> {
+        if is_unspecified_ip(addr.ip()) {
+            return Err(EngineError::InvalidInput(format!(
+                "native connect target is unspecified/sinkhole IP: {addr}"
+            )));
+        }
+        let connect = tokio::time::timeout(Self::CONNECT_TIMEOUT, TcpStream::connect(addr)).await;
+        let tcp = match connect {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                return Err(EngineError::Internal(format!(
+                    "native connect timeout after {}ms for {addr}",
+                    Self::CONNECT_TIMEOUT.as_millis()
+                )))
+            }
+        };
+        let _ = tcp.set_nodelay(true);
+        if should_apply_low_ttl(addr.ip(), self.first_packet_ttl) {
+            let _ = set_socket_ttl_low(&tcp, self.first_packet_ttl);
+        }
+        Ok(tcp)
+    }
+
     async fn connect_impl(&self, target: TargetEndpoint) -> Result<BoxStream> {
         let target = normalize_target_endpoint(target);
         let target_label = match &target.addr {

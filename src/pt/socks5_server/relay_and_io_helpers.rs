@@ -162,19 +162,3 @@ pub fn should_skip_empty_session_scoring(c2u: u64, u2c: u64) -> bool {
 pub fn should_mark_suspicious_zero_reply(port: u16, c2u: u64, u2c: u64, min_c2u: u64) -> bool {
     port == 443 && u2c == 0 && c2u >= min_c2u
 }
-
-#[allow(dead_code)]
-pub(super) fn registrable_domain_bucket(host: &str) -> Option<String> {
-    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    let n = parts.len();
-    let bucket = if parts[n - 1].len() == 2 && parts[n - 2].len() <= 3 && n >= 3 {
-        format!("{}.{}.{}", parts[n - 3], parts[n - 2], parts[n - 1])
-    } else {
-        format!("{}.{}", parts[n - 2], parts[n - 1])
-    };
-    Some(bucket)
-}

@@ -90,76 +90,91 @@ pub async fn connect_via_best_route(
         let tl = target_label.to_owned();
         let out = outbound.clone();
         let ro = relay_opts.clone();
-        let config = cfg_arc.clone(); // CORRECT: Clone Arc, don't move cfg
+        let config = cfg_arc.clone();
         let icd = initial_client_data.clone();
 
         winners.spawn(async move {
             let delay = (idx as u64) * 100;
-            if delay > 0 { tokio::time::sleep(Duration::from_millis(delay)).await; }
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
 
-            let mut stream = connect_route_candidate(conn_id, &t, &tl, &c, out, &ro, config.clone()).await?;
             let mut initial_u2c = Vec::new();
             let mut sent = false;
 
-            if let Some(ref data) = icd {
-                // Send data using the appropriate technique for this route kind:
-                // - Native:  apply TcpDesyncEngine (TLS record split / TCP segment split)
-                // - Direct:  optional internal ClientHello fragmentation
-                // - Bypass:  pass raw bytes; the external proxy handles evasion
-                if c.kind == RouteKind::Native {
-                    if let Some(ref engine) = ro.native_bypass {
+            // Native routes connect via raw TcpStream to enable OOB byte injection
+            // and fake low-TTL probes.  All other routes go through connect_route_candidate.
+            if c.kind == RouteKind::Native {
+                if let Some(ref engine) = ro.native_bypass {
+                    let profile_idx = c.bypass_profile_idx as usize;
+                    let resolver = out.resolver().ok_or(EngineError::ResolverMissing)?;
+                    let direct = crate::pt::direct::DirectOutbound::new(resolver);
+
+                    // Send a fake low-TTL probe to desync the DPI's TCP state table.
+                    if let Some(probe) = engine.profile_fake_probe(profile_idx) {
+                        if let Ok(addr) = direct.resolve_target_ip(&t).await {
+                            if probe.data_size == 0 {
+                                let _ = crate::evasion::dpi_bypass::send_tcb_desync_probe(
+                                    addr, probe.ttl,
+                                )
+                                .await;
+                            } else {
+                                let _ = crate::evasion::dpi_bypass::send_fake_payload_probe(
+                                    addr,
+                                    probe.ttl,
+                                    probe.data_size,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+
+                    let mut tcp = direct.connect_tcp_stream(t.clone()).await?;
+
+                    if let Some(ref data) = icd {
                         engine
-                            .apply(c.bypass_profile_idx as usize, &mut stream, data)
+                            .apply_to_tcp_stream(profile_idx, &mut tcp, data)
                             .await
                             .map_err(EngineError::Io)?;
-                    } else {
+                        sent = true;
+                        let label = c.route_label();
+                        initial_u2c =
+                            read_initial_upstream_response(&mut tcp, t.port, conn_id, &label)
+                                .await?;
+                    }
+
+                    let stream: BoxStream = Box::new(tcp);
+                    return Ok((c, stream, initial_u2c, sent));
+                }
+            }
+
+            // Direct, Bypass, or Native without an engine.
+            let mut stream =
+                connect_route_candidate(conn_id, &t, &tl, &c, out, &ro, config.clone()).await?;
+
+            if let Some(ref data) = icd {
+                match c.kind {
+                    RouteKind::Native => {
+                        // Native without engine — pass through unchanged.
                         stream.write_all(data).await?;
                         stream.flush().await?;
                     }
-                } else if c.kind == RouteKind::Direct
-                    && ro.fragment_client_hello
-                    && is_tls_client_hello(data)
-                {
-                    let _ = fragment_and_send_tls_hello(data, &mut stream, &ro)
-                        .await
-                        .map_err(EngineError::Io)?;
-                } else {
-                    stream.write_all(data).await?;
-                    stream.flush().await?;
-                }
-                sent = true;
-
-                let mut buf = [0u8; 4096];
-                // Wait for the TLS record header or some response data.
-                // Increase timeout to 3s for slower bypass routes like Discord
-                if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(3000), stream.read(&mut buf)).await {
-                    if n > 0 {
-                        // Validate TLS on HTTPS port 443
-                        if t.port == 443 && buf[0] != 0x16 {
-                            debug!(conn_id, route = %c.route_label(), byte = buf[0], "REJECTED: invalid TLS handshake record type (likely DPI)");
-                            return Err(EngineError::Internal("invalid tls handshake (dpi)".to_owned()));
-                        }
-                        // Validate HTTP on port 80 (common fake redirect)
-                        if t.port == 80 && buf[0] == 0x15 {
-                            return Err(EngineError::Internal("DPI block page detected".to_owned()));
-                        }
-                        initial_u2c.extend_from_slice(&buf[..n]);
-
-                        // TRY TO READ MORE: Strict Meta servers might send Server Hello in multiple segments.
-                        // Capture as much as possible in 50ms to avoid breaking the flight.
-                        let mut extra = [0u8; 4096];
-                        while let Ok(Ok(Ok(en))) = tokio::time::timeout(Duration::from_millis(50), tokio::time::timeout(Duration::from_millis(10), stream.read(&mut extra))).await {
-                            if en == 0 { break; }
-                            initial_u2c.extend_from_slice(&extra[..en]);
-                            if initial_u2c.len() > 8192 { break; }
-                        }
+                    RouteKind::Direct if ro.fragment_client_hello && is_tls_client_hello(data) => {
+                        let _ = fragment_and_send_tls_hello(data, &mut stream, &ro)
+                            .await
+                            .map_err(EngineError::Io)?;
+                    }
+                    _ => {
+                        stream.write_all(data).await?;
+                        stream.flush().await?;
                     }
                 }
-
-                if initial_u2c.is_empty() && (t.port == 443 || t.port == 80) {
-                    return Err(EngineError::Internal("no response from candidate".to_owned()));
-                }
+                sent = true;
+                let label = c.route_label();
+                initial_u2c =
+                    read_initial_upstream_response(&mut stream, t.port, conn_id, &label).await?;
             }
+
             Ok((c, stream, initial_u2c, sent))
         });
     }
@@ -479,6 +494,70 @@ async fn read_socks5_target_endpoint_with_atyp(
         addr,
         port: u16::from_be_bytes(p),
     })
+}
+
+/// Wait for the first bytes from the upstream and validate them.
+///
+/// Returns the collected initial response bytes, or an error if the response
+/// looks like a DPI block page or if no data arrives within 3 seconds.
+async fn read_initial_upstream_response<S: AsyncReadExt + Unpin>(
+    stream: &mut S,
+    port: u16,
+    conn_id: u64,
+    route_label: &str,
+) -> Result<Vec<u8>> {
+    let mut initial = Vec::new();
+    let mut buf = [0u8; 4096];
+
+    // Wait up to 3 s for the first byte — bypass routes are slower than Direct.
+    if let Ok(Ok(n)) =
+        tokio::time::timeout(Duration::from_millis(3000), stream.read(&mut buf)).await
+    {
+        if n > 0 {
+            // Validate TLS record type on HTTPS port.
+            if port == 443 && buf[0] != 0x16 {
+                debug!(
+                    conn_id,
+                    route = %route_label,
+                    byte = buf[0],
+                    "REJECTED: invalid TLS handshake record type (likely DPI)"
+                );
+                return Err(EngineError::Internal(
+                    "invalid tls handshake (dpi)".to_owned(),
+                ));
+            }
+            // TLS alert on port 80 indicates a DPI block page.
+            if port == 80 && buf[0] == 0x15 {
+                return Err(EngineError::Internal("DPI block page detected".to_owned()));
+            }
+            initial.extend_from_slice(&buf[..n]);
+
+            // Read more data in the next 50 ms — some servers send ServerHello
+            // in multiple TCP segments (e.g. strict Meta servers).
+            let mut extra = [0u8; 4096];
+            while let Ok(Ok(Ok(en))) = tokio::time::timeout(
+                Duration::from_millis(50),
+                tokio::time::timeout(Duration::from_millis(10), stream.read(&mut extra)),
+            )
+            .await
+            {
+                if en == 0 {
+                    break;
+                }
+                initial.extend_from_slice(&extra[..en]);
+                if initial.len() > 8192 {
+                    break;
+                }
+            }
+        }
+    }
+
+    if initial.is_empty() && (port == 443 || port == 80) {
+        return Err(EngineError::Internal(
+            "no response from candidate".to_owned(),
+        ));
+    }
+    Ok(initial)
 }
 
 fn reap_route_race_losers_v3(mut winners: JoinSet<Result<RaceTask>>, _cid: u64, _tl: String) {

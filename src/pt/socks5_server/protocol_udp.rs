@@ -131,11 +131,8 @@ async fn handle_client_to_remote(
             let ip = std::net::Ipv4Addr::new(data[4], data[5], data[6], data[7]);
             let port = u16::from_be_bytes([data[8], data[9]]);
             let addr = SocketAddr::new(std::net::IpAddr::V4(ip), port);
-
-            if port == 443 && is_likely_google_ip(addr.ip()) {
-                debug!(conn_id, "blocking QUIC to IP {} for fallback", addr.ip());
-                return Ok(None);
-            }
+            // Without a domain name we cannot determine whether the destination is
+            // censored, so we let the packet through and accept a possible RST.
             (addr, 10)
         }
         0x03 => {
@@ -179,11 +176,7 @@ async fn handle_client_to_remote(
             ip_bytes.copy_from_slice(&data[4..20]);
             let port = u16::from_be_bytes([data[20], data[21]]);
             let addr = SocketAddr::new(std::net::IpAddr::V6(ip_bytes.into()), port);
-
-            if port == 443 && is_likely_google_ip(addr.ip()) {
-                debug!(conn_id, "blocking QUIC to IPv6 {} for fallback", addr.ip());
-                return Ok(None);
-            }
+            // Same reasoning as IPv4: no domain available, pass through.
             (addr, 22)
         }
         _ => return Ok(None),
@@ -217,22 +210,4 @@ async fn send_to_client(
 
     socket.send_to(&reply, client_addr).await?;
     Ok(())
-}
-
-fn is_likely_google_ip(ip: std::net::IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            // Google Public DNS — exact addresses only, not the whole 8.8.0.0/16
-            (o == [8, 8, 8, 8] || o == [8, 8, 4, 4])
-                // Google/YouTube content delivery
-                || (o[0] == 142 && o[1] == 250)
-                || (o[0] == 172 && o[1] == 217)
-                || (o[0] == 216 && o[1] == 58)
-                // Cloudflare ranges (Discord, Instagram, etc.) — block QUIC so TCP bypass kicks in
-                || (o[0] == 104 && o[1] >= 16 && o[1] <= 31)
-                || (o[0] == 162 && o[1] == 159)
-        }
-        _ => false,
-    }
 }

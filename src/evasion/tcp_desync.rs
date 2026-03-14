@@ -1,9 +1,10 @@
 use std::io;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 
 use crate::evasion::tls_parser::{parse_client_hello, ParsedClientHello};
 
-/// Where to place the split point within the ClientHello.
+/// Where to place the split point within the TLS ClientHello record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitAt {
     /// Fixed offset in bytes (counted from byte 0 of the TLS record, incl. the 5-byte header).
@@ -16,7 +17,16 @@ pub enum SplitAt {
     MidSni,
 }
 
-/// Userspace TCP desync technique applied to TLS ClientHello data.
+/// Where to split an HTTP/1.x request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpSplitAt {
+    /// Split right before the `Host:` header line (second segment starts with `Host:`).
+    BeforeHostHeader,
+    /// Split at a fixed byte offset within the request.
+    Fixed(usize),
+}
+
+/// Userspace TCP desync technique applied to TLS ClientHello or HTTP data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesyncTechnique {
     /// Send two raw TCP segments with an explicit flush between them.
@@ -28,72 +38,99 @@ pub enum DesyncTechnique {
     /// Equivalent to byedpi `--tlsrec`.
     TlsRecordSplit { at: SplitAt },
 
-    /// TLS record split combined with an OOB (URG) byte before the second fragment.
+    /// TLS record split combined with an OOB (URG) byte between the two fragments.
     /// Equivalent to byedpi `--tlsrec ... --oob`.
+    /// Only meaningful on Windows (MSG_OOB); falls back to plain split otherwise.
     TlsRecordSplitOob { at: SplitAt },
 
     /// TCP segment split combined with an OOB (URG) byte at the split point.
     /// Equivalent to byedpi `--split ... --oob`.
+    /// Only meaningful on Windows (MSG_OOB); falls back to plain split otherwise.
     TcpSegmentSplitOob { at: SplitAt },
+
+    /// Split an HTTP/1.x request into two TCP segments for DPI evasion on port 80.
+    HttpSplit { at: HttpSplitAt },
+}
+
+/// Optional low-TTL probe sent to the target before the real TCP connection.
+///
+/// Poisons the DPI middlebox's TCP state-tracking table so it desynchronises
+/// from the real connection that follows.
+#[derive(Debug, Clone, Copy)]
+pub struct FakeProbe {
+    /// IP TTL for the probe connection (typically 3–5 hops).
+    pub ttl: u8,
+    /// Random bytes to send in the probe body; 0 = empty probe (TCB-desync only).
+    pub data_size: usize,
 }
 
 /// A named native desync profile.
 #[derive(Debug, Clone)]
 pub struct NativeDesyncProfile {
+    /// Short identifier used in logs and route-race labels.
     pub name: &'static str,
+    /// The desync technique to apply to the first TLS ClientHello or HTTP request.
     pub technique: DesyncTechnique,
-    /// If false, avoid for Cloudflare targets (Discord, Instagram, etc.) because
-    /// those servers reject disordered TCP segments.
+    /// If `false`, this profile is skipped for Cloudflare-hosted targets (Discord,
+    /// Instagram, etc.) because those servers reject disordered TCP segments.
     pub cloudflare_safe: bool,
+    /// If `Some`, send a low-TTL probe to the target before connecting.
+    pub fake_probe: Option<FakeProbe>,
 }
 
 /// In-process TCP desync engine — drop-in replacement for the external ciadpi pool.
 ///
-/// The engine holds a list of [`NativeDesyncProfile`]s that map 1:1 to what the
-/// byedpi profiles used to do.  Each profile gets its own [`RouteCandidate`] in
-/// the route-race, so the ML scorer can learn which profile wins for each domain.
+/// Holds a list of [`NativeDesyncProfile`]s that map 1:1 to byedpi profiles.
+/// Each profile gets its own [`RouteCandidate`] in the route-race so the ML
+/// scorer can learn which technique wins for each domain.
 #[derive(Debug)]
 pub struct TcpDesyncEngine {
     profiles: Vec<NativeDesyncProfile>,
 }
 
 impl TcpDesyncEngine {
+    /// Create an engine with an explicit profile list.
     pub fn new(profiles: Vec<NativeDesyncProfile>) -> Self {
         Self { profiles }
     }
 
-    /// Build an engine with the default profiles that mirror the 12 default byedpi profiles.
+    /// Build an engine with the platform-appropriate default profiles.
+    ///
+    /// On Windows: TLS/TCP split, HTTP split, fake-probe, and OOB/URG profiles.
+    /// On other platforms: TLS/TCP split and HTTP split profiles only
+    /// (OOB profiles require `MSG_OOB` and are excluded to avoid stubs).
     pub fn with_default_profiles() -> Self {
         Self::new(default_native_profiles())
     }
 
-    /// Number of profiles.
+    /// Number of profiles loaded in this engine.
     pub fn profile_count(&self) -> usize {
         self.profiles.len()
     }
 
-    /// Name of profile at `idx` (for logging).
+    /// Name of the profile at `idx` (for logging); returns `"unknown"` if out of range.
     pub fn profile_name(&self, idx: usize) -> &str {
         self.profiles.get(idx).map(|p| p.name).unwrap_or("unknown")
     }
 
-    /// Apply the desync technique for `profile_idx` to `data` and write the
-    /// result to `writer`.  `data` should be the raw TLS ClientHello record.
+    /// Returns the fake-probe spec for `idx`, if the profile requests one.
+    pub fn profile_fake_probe(&self, idx: usize) -> Option<&FakeProbe> {
+        self.profiles.get(idx).and_then(|p| p.fake_probe.as_ref())
+    }
+
+    /// Apply the desync technique for `profile_idx` to `data` using a generic writer.
     ///
-    /// If the data is not a TLS ClientHello, writes it unchanged.
+    /// OOB techniques fall back to plain split when used with this method; use
+    /// [`apply_to_tcp_stream`] instead to get real `MSG_OOB` injection.
+    ///
+    /// If `data` is not a TLS ClientHello (and the technique is not `HttpSplit`),
+    /// writes it unchanged.
     pub async fn apply<W: AsyncWriteExt + Unpin>(
         &self,
         profile_idx: usize,
         writer: &mut W,
         data: &[u8],
     ) -> io::Result<()> {
-        // If it's not a TLS ClientHello, pass through.
-        if data.len() < 5 || data[0] != 0x16 {
-            writer.write_all(data).await?;
-            writer.flush().await?;
-            return Ok(());
-        }
-
         let profile = match self.profiles.get(profile_idx) {
             Some(p) => p,
             None => {
@@ -103,15 +140,87 @@ impl TcpDesyncEngine {
             }
         };
 
+        // HTTP-split profiles handle port-80 plaintext before TLS is checked.
+        if let DesyncTechnique::HttpSplit { at } = profile.technique {
+            let split = http_split_offset(data, at);
+            tcp_segment_split(writer, data, split).await?;
+            writer.flush().await?;
+            return Ok(());
+        }
+
+        // All TLS-based techniques: pass non-TLS data unchanged.
+        if data.len() < 5 || data[0] != 0x16 {
+            writer.write_all(data).await?;
+            writer.flush().await?;
+            return Ok(());
+        }
+
         let parsed = parse_client_hello(data);
         apply_technique(writer, data, profile.technique, parsed.as_ref()).await?;
         writer.flush().await?;
+        Ok(())
+    }
+
+    /// Apply the desync technique to a raw [`TcpStream`], enabling real OOB injection.
+    ///
+    /// For `TlsRecordSplitOob` and `TcpSegmentSplitOob` profiles this sends an
+    /// actual `MSG_OOB` byte between the two fragments (Windows only).  All other
+    /// techniques behave identically to [`apply`].
+    pub async fn apply_to_tcp_stream(
+        &self,
+        profile_idx: usize,
+        stream: &mut TcpStream,
+        data: &[u8],
+    ) -> io::Result<()> {
+        let profile = match self.profiles.get(profile_idx) {
+            Some(p) => p,
+            None => {
+                stream.write_all(data).await?;
+                stream.flush().await?;
+                return Ok(());
+            }
+        };
+
+        // HTTP-split: plaintext evasion, no TLS check needed.
+        if let DesyncTechnique::HttpSplit { at } = profile.technique {
+            let split = http_split_offset(data, at);
+            tcp_segment_split(stream, data, split).await?;
+            stream.flush().await?;
+            return Ok(());
+        }
+
+        // TLS-based techniques: pass non-TLS data unchanged.
+        if data.len() < 5 || data[0] != 0x16 {
+            stream.write_all(data).await?;
+            stream.flush().await?;
+            return Ok(());
+        }
+
+        let parsed = parse_client_hello(data);
+
+        match profile.technique {
+            DesyncTechnique::TlsRecordSplitOob { at } => {
+                let payload_split = split_offset_in_payload(data, at, parsed.as_ref());
+                tls_record_split_oob_real(stream, data, payload_split).await?;
+            }
+            DesyncTechnique::TcpSegmentSplitOob { at } => {
+                let split = split_offset_in_record(data, at, parsed.as_ref());
+                tcp_segment_split_oob_real(stream, data, split).await?;
+            }
+            other => {
+                // Non-OOB techniques behave the same on TcpStream as on generic writers.
+                apply_technique(stream, data, other, parsed.as_ref()).await?;
+            }
+        }
+
+        stream.flush().await?;
         Ok(())
     }
 }
 
 // ── Technique dispatch ────────────────────────────────────────────────────────
 
+/// Apply a non-OOB technique to a generic async writer.
 async fn apply_technique<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     data: &[u8],
@@ -127,13 +236,18 @@ async fn apply_technique<W: AsyncWriteExt + Unpin>(
             let payload_split = split_offset_in_payload(data, at, parsed);
             tls_record_split(writer, data, payload_split).await
         }
+        // OOB fallback to plain split when no raw socket is available.
         DesyncTechnique::TlsRecordSplitOob { at } => {
             let payload_split = split_offset_in_payload(data, at, parsed);
-            tls_record_split_oob(writer, data, payload_split).await
+            tls_record_split(writer, data, payload_split).await
         }
         DesyncTechnique::TcpSegmentSplitOob { at } => {
             let split = split_offset_in_record(data, at, parsed);
-            tcp_segment_split_oob(writer, data, split).await
+            tcp_segment_split(writer, data, split).await
+        }
+        DesyncTechnique::HttpSplit { at } => {
+            let split = http_split_offset(data, at);
+            tcp_segment_split(writer, data, split).await
         }
     }
 }
@@ -158,7 +272,7 @@ async fn tcp_segment_split<W: AsyncWriteExt + Unpin>(
 
 /// Reconstruct the TLS record as two separate TLS records.
 ///
-/// `payload_split` is the split offset *within the TLS payload* (i.e. bytes after the 5-byte
+/// `payload_split` is the split offset *within the TLS payload* (bytes after the 5-byte
 /// TLS record header).
 async fn tls_record_split<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
@@ -179,7 +293,7 @@ async fn tls_record_split<W: AsyncWriteExt + Unpin>(
         return Ok(());
     }
 
-    // Fragment 1
+    // Fragment 1: TLS record header + first part of payload.
     let len1 = (payload_split as u16).to_be_bytes();
     writer
         .write_all(&[content_type, version[0], version[1], len1[0], len1[1]])
@@ -187,7 +301,7 @@ async fn tls_record_split<W: AsyncWriteExt + Unpin>(
     writer.write_all(&payload[..payload_split]).await?;
     writer.flush().await?;
 
-    // Fragment 2
+    // Fragment 2: TLS record header + remainder of payload.
     let rem = payload.len() - payload_split;
     let len2 = (rem as u16).to_be_bytes();
     writer
@@ -197,30 +311,73 @@ async fn tls_record_split<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// TLS record split + OOB byte at the boundary on Windows; plain split on other platforms.
-async fn tls_record_split_oob<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
+/// TLS record split with a real OOB byte injected between the two fragments.
+///
+/// Requires a raw `TcpStream` for `MSG_OOB` access.
+async fn tls_record_split_oob_real(
+    stream: &mut TcpStream,
     record: &[u8],
     payload_split: usize,
 ) -> io::Result<()> {
-    // On platforms without raw socket access through BoxStream we fall back to plain split.
-    // Full OOB support is added when WinDivert/packet_intercept is available (Priority 2).
-    tls_record_split(writer, record, payload_split).await
+    if record.len() < 5 || payload_split == 0 {
+        stream.write_all(record).await?;
+        return Ok(());
+    }
+
+    let content_type = record[0];
+    let version = [record[1], record[2]];
+    let payload = &record[5..];
+
+    if payload_split >= payload.len() {
+        stream.write_all(record).await?;
+        return Ok(());
+    }
+
+    // Fragment 1
+    let len1 = (payload_split as u16).to_be_bytes();
+    stream
+        .write_all(&[content_type, version[0], version[1], len1[0], len1[1]])
+        .await?;
+    stream.write_all(&payload[..payload_split]).await?;
+    stream.flush().await?;
+
+    // OOB byte between fragments — confuses DPI reassembly.
+    crate::evasion::dpi_bypass::send_oob_byte(stream, 0x00).await?;
+
+    // Fragment 2
+    let rem = payload.len() - payload_split;
+    let len2 = (rem as u16).to_be_bytes();
+    stream
+        .write_all(&[content_type, version[0], version[1], len2[0], len2[1]])
+        .await?;
+    stream.write_all(&payload[payload_split..]).await?;
+    Ok(())
 }
 
-/// TCP segment split + OOB at split point.
-async fn tcp_segment_split_oob<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
+/// TCP segment split with a real OOB byte injected at the split point.
+async fn tcp_segment_split_oob_real(
+    stream: &mut TcpStream,
     data: &[u8],
     split: usize,
 ) -> io::Result<()> {
-    // Same fallback as tls_record_split_oob for now.
-    tcp_segment_split(writer, data, split).await
+    if split == 0 || split >= data.len() {
+        stream.write_all(data).await?;
+        return Ok(());
+    }
+
+    stream.write_all(&data[..split]).await?;
+    stream.flush().await?;
+
+    // OOB byte between segments.
+    crate::evasion::dpi_bypass::send_oob_byte(stream, 0x00).await?;
+
+    stream.write_all(&data[split..]).await?;
+    Ok(())
 }
 
 // ── Offset computation ────────────────────────────────────────────────────────
 
-/// Compute split offset within the **full TLS record buffer** (incl. 5-byte header).
+/// Compute the split offset within the **full TLS record buffer** (incl. 5-byte header).
 fn split_offset_in_record(data: &[u8], at: SplitAt, parsed: Option<&ParsedClientHello>) -> usize {
     let max = data.len().saturating_sub(1).max(1);
     match at {
@@ -244,7 +401,7 @@ fn split_offset_in_record(data: &[u8], at: SplitAt, parsed: Option<&ParsedClient
     }
 }
 
-/// Compute split offset within the **TLS payload** (bytes after the 5-byte header).
+/// Compute the split offset within the **TLS payload** (bytes after the 5-byte header).
 fn split_offset_in_payload(data: &[u8], at: SplitAt, parsed: Option<&ParsedClientHello>) -> usize {
     if data.len() < 5 {
         return 0;
@@ -273,15 +430,33 @@ fn split_offset_in_payload(data: &[u8], at: SplitAt, parsed: Option<&ParsedClien
     }
 }
 
+/// Compute the split offset within an HTTP request for [`HttpSplitAt`].
+fn http_split_offset(data: &[u8], at: HttpSplitAt) -> usize {
+    let max = data.len().saturating_sub(1).max(1);
+    match at {
+        HttpSplitAt::Fixed(n) => n.clamp(1, max),
+        HttpSplitAt::BeforeHostHeader => {
+            // Find "\r\nHost:" (case-insensitive for the field name) and split
+            // right after the "\r\n" so the second segment starts with "Host:".
+            data.windows(7)
+                .position(|w| {
+                    w[0] == b'\r' && w[1] == b'\n' && w[2..].eq_ignore_ascii_case(b"host:")
+                })
+                .map(|pos| (pos + 2).clamp(1, max))
+                .unwrap_or(data.len() / 2)
+        }
+    }
+}
+
 // ── Default profiles ──────────────────────────────────────────────────────────
 
-/// 8 default profiles that use distinct, implemented desync techniques.
+/// Return the platform-appropriate default native desync profiles.
 ///
-/// OOB/URG variants are intentionally excluded until `WinDivert` or raw-socket
-/// support is available — including stub OOB profiles would teach the ML scorer
-/// on signals that are identical to plain splits.
+/// Every profile in this list performs genuinely distinct work so the ML scorer
+/// learns real signals rather than duplicates.  Stubs (e.g. OOB on non-Windows)
+/// are excluded via compile-time gates.
 pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
-    vec![
+    let mut profiles = vec![
         // 1. TLS record split right into the SNI extension — safest for Cloudflare.
         //    Equivalent: --tlsrec 1+s
         NativeDesyncProfile {
@@ -290,8 +465,9 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
                 at: SplitAt::IntoSni,
             },
             cloudflare_safe: true,
+            fake_probe: None,
         },
-        // 2. TLS record split before the SNI extension — SNI is entirely in the second fragment.
+        // 2. TLS record split before the SNI extension.
         //    Equivalent: --tlsrec SNI-1
         NativeDesyncProfile {
             name: "tlsrec-before-sni",
@@ -299,6 +475,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
                 at: SplitAt::BeforeSni,
             },
             cloudflare_safe: true,
+            fake_probe: None,
         },
         // 3. TCP segment split right into the SNI extension.
         //    Equivalent: --split 1+s
@@ -308,8 +485,9 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
                 at: SplitAt::IntoSni,
             },
             cloudflare_safe: true,
+            fake_probe: None,
         },
-        // 4. TLS record split through the middle of the SNI hostname — most aggressive.
+        // 4. TLS record split through the middle of the SNI hostname.
         //    Equivalent: --tlsrec mid+s
         NativeDesyncProfile {
             name: "tlsrec-mid-sni",
@@ -317,16 +495,17 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
                 at: SplitAt::MidSni,
             },
             cloudflare_safe: true,
+            fake_probe: None,
         },
-        // 5. TLS record split at a fixed deep offset (5 bytes into the payload).
-        //    Effective on ISPs that inspect only the first few bytes of the handshake.
-        //    Equivalent: --tlsrec 5+s
+        // 5. TLS record split at a fixed 5-byte offset into the payload.
+        //    Equivalent: --tlsrec 5
         NativeDesyncProfile {
             name: "tlsrec-fixed-5",
             technique: DesyncTechnique::TlsRecordSplit {
                 at: SplitAt::Fixed(5),
             },
             cloudflare_safe: true,
+            fake_probe: None,
         },
         // 6. TCP segment split before the SNI extension.
         //    Equivalent: --split before-sni
@@ -336,8 +515,9 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
                 at: SplitAt::BeforeSni,
             },
             cloudflare_safe: true,
+            fake_probe: None,
         },
-        // 7. TCP segment split at fixed byte 1 — minimal first fragment.
+        // 7. TCP segment split at fixed byte 1.
         //    Equivalent: --split 1
         NativeDesyncProfile {
             name: "split-fixed-1",
@@ -345,6 +525,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
                 at: SplitAt::Fixed(1),
             },
             cloudflare_safe: false,
+            fake_probe: None,
         },
         // 8. TCP segment split at fixed byte 3.
         //    Equivalent: --split 3
@@ -354,8 +535,90 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
                 at: SplitAt::Fixed(3),
             },
             cloudflare_safe: false,
+            fake_probe: None,
         },
-    ]
+        // 9. HTTP-level split before the Host: header — effective for port-80 DPI.
+        NativeDesyncProfile {
+            name: "http-before-host",
+            technique: DesyncTechnique::HttpSplit {
+                at: HttpSplitAt::BeforeHostHeader,
+            },
+            cloudflare_safe: true,
+            fake_probe: None,
+        },
+        // 10. TLS record split + fake low-TTL TCB probe (TTL=3).
+        //     The probe desynchronises the DPI state table before the real SYN.
+        NativeDesyncProfile {
+            name: "tlsrec-into-sni-fake-ttl3",
+            technique: DesyncTechnique::TlsRecordSplit {
+                at: SplitAt::IntoSni,
+            },
+            cloudflare_safe: true,
+            fake_probe: Some(FakeProbe {
+                ttl: 3,
+                data_size: 0,
+            }),
+        },
+        // 11. TCP segment split + fake low-TTL probe.
+        NativeDesyncProfile {
+            name: "split-into-sni-fake-ttl3",
+            technique: DesyncTechnique::TcpSegmentSplit {
+                at: SplitAt::IntoSni,
+            },
+            cloudflare_safe: true,
+            fake_probe: Some(FakeProbe {
+                ttl: 3,
+                data_size: 0,
+            }),
+        },
+    ];
+
+    // OOB/URG profiles are only included on Windows where MSG_OOB is available.
+    // On other platforms, OOB would be sent as a regular byte, which would corrupt
+    // the TLS record and fail the connection — making them identical stubs.
+    #[cfg(windows)]
+    profiles.extend([
+        // 12. TLS record split + OOB byte between fragments.
+        //     Equivalent: --tlsrec 1+s --oob
+        NativeDesyncProfile {
+            name: "tlsrec-into-sni-oob",
+            technique: DesyncTechnique::TlsRecordSplitOob {
+                at: SplitAt::IntoSni,
+            },
+            cloudflare_safe: true,
+            fake_probe: None,
+        },
+        // 13. TLS record split before SNI + OOB byte.
+        NativeDesyncProfile {
+            name: "tlsrec-before-sni-oob",
+            technique: DesyncTechnique::TlsRecordSplitOob {
+                at: SplitAt::BeforeSni,
+            },
+            cloudflare_safe: true,
+            fake_probe: None,
+        },
+        // 14. TCP segment split into SNI + OOB byte.
+        //     Equivalent: --split 1+s --oob
+        NativeDesyncProfile {
+            name: "split-into-sni-oob",
+            technique: DesyncTechnique::TcpSegmentSplitOob {
+                at: SplitAt::IntoSni,
+            },
+            cloudflare_safe: true,
+            fake_probe: None,
+        },
+        // 15. TCP segment split before SNI + OOB byte.
+        NativeDesyncProfile {
+            name: "split-before-sni-oob",
+            technique: DesyncTechnique::TcpSegmentSplitOob {
+                at: SplitAt::BeforeSni,
+            },
+            cloudflare_safe: true,
+            fake_probe: None,
+        },
+    ]);
+
+    profiles
 }
 
 #[cfg(test)]
@@ -410,17 +673,14 @@ mod tests {
         tls_record_split(&mut buf, &record, 10).await.unwrap();
 
         // Two TLS records — reassemble payload and compare
-        assert!(buf.len() > record.len()); // Should have two TLS headers now (5 extra bytes)
-                                           // Fragment 1 header
+        assert!(buf.len() > record.len()); // two TLS headers now (5 extra bytes)
         assert_eq!(buf[0], 0x16); // content type
         let len1 = u16::from_be_bytes([buf[3], buf[4]]) as usize;
         assert_eq!(len1, 10);
-        // Fragment 2 header
         let f2_start = 5 + len1;
         assert_eq!(buf[f2_start], 0x16);
         let len2 = u16::from_be_bytes([buf[f2_start + 3], buf[f2_start + 4]]) as usize;
 
-        // Reassembled payload == original payload
         let original_payload = &record[5..];
         let reassembled: Vec<u8> =
             [&buf[5..5 + len1], &buf[f2_start + 5..f2_start + 5 + len2]].concat();
@@ -442,8 +702,6 @@ mod tests {
         for i in 0..engine.profile_count() {
             let mut buf = Vec::new();
             engine.apply(i, &mut buf, &record).await.unwrap();
-            // Reassembled bytes must equal original record
-            // (TLS record split adds extra headers; extract payloads for comparison)
             assert!(!buf.is_empty(), "profile {} produced empty output", i);
         }
     }
@@ -455,5 +713,55 @@ mod tests {
         let mut buf = Vec::new();
         engine.apply(0, &mut buf, data).await.unwrap();
         assert_eq!(buf.as_slice(), data.as_ref());
+    }
+
+    #[tokio::test]
+    async fn http_split_splits_before_host_header() {
+        let engine = TcpDesyncEngine::with_default_profiles();
+        // Find the http-before-host profile index.
+        let idx = (0..engine.profile_count())
+            .find(|&i| engine.profile_name(i) == "http-before-host")
+            .expect("http-before-host profile missing");
+
+        let req = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut buf = Vec::new();
+        engine.apply(idx, &mut buf, req).await.unwrap();
+
+        // Output must equal the original request (Vec<u8> collects both writes).
+        assert_eq!(buf.as_slice(), req.as_ref());
+        // The split must be non-trivial — the first flush must not include "Host:".
+        let host_pos = buf
+            .windows(5)
+            .position(|w| w == b"Host:")
+            .expect("Host: not found");
+        assert!(host_pos > 0, "split point must be before Host:");
+    }
+
+    #[tokio::test]
+    async fn http_split_offset_finds_host_header() {
+        let req = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let off = http_split_offset(req, HttpSplitAt::BeforeHostHeader);
+        // offset should point to right after \r\n, before "Host:"
+        assert_eq!(&req[off..off + 5], b"Host:");
+    }
+
+    #[tokio::test]
+    async fn fake_probe_profiles_have_probe_set() {
+        let engine = TcpDesyncEngine::with_default_profiles();
+        let probe_profiles: Vec<&str> = (0..engine.profile_count())
+            .filter(|&i| engine.profile_fake_probe(i).is_some())
+            .map(|i| engine.profile_name(i))
+            .collect();
+        assert!(
+            !probe_profiles.is_empty(),
+            "at least one fake-probe profile expected"
+        );
+        for name in &probe_profiles {
+            assert!(
+                name.contains("fake"),
+                "fake probe profile name should contain 'fake': {}",
+                name
+            );
+        }
     }
 }
