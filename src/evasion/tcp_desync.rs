@@ -1,4 +1,7 @@
 use std::io;
+use std::time::Duration;
+
+use rand::Rng;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
@@ -27,7 +30,9 @@ pub enum HttpSplitAt {
 }
 
 /// Userspace TCP desync technique applied to TLS ClientHello or HTTP data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Note: not `Copy` because `MultiSplit` owns a `Vec`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DesyncTechnique {
     /// Send two raw TCP segments with an explicit flush between them.
     /// Equivalent to byedpi `--split`.
@@ -40,16 +45,23 @@ pub enum DesyncTechnique {
 
     /// TLS record split combined with an OOB (URG) byte between the two fragments.
     /// Equivalent to byedpi `--tlsrec ... --oob`.
-    /// Only meaningful on Windows (MSG_OOB); falls back to plain split otherwise.
+    /// Real `MSG_OOB` on Windows and Linux; falls back to plain split on other platforms.
     TlsRecordSplitOob { at: SplitAt },
 
     /// TCP segment split combined with an OOB (URG) byte at the split point.
     /// Equivalent to byedpi `--split ... --oob`.
-    /// Only meaningful on Windows (MSG_OOB); falls back to plain split otherwise.
+    /// Real `MSG_OOB` on Windows and Linux; falls back to plain split on other platforms.
     TcpSegmentSplitOob { at: SplitAt },
 
     /// Split an HTTP/1.x request into two TCP segments for DPI evasion on port 80.
     HttpSplit { at: HttpSplitAt },
+
+    /// Split data into N+1 TCP segments (one flush per split point).
+    ///
+    /// Points are resolved to absolute byte offsets at runtime using the parsed
+    /// ClientHello, deduplicated, and sorted.  Effective against DPI that
+    /// reassembles exactly 2 fragments but gives up on 3+.
+    MultiSplit { points: Vec<SplitAt> },
 }
 
 /// Optional low-TTL probe sent to the target before the real TCP connection.
@@ -76,6 +88,15 @@ pub struct NativeDesyncProfile {
     pub cloudflare_safe: bool,
     /// If `Some`, send a low-TTL probe to the target before connecting.
     pub fake_probe: Option<FakeProbe>,
+    /// If `true`, randomize the ASCII case of the SNI hostname bytes before sending
+    /// (e.g. `discord.com` → `DiScOrD.cOm`).  Defeats DPI with exact-match SNI filters.
+    pub randomize_sni_case: bool,
+    /// Milliseconds to sleep between the first and subsequent TCP segment flushes.
+    ///
+    /// Defeats DPI middleboxes that have a short reassembly timer: if the second
+    /// segment arrives after the timer expires, the DPI discards its buffer.
+    /// `None` means no intentional delay (default).
+    pub inter_fragment_delay_ms: Option<u64>,
 }
 
 /// In-process TCP desync engine — drop-in replacement for the external ciadpi pool.
@@ -96,9 +117,9 @@ impl TcpDesyncEngine {
 
     /// Build an engine with the platform-appropriate default profiles.
     ///
-    /// On Windows: TLS/TCP split, HTTP split, fake-probe, and OOB/URG profiles.
-    /// On other platforms: TLS/TCP split and HTTP split profiles only
-    /// (OOB profiles require `MSG_OOB` and are excluded to avoid stubs).
+    /// On all platforms: TLS/TCP split, HTTP split, fake-probe, multi-split,
+    /// delayed-split, and SNI-case profiles.
+    /// On Windows and Unix: additionally OOB/URG profiles using real `MSG_OOB`.
     pub fn with_default_profiles() -> Self {
         Self::new(default_native_profiles())
     }
@@ -140,10 +161,12 @@ impl TcpDesyncEngine {
             }
         };
 
+        let delay = profile.inter_fragment_delay_ms;
+
         // HTTP-split profiles handle port-80 plaintext before TLS is checked.
-        if let DesyncTechnique::HttpSplit { at } = profile.technique {
-            let split = http_split_offset(data, at);
-            tcp_segment_split(writer, data, split).await?;
+        if let DesyncTechnique::HttpSplit { at } = &profile.technique {
+            let split = http_split_offset(data, *at);
+            tcp_segment_split(writer, data, split, delay).await?;
             writer.flush().await?;
             return Ok(());
         }
@@ -156,7 +179,19 @@ impl TcpDesyncEngine {
         }
 
         let parsed = parse_client_hello(data);
-        apply_technique(writer, data, profile.technique, parsed.as_ref()).await?;
+
+        // SNI case randomization: work on an owned copy when enabled.
+        let mut data_buf: Option<Vec<u8>> = None;
+        if profile.randomize_sni_case {
+            if let Some(ref p) = parsed {
+                let mut buf = data.to_vec();
+                randomize_sni_case_bytes(&mut buf, p);
+                data_buf = Some(buf);
+            }
+        }
+        let data = data_buf.as_deref().unwrap_or(data);
+
+        apply_technique(writer, data, &profile.technique, parsed.as_ref(), delay).await?;
         writer.flush().await?;
         Ok(())
     }
@@ -164,7 +199,7 @@ impl TcpDesyncEngine {
     /// Apply the desync technique to a raw [`TcpStream`], enabling real OOB injection.
     ///
     /// For `TlsRecordSplitOob` and `TcpSegmentSplitOob` profiles this sends an
-    /// actual `MSG_OOB` byte between the two fragments (Windows only).  All other
+    /// actual `MSG_OOB` byte between the two fragments (Windows and Linux).  All other
     /// techniques behave identically to [`apply`].
     pub async fn apply_to_tcp_stream(
         &self,
@@ -181,10 +216,12 @@ impl TcpDesyncEngine {
             }
         };
 
+        let delay = profile.inter_fragment_delay_ms;
+
         // HTTP-split: plaintext evasion, no TLS check needed.
-        if let DesyncTechnique::HttpSplit { at } = profile.technique {
-            let split = http_split_offset(data, at);
-            tcp_segment_split(stream, data, split).await?;
+        if let DesyncTechnique::HttpSplit { at } = &profile.technique {
+            let split = http_split_offset(data, *at);
+            tcp_segment_split(stream, data, split, delay).await?;
             stream.flush().await?;
             return Ok(());
         }
@@ -198,18 +235,29 @@ impl TcpDesyncEngine {
 
         let parsed = parse_client_hello(data);
 
-        match profile.technique {
+        // SNI case randomization: work on an owned copy when enabled.
+        let mut data_buf: Option<Vec<u8>> = None;
+        if profile.randomize_sni_case {
+            if let Some(ref p) = parsed {
+                let mut buf = data.to_vec();
+                randomize_sni_case_bytes(&mut buf, p);
+                data_buf = Some(buf);
+            }
+        }
+        let data = data_buf.as_deref().unwrap_or(data);
+
+        match &profile.technique {
             DesyncTechnique::TlsRecordSplitOob { at } => {
-                let payload_split = split_offset_in_payload(data, at, parsed.as_ref());
-                tls_record_split_oob_real(stream, data, payload_split).await?;
+                let payload_split = split_offset_in_payload(data, *at, parsed.as_ref());
+                tls_record_split_oob_real(stream, data, payload_split, delay).await?;
             }
             DesyncTechnique::TcpSegmentSplitOob { at } => {
-                let split = split_offset_in_record(data, at, parsed.as_ref());
-                tcp_segment_split_oob_real(stream, data, split).await?;
+                let split = split_offset_in_record(data, *at, parsed.as_ref());
+                tcp_segment_split_oob_real(stream, data, split, delay).await?;
             }
             other => {
                 // Non-OOB techniques behave the same on TcpStream as on generic writers.
-                apply_technique(stream, data, other, parsed.as_ref()).await?;
+                apply_technique(stream, data, other, parsed.as_ref(), delay).await?;
             }
         }
 
@@ -224,30 +272,34 @@ impl TcpDesyncEngine {
 async fn apply_technique<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     data: &[u8],
-    technique: DesyncTechnique,
+    technique: &DesyncTechnique,
     parsed: Option<&ParsedClientHello>,
+    delay_ms: Option<u64>,
 ) -> io::Result<()> {
     match technique {
         DesyncTechnique::TcpSegmentSplit { at } => {
-            let split = split_offset_in_record(data, at, parsed);
-            tcp_segment_split(writer, data, split).await
+            let split = split_offset_in_record(data, *at, parsed);
+            tcp_segment_split(writer, data, split, delay_ms).await
         }
         DesyncTechnique::TlsRecordSplit { at } => {
-            let payload_split = split_offset_in_payload(data, at, parsed);
-            tls_record_split(writer, data, payload_split).await
+            let payload_split = split_offset_in_payload(data, *at, parsed);
+            tls_record_split(writer, data, payload_split, delay_ms).await
         }
         // OOB fallback to plain split when no raw socket is available.
         DesyncTechnique::TlsRecordSplitOob { at } => {
-            let payload_split = split_offset_in_payload(data, at, parsed);
-            tls_record_split(writer, data, payload_split).await
+            let payload_split = split_offset_in_payload(data, *at, parsed);
+            tls_record_split(writer, data, payload_split, delay_ms).await
         }
         DesyncTechnique::TcpSegmentSplitOob { at } => {
-            let split = split_offset_in_record(data, at, parsed);
-            tcp_segment_split(writer, data, split).await
+            let split = split_offset_in_record(data, *at, parsed);
+            tcp_segment_split(writer, data, split, delay_ms).await
         }
         DesyncTechnique::HttpSplit { at } => {
-            let split = http_split_offset(data, at);
-            tcp_segment_split(writer, data, split).await
+            let split = http_split_offset(data, *at);
+            tcp_segment_split(writer, data, split, delay_ms).await
+        }
+        DesyncTechnique::MultiSplit { points } => {
+            multi_tcp_segment_split(writer, data, points, parsed, delay_ms).await
         }
     }
 }
@@ -255,10 +307,14 @@ async fn apply_technique<W: AsyncWriteExt + Unpin>(
 // ── Core primitives ──────────────────────────────────────────────────────────
 
 /// Send data as two TCP segments separated by an explicit flush.
+///
+/// `delay_ms`: optional sleep between the flush and the second write, to defeat
+/// DPI middleboxes with short reassembly timers.
 async fn tcp_segment_split<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     data: &[u8],
     split: usize,
+    delay_ms: Option<u64>,
 ) -> io::Result<()> {
     if split == 0 || split >= data.len() {
         writer.write_all(data).await?;
@@ -266,6 +322,9 @@ async fn tcp_segment_split<W: AsyncWriteExt + Unpin>(
     }
     writer.write_all(&data[..split]).await?;
     writer.flush().await?;
+    if let Some(ms) = delay_ms {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
     writer.write_all(&data[split..]).await?;
     Ok(())
 }
@@ -273,11 +332,12 @@ async fn tcp_segment_split<W: AsyncWriteExt + Unpin>(
 /// Reconstruct the TLS record as two separate TLS records.
 ///
 /// `payload_split` is the split offset *within the TLS payload* (bytes after the 5-byte
-/// TLS record header).
+/// TLS record header).  `delay_ms` is an optional inter-fragment sleep.
 async fn tls_record_split<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     record: &[u8],
     payload_split: usize,
+    delay_ms: Option<u64>,
 ) -> io::Result<()> {
     if record.len() < 5 || payload_split == 0 {
         writer.write_all(record).await?;
@@ -301,6 +361,10 @@ async fn tls_record_split<W: AsyncWriteExt + Unpin>(
     writer.write_all(&payload[..payload_split]).await?;
     writer.flush().await?;
 
+    if let Some(ms) = delay_ms {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+
     // Fragment 2: TLS record header + remainder of payload.
     let rem = payload.len() - payload_split;
     let len2 = (rem as u16).to_be_bytes();
@@ -311,6 +375,48 @@ async fn tls_record_split<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+/// Split data into N+1 TCP segments with explicit flushes between each.
+///
+/// Split points are resolved from [`SplitAt`] to absolute byte offsets in `data`,
+/// sorted, and deduplicated.  Effective against DPI that reassembles exactly
+/// 2 fragments but gives up on 3 or more.
+async fn multi_tcp_segment_split<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+    points: &[SplitAt],
+    parsed: Option<&ParsedClientHello>,
+    delay_ms: Option<u64>,
+) -> io::Result<()> {
+    let mut offsets: Vec<usize> = points
+        .iter()
+        .map(|&at| split_offset_in_record(data, at, parsed))
+        .filter(|&off| off > 0 && off < data.len())
+        .collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+
+    if offsets.is_empty() {
+        writer.write_all(data).await?;
+        return Ok(());
+    }
+
+    let mut prev = 0usize;
+    for &off in &offsets {
+        if off > prev {
+            writer.write_all(&data[prev..off]).await?;
+            writer.flush().await?;
+            if let Some(ms) = delay_ms {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
+            prev = off;
+        }
+    }
+    if prev < data.len() {
+        writer.write_all(&data[prev..]).await?;
+    }
+    Ok(())
+}
+
 /// TLS record split with a real OOB byte injected between the two fragments.
 ///
 /// Requires a raw `TcpStream` for `MSG_OOB` access.
@@ -318,6 +424,7 @@ async fn tls_record_split_oob_real(
     stream: &mut TcpStream,
     record: &[u8],
     payload_split: usize,
+    delay_ms: Option<u64>,
 ) -> io::Result<()> {
     if record.len() < 5 || payload_split == 0 {
         stream.write_all(record).await?;
@@ -341,6 +448,10 @@ async fn tls_record_split_oob_real(
     stream.write_all(&payload[..payload_split]).await?;
     stream.flush().await?;
 
+    if let Some(ms) = delay_ms {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+
     // OOB byte between fragments — confuses DPI reassembly.
     crate::evasion::dpi_bypass::send_oob_byte(stream, 0x00).await?;
 
@@ -359,6 +470,7 @@ async fn tcp_segment_split_oob_real(
     stream: &mut TcpStream,
     data: &[u8],
     split: usize,
+    delay_ms: Option<u64>,
 ) -> io::Result<()> {
     if split == 0 || split >= data.len() {
         stream.write_all(data).await?;
@@ -368,11 +480,43 @@ async fn tcp_segment_split_oob_real(
     stream.write_all(&data[..split]).await?;
     stream.flush().await?;
 
+    if let Some(ms) = delay_ms {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+
     // OOB byte between segments.
     crate::evasion::dpi_bypass::send_oob_byte(stream, 0x00).await?;
 
     stream.write_all(&data[split..]).await?;
     Ok(())
+}
+
+// ── SNI case randomization ────────────────────────────────────────────────────
+
+/// Randomize the ASCII case of the SNI hostname bytes in place.
+///
+/// Modifies `record` at the byte range `[sni_hostname_offset, sni_hostname_offset + len)`.
+/// Alphabetic bytes are randomly uppercased or lowercased; non-alpha bytes (dots, hyphens)
+/// are left unchanged.  The TLS record remains structurally valid because only payload
+/// values change, not lengths.
+fn randomize_sni_case_bytes(record: &mut [u8], parsed: &ParsedClientHello) {
+    let Some(offset) = parsed.sni_hostname_offset else {
+        return;
+    };
+    let end = offset + parsed.sni_hostname_len;
+    if end > record.len() {
+        return;
+    }
+    let mut rng = rand::thread_rng();
+    for byte in &mut record[offset..end] {
+        if byte.is_ascii_alphabetic() {
+            if rng.gen::<bool>() {
+                *byte = byte.to_ascii_uppercase();
+            } else {
+                *byte = byte.to_ascii_lowercase();
+            }
+        }
+    }
 }
 
 // ── Offset computation ────────────────────────────────────────────────────────
@@ -453,8 +597,8 @@ fn http_split_offset(data: &[u8], at: HttpSplitAt) -> usize {
 /// Return the platform-appropriate default native desync profiles.
 ///
 /// Every profile in this list performs genuinely distinct work so the ML scorer
-/// learns real signals rather than duplicates.  Stubs (e.g. OOB on non-Windows)
-/// are excluded via compile-time gates.
+/// learns real signals rather than duplicates.  Stubs are excluded via compile-time
+/// gates (OOB profiles require `MSG_OOB`, available on Windows and Unix).
 pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
     let mut profiles = vec![
         // 1. TLS record split right into the SNI extension — safest for Cloudflare.
@@ -466,6 +610,8 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: true,
             fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
         },
         // 2. TLS record split before the SNI extension.
         //    Equivalent: --tlsrec SNI-1
@@ -476,6 +622,8 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: true,
             fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
         },
         // 3. TCP segment split right into the SNI extension.
         //    Equivalent: --split 1+s
@@ -486,6 +634,8 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: true,
             fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
         },
         // 4. TLS record split through the middle of the SNI hostname.
         //    Equivalent: --tlsrec mid+s
@@ -496,6 +646,8 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: true,
             fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
         },
         // 5. TLS record split at a fixed 5-byte offset into the payload.
         //    Equivalent: --tlsrec 5
@@ -506,6 +658,8 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: true,
             fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
         },
         // 6. TCP segment split before the SNI extension.
         //    Equivalent: --split before-sni
@@ -516,6 +670,8 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: true,
             fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
         },
         // 7. TCP segment split at fixed byte 1.
         //    Equivalent: --split 1
@@ -526,6 +682,8 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: false,
             fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
         },
         // 8. TCP segment split at fixed byte 3.
         //    Equivalent: --split 3
@@ -536,6 +694,8 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: false,
             fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
         },
         // 9. HTTP-level split before the Host: header — effective for port-80 DPI.
         NativeDesyncProfile {
@@ -545,6 +705,8 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: true,
             fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
         },
         // 10. TLS record split + fake low-TTL TCB probe (TTL=3).
         //     The probe desynchronises the DPI state table before the real SYN.
@@ -558,6 +720,8 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
                 ttl: 3,
                 data_size: 0,
             }),
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
         },
         // 11. TCP segment split + fake low-TTL probe.
         NativeDesyncProfile {
@@ -570,15 +734,92 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
                 ttl: 3,
                 data_size: 0,
             }),
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
+        },
+        // 12. Multi-split across the SNI region (3 split points → 4 segments).
+        //     Targets DPI that reassembles exactly 2 fragments but gives up on 3+.
+        NativeDesyncProfile {
+            name: "multi-split-sni-region",
+            technique: DesyncTechnique::MultiSplit {
+                points: vec![SplitAt::BeforeSni, SplitAt::IntoSni, SplitAt::MidSni],
+            },
+            cloudflare_safe: true,
+            fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
+        },
+        // 13. Multi-split with fixed offsets (4 split points → 5 segments).
+        //     Confuses DPI doing offset-based packet inspection.
+        NativeDesyncProfile {
+            name: "multi-split-fixed",
+            technique: DesyncTechnique::MultiSplit {
+                points: vec![
+                    SplitAt::Fixed(1),
+                    SplitAt::Fixed(2),
+                    SplitAt::BeforeSni,
+                    SplitAt::IntoSni,
+                ],
+            },
+            cloudflare_safe: true,
+            fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
+        },
+        // 14. TCP split + 100 ms inter-fragment delay.
+        //     Defeats DPI with short reassembly timers that discard incomplete buffers.
+        NativeDesyncProfile {
+            name: "split-into-sni-delay-100",
+            technique: DesyncTechnique::TcpSegmentSplit {
+                at: SplitAt::IntoSni,
+            },
+            cloudflare_safe: true,
+            fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: Some(100),
+        },
+        // 15. TLS record split + 250 ms inter-fragment delay.
+        NativeDesyncProfile {
+            name: "tlsrec-into-sni-delay-250",
+            technique: DesyncTechnique::TlsRecordSplit {
+                at: SplitAt::IntoSni,
+            },
+            cloudflare_safe: true,
+            fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: Some(250),
+        },
+        // 16. TCP split + SNI case randomization.
+        //     Defeats DPI with exact-match SNI string filters (e.g. "discord.com").
+        NativeDesyncProfile {
+            name: "split-into-sni-case-rand",
+            technique: DesyncTechnique::TcpSegmentSplit {
+                at: SplitAt::IntoSni,
+            },
+            cloudflare_safe: true,
+            fake_probe: None,
+            randomize_sni_case: true,
+            inter_fragment_delay_ms: None,
+        },
+        // 17. TLS record split + SNI case randomization.
+        NativeDesyncProfile {
+            name: "tlsrec-into-sni-case-rand",
+            technique: DesyncTechnique::TlsRecordSplit {
+                at: SplitAt::IntoSni,
+            },
+            cloudflare_safe: true,
+            fake_probe: None,
+            randomize_sni_case: true,
+            inter_fragment_delay_ms: None,
         },
     ];
 
-    // OOB/URG profiles are only included on Windows where MSG_OOB is available.
-    // On other platforms, OOB would be sent as a regular byte, which would corrupt
-    // the TLS record and fail the connection — making them identical stubs.
-    #[cfg(windows)]
+    // OOB/URG profiles require real MSG_OOB support.
+    // On Windows: available via WinSock.
+    // On Unix (Linux, macOS): available via libc::send with MSG_OOB.
+    #[cfg(any(windows, unix))]
     profiles.extend([
-        // 12. TLS record split + OOB byte between fragments.
+        // 18. TLS record split + OOB byte between fragments.
         //     Equivalent: --tlsrec 1+s --oob
         NativeDesyncProfile {
             name: "tlsrec-into-sni-oob",
@@ -587,8 +828,10 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: true,
             fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
         },
-        // 13. TLS record split before SNI + OOB byte.
+        // 19. TLS record split before SNI + OOB byte.
         NativeDesyncProfile {
             name: "tlsrec-before-sni-oob",
             technique: DesyncTechnique::TlsRecordSplitOob {
@@ -596,8 +839,10 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: true,
             fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
         },
-        // 14. TCP segment split into SNI + OOB byte.
+        // 20. TCP segment split into SNI + OOB byte.
         //     Equivalent: --split 1+s --oob
         NativeDesyncProfile {
             name: "split-into-sni-oob",
@@ -606,8 +851,10 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: true,
             fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
         },
-        // 15. TCP segment split before SNI + OOB byte.
+        // 21. TCP segment split before SNI + OOB byte.
         NativeDesyncProfile {
             name: "split-before-sni-oob",
             technique: DesyncTechnique::TcpSegmentSplitOob {
@@ -615,6 +862,8 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             },
             cloudflare_safe: true,
             fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
         },
     ]);
 
@@ -670,7 +919,7 @@ mod tests {
         let mut buf = Vec::new();
         let _parsed = parse_client_hello(&record);
         // Split at payload offset 10
-        tls_record_split(&mut buf, &record, 10).await.unwrap();
+        tls_record_split(&mut buf, &record, 10, None).await.unwrap();
 
         // Two TLS records — reassemble payload and compare
         assert!(buf.len() > record.len()); // two TLS headers now (5 extra bytes)
@@ -691,7 +940,9 @@ mod tests {
     async fn tcp_segment_split_preserves_data() {
         let record = build_tls_record("example.com");
         let mut buf = Vec::new();
-        tcp_segment_split(&mut buf, &record, 20).await.unwrap();
+        tcp_segment_split(&mut buf, &record, 20, None)
+            .await
+            .unwrap();
         assert_eq!(buf, record);
     }
 
@@ -718,7 +969,6 @@ mod tests {
     #[tokio::test]
     async fn http_split_splits_before_host_header() {
         let engine = TcpDesyncEngine::with_default_profiles();
-        // Find the http-before-host profile index.
         let idx = (0..engine.profile_count())
             .find(|&i| engine.profile_name(i) == "http-before-host")
             .expect("http-before-host profile missing");
@@ -763,5 +1013,80 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[tokio::test]
+    async fn multi_split_sni_region_produces_non_empty_output() {
+        let engine = TcpDesyncEngine::with_default_profiles();
+        let idx = (0..engine.profile_count())
+            .find(|&i| engine.profile_name(i) == "multi-split-sni-region")
+            .expect("multi-split-sni-region profile missing");
+
+        let record = build_tls_record("discord.com");
+        let mut buf = Vec::new();
+        engine.apply(idx, &mut buf, &record).await.unwrap();
+        assert_eq!(
+            buf, record,
+            "multi-split output must reconstruct original data"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_split_preserves_all_data() {
+        let record = build_tls_record("youtube.com");
+        let parsed = parse_client_hello(&record);
+        let points = vec![SplitAt::BeforeSni, SplitAt::IntoSni, SplitAt::MidSni];
+        let mut buf = Vec::new();
+        multi_tcp_segment_split(&mut buf, &record, &points, parsed.as_ref(), None)
+            .await
+            .unwrap();
+        assert_eq!(buf, record);
+    }
+
+    #[tokio::test]
+    async fn sni_case_randomization_changes_hostname_bytes() {
+        let record = build_tls_record("discord.com");
+        let parsed = parse_client_hello(&record).expect("should parse");
+        let offset = parsed.sni_hostname_offset.expect("hostname offset");
+        let len = parsed.sni_hostname_len;
+
+        let mut modified = record.clone();
+        randomize_sni_case_bytes(&mut modified, &parsed);
+
+        // The hostname bytes should be changed (case-randomized).
+        let orig_host = &record[offset..offset + len];
+        let new_host = &modified[offset..offset + len];
+        // Both must be equal when lowercased (same hostname, different case).
+        assert_eq!(
+            orig_host.to_ascii_lowercase(),
+            new_host.to_ascii_lowercase(),
+            "hostname content must be preserved after case randomization"
+        );
+        // The rest of the record (non-hostname bytes) must be unchanged.
+        assert_eq!(&record[..offset], &modified[..offset]);
+        assert_eq!(&record[offset + len..], &modified[offset + len..]);
+    }
+
+    #[tokio::test]
+    async fn sni_case_profile_applies_correctly() {
+        let engine = TcpDesyncEngine::with_default_profiles();
+        let idx = (0..engine.profile_count())
+            .find(|&i| engine.profile_name(i) == "split-into-sni-case-rand")
+            .expect("split-into-sni-case-rand profile missing");
+
+        let record = build_tls_record("discord.com");
+        let mut buf = Vec::new();
+        engine.apply(idx, &mut buf, &record).await.unwrap();
+        // Output data must contain the same bytes as original (modulo case).
+        assert_eq!(
+            buf.len(),
+            record.len(),
+            "case randomization must not change record length"
+        );
+        assert_eq!(
+            buf.to_ascii_lowercase(),
+            record.to_ascii_lowercase(),
+            "lowercased output must equal lowercased input"
+        );
     }
 }

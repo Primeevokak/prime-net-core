@@ -147,12 +147,16 @@ impl DpiBypassExt for TcpStream {
 
 /// Send a single byte to `stream` with the OOB/URG flag set.
 ///
-/// On Windows, uses `MSG_OOB` via `WinSock::send`.  On other platforms, sends
-/// the byte as a regular byte (OOB profiles should not be included in
-/// `default_native_profiles()` on non-Windows targets).
+/// On Windows, uses `MSG_OOB` via `WinSock::send`.
+/// On Unix (Linux, macOS), uses `libc::send` with `MSG_OOB`.
+/// On other platforms, falls back to sending the byte normally (connection remains valid
+/// but without the URG signal; OOB profiles should not be included on such platforms).
 ///
 /// # Safety (Windows path)
 /// `sock` is a valid Windows socket handle obtained from the live `TcpStream`.
+///
+/// # Safety (Unix path)
+/// `fd` is a valid Unix file descriptor obtained from the live `TcpStream`.
 pub(crate) async fn send_oob_byte(stream: &mut TcpStream, byte: u8) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -171,7 +175,23 @@ pub(crate) async fn send_oob_byte(stream: &mut TcpStream, byte: u8) -> std::io::
         }
         Ok(())
     }
-    #[cfg(not(windows))]
+    #[cfg(all(unix, not(windows)))]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = stream.as_raw_fd();
+        let buf = [byte];
+        // SAFETY: fd is a valid file descriptor for this live TcpStream.
+        // buf is a valid 1-byte readable buffer that outlives the send() call.
+        unsafe {
+            let res = libc::send(fd, buf.as_ptr() as *const libc::c_void, 1, libc::MSG_OOB);
+            if res == -1 {
+                // Fallback: send as a normal byte so the connection is not broken.
+                stream.write_all(&buf).await?;
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(any(windows, unix)))]
     stream.write_all(&[byte]).await
 }
 
@@ -196,6 +216,7 @@ pub(crate) async fn write_oob_at(
 
         let sock = stream.as_raw_socket() as SOCKET;
         let byte_to_send = data[cut];
+        // SAFETY: sock is valid for this TcpStream; byte_to_send is on the stack.
         unsafe {
             let res = send(sock, &byte_to_send as *const u8, 1, MSG_OOB);
             if res == -1 {
@@ -203,7 +224,25 @@ pub(crate) async fn write_oob_at(
             }
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(all(unix, not(windows)))]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = stream.as_raw_fd();
+        let byte_to_send = data[cut];
+        // SAFETY: fd is valid for this TcpStream; byte_to_send is on the stack.
+        unsafe {
+            let res = libc::send(
+                fd,
+                &byte_to_send as *const u8 as *const libc::c_void,
+                1,
+                libc::MSG_OOB,
+            );
+            if res == -1 {
+                stream.write_all(&[byte_to_send]).await?;
+            }
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
     {
         stream.write_all(&[data[cut]]).await?;
     }

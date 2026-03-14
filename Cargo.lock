@@ -2850,7 +2850,7 @@ dependencies = [
 
 [[package]]
 name = "prime-net-engine"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "arboard",
  "assert_cmd",
@@ -2871,6 +2871,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.8.1",
  "hyper-util",
+ "libc",
  "mockito",
  "once_cell",
  "parking_lot",
