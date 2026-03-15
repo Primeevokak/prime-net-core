@@ -113,7 +113,14 @@ pub async fn connect_via_best_route(
                     // Send a fake low-TTL probe to desync the DPI's TCP state table.
                     if let Some(probe) = engine.profile_fake_probe(profile_idx) {
                         if let Ok(addr) = direct.resolve_target_ip(&t).await {
-                            if probe.data_size == 0 {
+                            if let Some(sni) = probe.fake_sni {
+                                // Crafted TLS ClientHello probe — DPI parses the fake SNI
+                                // then loses state when the probe expires (low TTL).
+                                let _ = crate::evasion::dpi_bypass::send_fake_sni_probe(
+                                    addr, probe.ttl, sni,
+                                )
+                                .await;
+                            } else if probe.data_size == 0 {
                                 let _ = crate::evasion::dpi_bypass::send_tcb_desync_probe(
                                     addr, probe.ttl,
                                 )
@@ -352,6 +359,18 @@ pub async fn handle_socks5_request_with_target(
         select_route_candidates(&relay_opts, &target.addr, target.port, &target_label, &cfg)
     };
 
+    // Capture native profile indices from the first race for retry logic.
+    let tried_native_indices: Vec<u8> = candidates
+        .iter()
+        .filter(|c| c.kind == RouteKind::Native)
+        .map(|c| c.bypass_profile_idx)
+        .collect();
+    let target_family = route_family_for_target(&target.addr);
+
+    // Clone outbound and icd before moving — needed if a retry race is required.
+    let outbound_clone = outbound.clone();
+    let icd_clone = icd.clone();
+
     let route_res = connect_via_best_route(
         conn_id,
         target,
@@ -363,6 +382,44 @@ pub async fn handle_socks5_request_with_target(
         icd,
     )
     .await;
+
+    // If the first race failed and the domain is not pinned to a specific native profile,
+    // retry with any native profiles that were not included in the initial race.
+    let route_res = if route_res.is_err()
+        && !destination_has_native_pin(&target_label, &cfg)
+        && !tried_native_indices.is_empty()
+    {
+        let retry_cands =
+            build_native_retry_candidates(&tried_native_indices, &relay_opts, target_family);
+        if !retry_cands.is_empty() {
+            info!(
+                conn_id,
+                remaining = retry_cands.len(),
+                "first race failed — retrying with {} unused native profile(s)",
+                retry_cands.len()
+            );
+            let retry = connect_via_best_route(
+                conn_id,
+                target,
+                &target_label,
+                retry_cands,
+                outbound_clone,
+                &relay_opts,
+                &cfg,
+                icd_clone,
+            )
+            .await;
+            if retry.is_ok() {
+                retry
+            } else {
+                route_res
+            }
+        } else {
+            route_res
+        }
+    } else {
+        route_res
+    };
 
     match route_res {
         Ok(route) => {

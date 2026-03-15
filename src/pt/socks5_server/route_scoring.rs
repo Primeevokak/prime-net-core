@@ -290,6 +290,12 @@ pub fn select_route_candidates(
     let is_blocked = is_censored_domain(destination, relay_opts, cfg);
     let family = route_family_for_target(target);
 
+    // Native profile pin: skip ML and return exactly the configured profile.
+    if let Some(pinned) = select_native_pinned_candidate(destination, relay_opts, cfg, family) {
+        out.push(pinned);
+        return out;
+    }
+
     if port == 443 || port == 80 || port == 6443 || (5000..=9000).contains(&port) {
         let bypass_cands = select_bypass_candidates(relay_opts, destination, cfg);
         let native_cands = select_native_candidates(relay_opts);
@@ -350,6 +356,91 @@ pub fn select_route_candidates(
         out.push(RouteCandidate::direct_with_family("adaptive", family));
     }
     out
+}
+
+/// If `destination` has a `"native:profile_name"` entry in `domain_profiles`, return a
+/// pinned [`RouteCandidate`] for exactly that profile, bypassing ML candidate selection.
+///
+/// Accepts both `"native:profile_name"` (resolved by name) and `"native:N"` (1-based index).
+/// Returns `None` if there is no native pin for this destination, or the engine / profile is
+/// unavailable.
+fn select_native_pinned_candidate(
+    destination: &str,
+    relay_opts: &RelayOptions,
+    cfg: &EngineConfig,
+    family: RouteIpFamily,
+) -> Option<RouteCandidate> {
+    let host = destination
+        .split(':')
+        .next()
+        .unwrap_or(destination)
+        .to_ascii_lowercase();
+
+    for (domain, arm) in &cfg.routing.domain_profiles {
+        let domain = domain.trim().to_ascii_lowercase();
+        if host != domain && !host.ends_with(&format!(".{domain}")) {
+            continue;
+        }
+        let arm = arm.trim();
+        let profile_spec = arm.strip_prefix("native:")?;
+        let engine = relay_opts.native_bypass.as_ref()?;
+        let total = engine.profile_count() as u8;
+
+        // Resolve by profile name first, then by 1-based numeric index.
+        let idx = (0..engine.profile_count())
+            .find(|&i| engine.profile_name(i) == profile_spec)
+            .or_else(|| {
+                profile_spec.parse::<usize>().ok().and_then(|n| {
+                    let i = n.saturating_sub(1);
+                    (i < engine.profile_count()).then_some(i)
+                })
+            })?;
+
+        return Some(RouteCandidate {
+            score: 1000,
+            ..RouteCandidate::native_with_family("pinned", idx as u8, total, family)
+        });
+    }
+    None
+}
+
+/// Build retry candidates from native profiles that were NOT included in the first race.
+///
+/// Called after a route race fails entirely.  Returns up to all remaining native profiles
+/// as candidates so the caller can attempt a second pass without a full re-race.
+pub fn build_native_retry_candidates(
+    tried_native_indices: &[u8],
+    relay_opts: &RelayOptions,
+    family: RouteIpFamily,
+) -> Vec<RouteCandidate> {
+    let engine = match relay_opts.native_bypass.as_ref() {
+        Some(e) => e,
+        None => return Vec::new(),
+    };
+    let tried: std::collections::HashSet<u8> = tried_native_indices.iter().copied().collect();
+    let total = engine.profile_count() as u8;
+    (0..total)
+        .filter(|&i| !tried.contains(&i))
+        .map(|i| RouteCandidate {
+            score: 500,
+            ..RouteCandidate::native_with_family("retry", i, total, family)
+        })
+        .collect()
+}
+
+/// Returns `true` if `destination` has an explicit `"native:..."` pin in `domain_profiles`.
+/// Used to suppress automatic profile retries for pinned domains.
+pub fn destination_has_native_pin(destination: &str, cfg: &EngineConfig) -> bool {
+    let host = destination
+        .split(':')
+        .next()
+        .unwrap_or(destination)
+        .to_ascii_lowercase();
+    cfg.routing.domain_profiles.iter().any(|(domain, arm)| {
+        let domain = domain.trim().to_ascii_lowercase();
+        (host == domain || host.ends_with(&format!(".{domain}")))
+            && arm.trim().starts_with("native:")
+    })
 }
 
 pub fn host_service_bucket(host: &str, cfg: &EngineConfig) -> String {

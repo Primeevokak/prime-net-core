@@ -405,10 +405,19 @@ impl EngineConfig {
                     "routing.domain_profiles[{domain}]: route arm must not be empty"
                 )));
             }
-            if arm != "direct" && !arm.starts_with("bypass:") {
+            if arm != "direct" && !arm.starts_with("bypass:") && !arm.starts_with("native:") {
                 return Err(EngineError::Config(format!(
-                    "routing.domain_profiles[{domain}]: invalid route arm '{arm}'; must be 'direct' or 'bypass:N'"
+                    "routing.domain_profiles[{domain}]: invalid route arm '{arm}'; \
+                     must be 'direct', 'bypass:N', or 'native:profile_name'"
                 )));
+            }
+            if let Some(spec) = arm.strip_prefix("native:") {
+                if spec.trim().is_empty() {
+                    return Err(EngineError::Config(format!(
+                        "routing.domain_profiles[{domain}]: 'native:' must be followed \
+                         by a profile name or 1-based index"
+                    )));
+                }
             }
         }
         Ok(())

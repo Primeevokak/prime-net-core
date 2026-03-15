@@ -289,6 +289,105 @@ pub(crate) async fn send_fake_payload_probe(
     Ok(())
 }
 
+/// Send a low-TTL probe containing a crafted TLS ClientHello with `fake_sni` to desync DPI.
+///
+/// Unlike [`send_fake_payload_probe`] (which sends random bytes), this probe sends a
+/// structurally valid TLS 1.3 ClientHello.  DPI that reassembles TCP and parses TLS will
+/// extract the fake SNI, create state for it, and then lose sync when the low TTL causes
+/// the probe to expire before reaching the server.  The subsequent real ClientHello (on a
+/// different TCP 4-tuple) arrives into a confused DPI state.
+///
+/// Best-effort: errors are ignored by callers.
+pub(crate) async fn send_fake_sni_probe(
+    addr: SocketAddr,
+    ttl: u8,
+    fake_sni: &str,
+) -> std::io::Result<()> {
+    let payload = build_fake_client_hello(fake_sni);
+    if let Ok(Ok(mut probe)) =
+        tokio::time::timeout(Duration::from_millis(200), TcpStream::connect(addr)).await
+    {
+        let _ = probe.set_ttl(u32::from(ttl.max(1)));
+        let _ = probe.write_all(&payload).await;
+        let _ = probe.shutdown().await;
+    }
+    Ok(())
+}
+
+/// Build a minimal but structurally valid TLS 1.3 ClientHello record for the given SNI.
+///
+/// The resulting bytes form a complete TLS record that DPI can parse as a real ClientHello.
+/// Fields: version=TLS 1.2 compat, random=zeroed (probe only), one cipher suite
+/// (TLS_AES_128_GCM_SHA256), null compression, and a single SNI extension.
+fn build_fake_client_hello(sni: &str) -> Vec<u8> {
+    let sni_bytes = sni.as_bytes();
+    let sni_len = sni_bytes.len();
+
+    // SNI extension data layout:
+    //   server_name_list_len  (2 bytes)
+    //   server_name_type      (1 byte  = 0x00 host_name)
+    //   server_name_len       (2 bytes)
+    //   server_name           (sni_len bytes)
+    let sni_list_len = 3 + sni_len;
+    let sni_ext_data_len = 2 + sni_list_len; // list_len field + list
+
+    // Full extension wire encoding: type(2) + data_len(2) + data
+    let sni_ext_wire_len = 4 + sni_ext_data_len;
+
+    // ClientHello body (everything after the handshake type+length):
+    //   client_version     2
+    //   random            32
+    //   session_id_len     1  (= 0)
+    //   cipher_suites_len  2  (= 4, two ciphers × 2 bytes each)
+    //   cipher_suites      4
+    //   comp_methods_len   1  (= 1)
+    //   comp_methods       1  (= 0x00)
+    //   extensions_len     2
+    //   extensions         sni_ext_wire_len
+    let ch_body_len = 2 + 32 + 1 + 2 + 4 + 1 + 1 + 2 + sni_ext_wire_len;
+
+    // Handshake message = type(1) + length(3) + body
+    let hs_msg_len = 4 + ch_body_len;
+
+    // TLS record = record_header(5) + handshake_message
+    let mut buf = Vec::with_capacity(5 + hs_msg_len);
+
+    // TLS record header
+    buf.extend_from_slice(&[0x16, 0x03, 0x01]); // Handshake, TLS 1.0 wire version
+    buf.extend_from_slice(&(hs_msg_len as u16).to_be_bytes());
+
+    // Handshake header: ClientHello type = 0x01, length in 3 bytes
+    buf.push(0x01);
+    buf.extend_from_slice(&[
+        (ch_body_len >> 16) as u8,
+        (ch_body_len >> 8) as u8,
+        ch_body_len as u8,
+    ]);
+
+    // client_version: TLS 1.2 (0x0303) for maximum DPI recognition
+    buf.extend_from_slice(&[0x03, 0x03]);
+    // random: 32 zero bytes (probe — not a real handshake)
+    buf.extend_from_slice(&[0u8; 32]);
+    // session_id: empty
+    buf.push(0x00);
+    // cipher_suites: TLS_AES_128_GCM_SHA256 + TLS_AES_256_GCM_SHA384
+    buf.extend_from_slice(&[0x00, 0x04, 0x13, 0x01, 0x13, 0x02]);
+    // compression_methods: null only
+    buf.extend_from_slice(&[0x01, 0x00]);
+    // extensions_len
+    buf.extend_from_slice(&(sni_ext_wire_len as u16).to_be_bytes());
+
+    // SNI extension
+    buf.extend_from_slice(&[0x00, 0x00]); // extension type: server_name
+    buf.extend_from_slice(&(sni_ext_data_len as u16).to_be_bytes());
+    buf.extend_from_slice(&(sni_list_len as u16).to_be_bytes());
+    buf.push(0x00); // name_type: host_name
+    buf.extend_from_slice(&(sni_len as u16).to_be_bytes());
+    buf.extend_from_slice(sni_bytes);
+
+    buf
+}
+
 async fn write_split_prefix(
     stream: &mut TcpStream,
     data: &[u8],

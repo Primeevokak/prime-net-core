@@ -7,8 +7,12 @@ use tracing::debug;
 use crate::anticensorship::ResolverChain;
 use crate::config::EngineConfig;
 use crate::error::Result;
+use crate::evasion::quic_initial::{parse_quic_initial_header, send_fake_quic_initial};
 use crate::pt::socks5_server::route_scoring::is_censored_domain;
 use crate::pt::socks5_server::state_and_startup::RelayOptions;
+
+/// IP TTL for fake QUIC Initial probes (should expire before reaching the server).
+const FAKE_QUIC_TTL: u8 = 3;
 
 pub async fn handle_udp_associate(
     conn_id: u64,
@@ -143,14 +147,25 @@ async fn handle_client_to_remote(
             let domain = String::from_utf8_lossy(&data[5..5 + len]);
             let port = u16::from_be_bytes([data[5 + len], data[5 + len + 1]]);
 
-            // Block QUIC for any censored domain so the client falls back to TCP,
-            // where DPI-bypass profiles (Bypass/Native) can handle it.
+            // For censored domains on port 443:
+            // - With native evasion active: let the packet through; the QUIC
+            //   Initial desync (fake Initial injection below) handles evasion.
+            // - Without native evasion: hard-block so the client falls back to
+            //   TCP where Bypass profiles handle it.
             if port == 443 && is_censored_domain(&domain, relay_opts, cfg) {
+                if relay_opts.native_bypass.is_none() {
+                    debug!(
+                        conn_id,
+                        "blocking QUIC to censored domain {} — no native bypass, forcing TCP fallback",
+                        domain
+                    );
+                    return Ok(None);
+                }
                 debug!(
                     conn_id,
-                    "blocking QUIC to censored domain {} — forcing TCP fallback", domain
+                    domain = %domain,
+                    "censored domain with native bypass: applying QUIC Initial desync"
                 );
-                return Ok(None);
             }
 
             // ANTI-LEAK: Use encrypted resolver instead of system lookup_host
@@ -183,6 +198,23 @@ async fn handle_client_to_remote(
     };
 
     let payload = &data[header_len..];
+
+    // QUIC Initial desync: for port-443 UDP, inject a fake Initial with a
+    // decoy SNI before forwarding the real packet.  The fake uses the same DCID
+    // so DPI derives the same keys and parses the fake's CRYPTO frame, recording
+    // the decoy SNI.  The real packet follows immediately; DPI state is confused.
+    // This replaces the hard block for censored domains with an active bypass.
+    if target_addr.port() == 443 && relay_opts.native_bypass.is_some() {
+        if let Some(hdr) = parse_quic_initial_header(payload) {
+            // Fire-and-forget: fake arrives slightly before real due to async scheduling.
+            let target = target_addr;
+            let dcid = hdr.dcid.clone();
+            tokio::spawn(async move {
+                send_fake_quic_initial(target, &dcid, "www.google.com", FAKE_QUIC_TTL).await;
+            });
+        }
+    }
+
     socket.send_to(payload, target_addr).await?;
     Ok(Some(target_addr))
 }

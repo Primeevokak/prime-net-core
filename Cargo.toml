@@ -60,6 +60,11 @@ serde_json = "1.0"
 serde_yaml_ng = "0.10.0"
 sha1 = "0.10"
 sha2 = "0.10.9"
+hmac = "0.12"
+hkdf = "0.12"
+aes-gcm = "0.10"
+aes = "0.8"
+cipher = "0.4"
 socket2 = "0.5.7"
 gpgme = { version = "0.11", optional = true }
 tempfile = "3.10"
@@ -87,6 +92,7 @@ smoltcp = { version = "0.11", default-features = false, optional = true, feature
 ] }
 
 [target.'cfg(windows)'.dependencies]
+libloading = "0.8"
 windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Networking_WinInet",
@@ -100,6 +106,7 @@ winapi = { version = "0.3", features = ["shellapi", "wininet"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+libloading = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = "1.6"

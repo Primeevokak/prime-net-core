@@ -267,10 +267,22 @@ pub struct RoutingConfig {
     pub censored_groups: std::collections::HashMap<String, Vec<String>>,
     #[serde(default = "default_ml_routing_enabled")]
     pub ml_routing_enabled: bool,
-    /// Explicit domain → bypass arm overrides that skip ML entirely.
-    /// Keys are domain suffixes (e.g. "discord.com"), values are route IDs
-    /// such as "bypass:4". Subdomains are matched automatically.
-    /// Example: `[routing.domain_profiles] "discord.com" = "bypass:4"`
+    /// Explicit domain → route arm overrides that skip ML entirely.
+    ///
+    /// Keys are domain suffixes (e.g. `"discord.com"`); subdomains match automatically.
+    /// Values are route identifiers:
+    /// - `"direct"` — always use direct TCP, no evasion.
+    /// - `"bypass:N"` — always use bypass pool entry N (1-based index).
+    /// - `"native:profile_name"` — always use the named native desync profile
+    ///   (e.g. `"native:tlsrec-into-sni-oob"`).  Also accepts `"native:N"` (1-based index).
+    ///
+    /// Example:
+    /// ```toml
+    /// [routing.domain_profiles]
+    /// "discord.com" = "native:tlsrec-into-sni-oob"
+    /// "youtube.com" = "native:tlsrec-into-sni-fake-ttl3"
+    /// "rutracker.org" = "bypass:1"
+    /// ```
     #[serde(default)]
     pub domain_profiles: std::collections::HashMap<String, String>,
 }
