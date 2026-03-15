@@ -1,4 +1,4 @@
-﻿# API (Rust + FFI)
+# API (Rust + FFI)
 
 ## Cargo features
 
@@ -10,6 +10,7 @@
 
 Дополнительно:
 
+- `tun` (TUN/VPN режим, требует `tun2` + `smoltcp`)
 - `signature-verification` (проверка подписей обновлений через `gpgme`)
 - `require-signatures` (зависит от `signature-verification`)
 
@@ -47,7 +48,7 @@
 - `prime_engine_free(PrimeEngine*)`
 - `prime_last_error_message(void) -> const char*`
 
-`config_path == NULL` -> используется `EngineConfig::default()`.
+`config_path == NULL` → используется `EngineConfig::default()`.
 
 ### Sync request
 
@@ -84,7 +85,7 @@
 - `PrimeResponse*` освобождается только через `prime_response_free`.
 - `PrimeRequestHandle*` освобождается через `prime_request_free`.
 - `prime_request_wait` не освобождает handle автоматически: после завершения запроса handle остается валиден до `prime_request_free`.
-- При timeout (`"timeout"`) handle остается валиден, можно ждать повторно.
+- При timeout handle остается валиден, можно ждать повторно.
 
 ## Модель выполнения FFI
 

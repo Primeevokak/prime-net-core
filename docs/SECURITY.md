@@ -1,4 +1,4 @@
-﻿# SECURITY
+# SECURITY
 
 ## Модель угроз
 
@@ -6,13 +6,16 @@
 
 - обход сетевых ограничений и DPI;
 - снижение DNS-утечек;
-- контроль transport path (direct/proxy/PT).
+- контроль transport path (direct/native bypass/PT).
 
 Проект не является полной системой анонимности.
 
 ## Что покрывается
 
 - DoH/DoT/DoQ + управляемый fallback chain;
+- нативный TLS/TCP десинхрон (25+ in-process профилей);
+- QUIC Initial inject (RFC 9001) для обхода QUIC-фильтрации;
+- TCP disorder через WinDivert/NFQueue;
 - fragment/desync/fronting/PT техники;
 - privacy middleware для HTTP-запросов;
 - health/diagnostic observability.
@@ -23,6 +26,12 @@
 - глобальная корреляция трафика сильным противником;
 - утечки из приложений, которые не используют движок или его SOCKS endpoint;
 - компрометация конечной машины.
+
+## Нативный bypass: модель доверия
+
+Нативный DPI bypass работает полностью in-process — нет загрузки внешних бинарей, нет зависимостей от byedpi/ciadpi. Вектор атаки через сторонний bypass-бинарь исключён.
+
+TCP disorder через WinDivert (Windows) требует загрузки `WinDivert.dll`. Используйте только официальный WinDivert из доверенных источников или из директории поставки.
 
 ## Updater trust model
 
@@ -44,9 +53,19 @@
 - `update install` в таком состоянии ожидаемо завершится ошибкой проверки подписи.
 - До замены плейсхолдеров поддерживайте обновление через вручную проверенный release pipeline.
 
-## Packet bypass bootstrap
+## QUIC Initial inject: модель безопасности
 
-Для packet-bypass действует strict trust режим:
+Fake QUIC Initial пакеты отправляются с TTL, недостаточным для достижения сервера. Они достигают только DPI-точки провайдера. Реальный QUIC Initial с настоящим SNI не модифицируется.
+
+Decoy SNI в fake пакете выбирается движком и не раскрывает настоящий целевой домен DPI-системе.
+
+## Profile discovery: модель доверия
+
+Автозондирование профилей обращается к трём жёстко прописанным IP-адресам (Cloudflare, rutracker.org, IANA). Эти адреса не конфигурируются пользователем и не загружаются из внешних источников. Результаты зондирования хранятся локально.
+
+## Packet bypass bootstrap (legacy)
+
+Если в конфиге задан внешний packet bypass (`PRIME_PACKET_BYPASS_ARGS`):
 
 - latest-tag autodiscovery отключен по умолчанию;
 - используется pinned stable tag (если не задан явный `PRIME_PACKET_BYPASS_TAG`);
@@ -54,7 +73,7 @@
 
 ## Практические рекомендации
 
-- стартовать с `strict-privacy` или `aggressive-evasion` и проверять реальную связность `test`.
-- поддерживать blocklist в актуальном состоянии (`blocklist update`).
-- вести логи в файл (`--log-file`, `--log-format json`).
+- стартовать с `strict-privacy` или `aggressive-evasion` и проверять реальную связность через `test`;
+- поддерживать blocklist в актуальном состоянии (`blocklist update`);
+- вести логи в файл (`--log-file`, `--log-format json`);
 - для инцидентов фиксировать точные команды, конфиг (без секретов) и фрагменты логов.

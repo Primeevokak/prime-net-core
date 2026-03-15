@@ -1,4 +1,4 @@
-﻿# USER GUIDE
+# USER GUIDE
 
 ## Базовый ежедневный сценарий
 
@@ -54,10 +54,39 @@ prime-net-engine --config prime-net-engine.toml tui
 prime-net-engine --config prime-net-engine.toml --preset strict-privacy --config-check
 ```
 
-Агрессивный обход:
+Агрессивный обход (включает все техники, все DNS-резолверы):
 
 ```bash
-prime-net-engine --config prime-net-engine.toml --preset aggressive-evasion test --url https://example.com
+prime-net-engine --config prime-net-engine.toml --preset aggressive-evasion socks
+```
+
+## Ручное закрепление профилей для конкретных доменов
+
+ML-маршрутизатор автоматически находит рабочие профили. Для приоритетных доменов можно закрепить профиль явно — это обходит ML и гарантирует предсказуемый маршрут:
+
+```toml
+[routing.domain_profiles]
+"discord.com"    = "native:tlsrec-into-sni"
+"discordapp.com" = "native:tlsrec-into-sni"
+"rutracker.org"  = "native:split-into-sni"
+"youtube.com"    = "native:split-into-sni-fake-ttl3"
+"github.com"     = "direct"
+```
+
+Полный список нативных профилей — в `README.md` и `ARCHITECTURE.md`.
+
+## Сброс ML-статистики
+
+Если ISP изменил политику и старые «победители» перестали работать — экспоненциальное затухание (halflife 30 минут) адаптирует маршрутизатор автоматически. Для немедленного сброса:
+
+```bash
+rm ~/.cache/prime-net-engine/relay-classifier.json
+```
+
+## Сброс кеша автообнаружения профилей
+
+```bash
+rm ~/.local/share/prime-net/profile_wins.json
 ```
 
 ## Blocklist обслуживание
@@ -85,12 +114,27 @@ prime-net-engine --config prime-net-engine.toml update install
 
 ## PT сценарий (Trojan/Shadowsocks/Obfs4/Snowflake)
 
-- заполните `[pt]` секцию;
+- заполните `[pt]` секцию в конфиге;
 - не задавайте одновременно `[pt]` и `[proxy]`;
+- для obfs4 обязательно поле `cert`;
+- для snowflake обязательны `tor_bin` и `snowflake_bin`;
 - запускайте через `socks`.
+
+## TUN/VPN режим
+
+Требует компиляции с `--features tun`:
+
+```bash
+cargo build --release --features tun
+prime-net-engine --config prime-net-engine.toml tun
+```
+
+В TUN режиме весь системный трафик проходит через виртуальный сетевой интерфейс — не нужно настраивать каждое приложение отдельно.
 
 ## Диагностический запуск с логами
 
 ```bash
-prime-net-engine --config prime-net-engine.toml --log-level debug --log-format json --log-file prime.log test --url https://example.com
+prime-net-engine --config prime-net-engine.toml \
+  --log-level debug --log-format json --log-file prime.log \
+  test --url https://example.com --check-leaks
 ```

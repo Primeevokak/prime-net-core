@@ -1,4 +1,4 @@
-﻿# PRESETS
+# PRESETS
 
 Пресеты применяются через `--preset <name>`.
 
@@ -59,7 +59,9 @@
 - `anticensorship.dns_fallback_chain = [doh, dot, doq]`
 - `anticensorship.ech_mode = auto`
 - `evasion.strategy = auto`
-- если `client_hello_split_offsets` пустой -> `[1, 5, 40, 64]`
+- `evasion.packet_bypass_enabled = true`
+- `evasion.strategy_race_enabled = true`
+- если `client_hello_split_offsets` пустой → `[1, 5, 40, 64]`
 - `evasion.split_at_sni = true`
 - `evasion.fragment_sleep_ms = 0`
 - `evasion.fragment_budget_bytes = 32768`
@@ -69,4 +71,4 @@
 
 ## Важное
 
-Preset не создаёт автоматически `domain_fronting_rules` и не подменяет PT-секцию.
+Preset не создаёт автоматически `domain_fronting_rules` и не подменяет PT-секцию. Нативные профили DPI bypass (`native:*`) выбираются ML-маршрутизатором автоматически — явно задавать их в пресете не требуется, только через `routing.domain_profiles` для приоритетных доменов.

@@ -41,20 +41,21 @@ prime-net-engine --config prime-net-engine.toml --config-check --offline
 - не настроены release signing key/fingerprint в `src/updater/verification.rs`;
 - недоступны системные зависимости `gpgme/gpg-error` в окружении сборки.
 
-## 5. Packet bypass не стартует
+## 5. Нативный bypass не работает / профили не применяются
+
+Нативный bypass встроен в процесс — внешние утилиты (byedpi/ciadpi) для него не нужны.
 
 Проверьте:
 
-- включение `evasion.packet_bypass_enabled` и отсутствие `PRIME_PACKET_BYPASS=0`;
-- наличие бинаря движка рядом (packet bypass требует `prime-net-engine` в той же директории);
-- доступность pinned release asset;
-- корректность digest-переменных (`PRIME_PACKET_BYPASS_PAYLOAD_SHA256` / `PRIME_PACKET_BYPASS_BINARY_SHA256`).
+- включение `evasion.packet_bypass_enabled = true` в конфиге;
+- отсутствие `PRIME_PACKET_BYPASS=0` в окружении;
+- что в логах есть строки вида `native desync: applying profile 'tlsrec-into-sni'`.
 
-При ненадёжной сети для загрузки byedpi можно разрешить remote checksum:
+Для TCP disorder (профили `tcp-disorder-*`) дополнительно требуется:
+- **Windows**: `WinDivert.dll` в той же директории, что и `prime-net-engine.exe`, или в `PATH`;
+- **Linux**: ядерный модуль `nfqueue` (`modprobe nfnetlink_queue`) и права на создание NFQueue правил.
 
-```bash
-PRIME_PACKET_BYPASS_TRUST_REMOTE_CHECKSUM=1 prime-net-engine ...
-```
+При отсутствии WinDivert/NFQueue движок автоматически пропустит disorder-профили — остальные 20+ профилей работают без них.
 
 ## 6. PT (`obfs4`/`snowflake`) не стартует
 
@@ -64,27 +65,39 @@ PRIME_PACKET_BYPASS_TRUST_REMOTE_CHECKSUM=1 prime-net-engine ...
 - `obfs4proxy` (для obfs4)
 - `snowflake-client` (для snowflake)
 
-Убедитесь, что пути к бинарям указаны в `[pt.obfs4]` / `[pt.snowflake]` секциях конфига.
+Убедитесь, что пути к бинарям указаны в `[pt.obfs4]` / `[pt.snowflake]` секциях конфига. Для obfs4 поле `cert` обязательно.
 
 ## 7. Discord / мессенджеры не работают
 
 Discord использует **QUIC (UDP)** и часто блокируется через RST-инъекцию после TCP-рукопожатия.
 
-Шаги диагностики:
+**Шаги диагностики:**
 
-1. Убедитесь, что движок запущен и принимает трафик (проверьте `proxy status`).
-2. Дайте ML-маршрутизатору 2–3 минуты: он пробует разные bypass-профили и запоминает рабочие.
-3. Если Discord зависает в браузере — проверьте, что QUIC отключён в настройках браузера (`chrome://flags/#enable-quic` → Disabled). Движок делает это автоматически для Electron-клиента через SOCKS5 UDP ASSOCIATE.
+1. Убедитесь, что движок запущен и принимает трафик (`proxy status`).
+
+2. Движок автоматически применяет QUIC Initial десинхронизацию — перед реальным QUIC пакетом отправляется ложный Initial с decoy SNI при низком TTL. Дайте ему 1–2 минуты на зондирование профилей.
+
+3. Если Discord зависает в браузере — проверьте, что QUIC отключён в настройках браузера (`chrome://flags/#enable-quic` → Disabled). Для Electron-клиента движок делает это автоматически через UDP ASSOCIATE.
+
 4. Явно задайте Discord маршрут через `routing.domain_profiles`:
 
 ```toml
 [routing.domain_profiles]
-"discord.com" = "bypass:1"
-"discordapp.com" = "bypass:1"
-"discord.media" = "bypass:1"
+"discord.com"    = "native:tlsrec-into-sni"
+"discordapp.com" = "native:tlsrec-into-sni"
+"discord.media"  = "native:tlsrec-into-sni"
+"discord.gg"     = "native:tlsrec-into-sni"
 ```
 
-5. Запустите движок с `--log-level debug` и ищите в логах строки с `discord` — там будет видно, какой профиль выбирается.
+5. Запустите с `--log-level debug` и ищите в логах строки с `discord` — там будет видно, какой профиль выбирается и его результат.
+
+6. Если один профиль не помогает — попробуйте другие:
+
+```toml
+"discord.com" = "native:split-into-sni-oob"
+# или
+"discord.com" = "native:multi-split-sni-region"
+```
 
 ## 8. Низкая скорость / нестабильный throughput
 
@@ -95,7 +108,7 @@ Discord использует **QUIC (UDP)** и часто блокируется
 - `download.*` таймауты/конкурентность;
 - влияние `traffic_shaping_enabled`.
 
-Для максимальной скорости попробуйте пресет `max-compatibility` — он отключает агрессивные техники:
+Для максимальной скорости попробуйте пресет `max-compatibility`:
 
 ```bash
 prime-net-engine --preset max-compatibility --config prime-net-engine.toml socks
@@ -112,7 +125,17 @@ ML-маршрутизатор накапливает историю. Если IS
 rm ~/.cache/prime-net-engine/relay-classifier.json
 ```
 
-## 10. CI падает на `tempfile`/`fmt`
+Также можно сбросить кеш автообнаружения профилей:
+
+```bash
+rm ~/.local/share/prime-net/profile_wins.json
+```
+
+## 10. Профили зондируются слишком долго при запуске
+
+Profile discovery запускается в фоне и не блокирует старт прокси. Результаты предыдущего зондирования кешируются на 24 часа. Если прокси уже слушает — всё работает, discovery продолжается параллельно.
+
+## 11. CI падает на `tempfile`/`fmt`
 
 Если ошибка вида `use of unresolved crate tempfile`:
 
@@ -122,7 +145,7 @@ rm ~/.cache/prime-net-engine/relay-classifier.json
 
 - выполните локально `cargo fmt --all` и перезапустите checks.
 
-## 11. Что прикладывать к баг-репорту
+## 12. Что прикладывать к баг-репорту
 
 - ОС и архитектуру;
 - команду запуска;

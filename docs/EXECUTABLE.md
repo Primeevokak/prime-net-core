@@ -1,4 +1,4 @@
-﻿# CLI `prime-net-engine`
+# CLI `prime-net-engine`
 
 Источник истины: `src/bin/prime-net-engine/main.rs`.
 
@@ -44,6 +44,8 @@ prime-net-engine [GLOBAL_OPTS] fetch <url> [FETCH_OPTS]
 ```text
 prime-net-engine [GLOBAL_OPTS] download <url> --out <path>
 ```
+
+Поддерживает возобновление прерванной загрузки.
 
 ### `socks`
 
@@ -109,14 +111,27 @@ prime-net-engine [GLOBAL_OPTS] test [--url <url>] [--check-leaks]
 
 Также поддерживается позиционный URL: `test https://example.com`.
 
+### `tun`
+
+```text
+prime-net-engine [GLOBAL_OPTS] tun [TUN_OPTS]
+```
+
+Доступна только при сборке с `--features tun`. Запускает VPN/TUN режим через виртуальный сетевой интерфейс (`tun2` + `smoltcp`).
+
 ## Примеры
 
 ```bash
 prime-net-engine --config cfg.toml --config-check
+prime-net-engine --config cfg.toml --config-check --offline
+
 prime-net-engine --config cfg.toml fetch https://example.com --print-headers --out -
 prime-net-engine --config cfg.toml download https://example.com/file.bin --out file.bin
+
 prime-net-engine --config cfg.toml socks --bind 127.0.0.1:1080
 prime-net-engine --config cfg.toml proxy enable --mode all
+prime-net-engine --config cfg.toml proxy status
+
 prime-net-engine --config cfg.toml blocklist update
 prime-net-engine --config cfg.toml update check --channel beta
 prime-net-engine --config cfg.toml test --url https://example.com --check-leaks
@@ -128,3 +143,4 @@ prime-net-engine --config cfg.toml test --url https://example.com --check-leaks
 - Для `download` параметр `--out` обязателен.
 - Для `proxy enable --mode custom` параметр `--pac-url` обязателен.
 - Отдельного флага `--version` в CLI нет.
+- `tun` требует компиляции с `--features tun`.

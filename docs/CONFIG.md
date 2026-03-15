@@ -1,4 +1,4 @@
-﻿# CONFIG
+# CONFIG
 
 Источник истины: `src/config/config_sections/*`.
 
@@ -10,7 +10,7 @@
 - JSON (`.json`)
 - YAML (`.yaml`, `.yml`)
 
-Если расширение неизвестно, пробуется TOML -> JSON -> YAML.
+Если расширение неизвестно, пробуется TOML → JSON → YAML.
 
 После парсинга всегда выполняются:
 
@@ -191,7 +191,7 @@
 
 - `[pt.trojan]`: `server`, `password`, optional `sni`, `alpn_protocols` (default `['h2','http/1.1']`), `insecure_skip_verify`
 - `[pt.shadowsocks]`: `server`, `password`, `method`
-- `[pt.obfs4]`: `server`, `cert`, optional `fingerprint`, optional `iat_mode`, `tor_bin`, `obfs4proxy_bin`, args
+- `[pt.obfs4]`: `server`, `cert` (обязателен), optional `fingerprint`, optional `iat_mode`, `tor_bin`, `obfs4proxy_bin`, args
 - `[pt.snowflake]`: `tor_bin`, `snowflake_bin`, optional `broker/front/amp_cache/bridge`, `stun_servers`, args
 
 ### `[system_proxy]`
@@ -222,18 +222,28 @@
 ### `[routing]`
 
 - `censored_groups = {}` — группы доменов, которые всегда идут через bypass. Ключ: название группы, значение: список доменов.
-- `domain_profiles = {}` — явное закрепление домена за маршрутом. Ключ: домен, значение: `"direct"` или `"bypass:<N>"` (например `"bypass:1"`). Переопределяет ML-выбор.
+- `ml_routing_enabled = true` — включить ML-маршрутизатор (Shadow UCB Bandit).
+- `domain_profiles = {}` — явное закрепление домена за маршрутом. Ключ: домен, значение: маршрут. Переопределяет ML-выбор.
+
+**Форматы значений domain_profiles:**
+
+- `"direct"` — прямое соединение без bypass;
+- `"bypass:<N>"` — внешний bypass-процесс номер N (если настроен);
+- `"native:<profile_name>"` — нативный профиль по имени (например `"native:tlsrec-into-sni"`);
+- `"native:<N>"` — нативный профиль по индексу.
 
 Пример:
 
 ```toml
 [routing.domain_profiles]
-"discord.com" = "bypass:1"
-"youtube.com" = "bypass:2"
-"github.com" = "direct"
+"discord.com"    = "native:tlsrec-into-sni"
+"discordapp.com" = "native:tlsrec-into-sni"
+"rutracker.org"  = "native:split-into-sni"
+"youtube.com"    = "native:split-into-sni-fake-ttl3"
+"github.com"     = "direct"
 ```
 
-Валидация: значение должно быть `"direct"` или соответствовать шаблону `"bypass:<число>"`.
+Валидация: значение должно быть `"direct"`, `"bypass:<число>"`, `"native:<имя>"` или `"native:<число>"`.
 
 ### `[telemetry]`
 
@@ -249,6 +259,8 @@
 - `dot_enabled/doq_enabled` требуют непустые `dot_servers/doq_servers`.
 - `domain_fronting_enabled=true` требует валидные `domain_fronting_rules`.
 - `pt` и `proxy` одновременно запрещены.
+- `pt.obfs4` требует заполненного `cert` (обязательно для рукопожатия).
+- `pt.snowflake` требует `tor_bin` и `snowflake_bin`.
 - `system_proxy.socks_endpoint` должен быть `host:port` (`[::1]:port` для IPv6).
 - `updater.repo` должен быть `owner/name`.
 - `download.verify_hash` должен быть `auto` или `sha256:<64hex>`.
