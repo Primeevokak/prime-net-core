@@ -7,40 +7,35 @@ mod tests {
     fn clear_route_state_for_test(route_key: &str) {
         let service_key = route_service_key(route_key, &EngineConfig::default());
         let meta_key = route_meta_service_key(route_key, &EngineConfig::default());
-        let health_map = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
-        health_map.remove(route_key);
-        if let Some(service_key) = service_key.as_ref() {
-            health_map.remove(service_key);
+        let rs = routing_state();
+        rs.dest_route_health.remove(route_key);
+        if let Some(k) = service_key.as_ref() {
+            rs.dest_route_health.remove(k);
         }
-        if let Some(meta_key) = meta_key.as_ref() {
-            health_map.remove(meta_key);
+        if let Some(k) = meta_key.as_ref() {
+            rs.dest_route_health.remove(k);
         }
-
-        let winner_map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
-        winner_map.remove(route_key);
-        if let Some(service_key) = service_key.as_ref() {
-            winner_map.remove(service_key);
+        rs.dest_route_winner.remove(route_key);
+        if let Some(k) = service_key.as_ref() {
+            rs.dest_route_winner.remove(k);
         }
-        if let Some(meta_key) = meta_key.as_ref() {
-            winner_map.remove(meta_key);
+        if let Some(k) = meta_key.as_ref() {
+            rs.dest_route_winner.remove(k);
         }
     }
 
     fn clear_global_bypass_health_for_test() {
-        let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(DashMap::new);
-        map.clear();
+        routing_state().global_bypass_profile_health.clear();
     }
 
     fn clear_bypass_profile_state_for_test() {
-        let idx_map = DEST_BYPASS_PROFILE_IDX.get_or_init(DashMap::new);
-        idx_map.clear();
-        let fail_map = DEST_BYPASS_PROFILE_FAILURES.get_or_init(DashMap::new);
-        fail_map.clear();
+        let rs = routing_state();
+        rs.dest_bypass_profile_idx.clear();
+        rs.dest_bypass_profile_failures.clear();
     }
 
     fn clear_route_capabilities_for_test() {
-        let map = ROUTE_CAPABILITIES.get_or_init(|| RwLock::new(RouteCapabilities::default()));
-        if let Ok(mut guard) = map.write() {
+        if let Ok(mut guard) = routing_state().route_capabilities.write() {
             *guard = RouteCapabilities::default();
         }
     }
@@ -53,9 +48,10 @@ mod tests {
     }
 
     fn clear_destination_classifier_state_for_test() {
-        DEST_FAILURES.get_or_init(DashMap::new).clear();
-        DEST_PREFERRED_STAGE.get_or_init(DashMap::new).clear();
-        DEST_CLASSIFIER.get_or_init(DashMap::new).clear();
+        let rs = routing_state();
+        rs.dest_failures.clear();
+        rs.dest_preferred_stage.clear();
+        rs.dest_classifier.clear();
     }
 
     #[test]
@@ -195,16 +191,14 @@ mod tests {
     fn stage4_fragmentation_is_not_one_byte_on_non_windows() {
         let destination = "example.com:443";
         let key = destination.to_owned();
-        DEST_FAILURES
-            .get_or_init(DashMap::new)
-            .insert(key.clone(), 8);
+        routing_state().dest_failures.insert(key.clone(), 8);
         let _tuned = tune_relay_for_target(RelayOptions::default(), 443, destination, false, false);
         #[cfg(not(windows))]
         {
             assert!(_tuned.options.fragment_size_min >= 32);
             assert!(_tuned.options.fragment_size_max >= _tuned.options.fragment_size_min);
         }
-        DEST_FAILURES.get_or_init(DashMap::new).remove(&key);
+        routing_state().dest_failures.remove(&key);
     }
 
     #[test]
@@ -297,8 +291,7 @@ mod tests {
         clear_route_state_for_test(&probe_route_key);
         let service_key =
             route_service_key(&winner_route_key, &EngineConfig::default()).expect("service key");
-        let winner_map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
-        winner_map.insert(
+        routing_state().dest_route_winner.insert(
             service_key,
             RouteWinner {
                 route_id: "bypass:1".to_owned(),
@@ -333,8 +326,7 @@ mod tests {
         clear_route_state_for_test(&probe_route_key);
         let meta_key =
             route_meta_service_key(&winner_route_key, &EngineConfig::default()).expect("meta key");
-        let winner_map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
-        winner_map.insert(
+        routing_state().dest_route_winner.insert(
             meta_key,
             RouteWinner {
                 route_id: "bypass:2".to_owned(),
@@ -357,7 +349,7 @@ mod tests {
     #[test]
     fn learned_bypass_activates_after_failures_for_tls_domain() {
         let key = "learned-bypass-test.invalid:443|any".to_owned();
-        let map = DEST_FAILURES.get_or_init(DashMap::new);
+        let map = &routing_state().dest_failures;
         map.insert(key.clone(), LEARNED_BYPASS_MIN_FAILURES_DOMAIN);
 
         assert!(should_bypass_by_classifier_host(
@@ -402,8 +394,7 @@ mod tests {
         clear_bypass_profile_state_for_test();
         let service_key =
             bypass_profile_legacy_service_key("api.github.com:443", &EngineConfig::default());
-        let idx_map = DEST_BYPASS_PROFILE_IDX.get_or_init(DashMap::new);
-        idx_map.insert(service_key, 2);
+        routing_state().dest_bypass_profile_idx.insert(service_key, 2);
 
         assert_eq!(
             destination_bypass_profile_idx("collector.github.com:443", 3),
@@ -705,7 +696,7 @@ mod tests {
             now_unix_secs()
         ));
 
-        let health_map = DEST_ROUTE_HEALTH.get_or_init(DashMap::new);
+        let health_map = &routing_state().dest_route_health;
         if let Some(per_route) = health_map.get_mut(route_key) {
             if let Some(mut entry) = per_route.get_mut(&candidate.route_id()) {
                 entry.weak_until_unix = now_unix_secs().saturating_sub(1);
@@ -728,8 +719,7 @@ mod tests {
     fn adaptive_route_reraces_when_cached_winner_is_unavailable() {
         let route_key = "adaptive-route-missing-winner:443|any";
         clear_route_state_for_test(route_key);
-        let winner_map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
-        winner_map.insert(
+        routing_state().dest_route_winner.insert(
             route_key.to_owned(),
             RouteWinner {
                 route_id: "bypass:3".to_owned(),
@@ -752,8 +742,7 @@ mod tests {
     fn adaptive_route_skips_race_when_cached_winner_is_healthy() {
         let route_key = "adaptive-route-healthy-winner:443|any";
         clear_route_state_for_test(route_key);
-        let winner_map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
-        winner_map.insert(
+        routing_state().dest_route_winner.insert(
             route_key.to_owned(),
             RouteWinner {
                 route_id: "direct".to_owned(),

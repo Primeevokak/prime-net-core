@@ -3,7 +3,6 @@ use crate::error::{EngineError, Result};
 use crate::pt::socks5_server::ml_shadow::complete_route_outcome_event;
 use crate::pt::socks5_server::protocol_handlers::tune_relay_for_target;
 use crate::pt::{BoxStream, DynOutbound, TargetAddr, TargetEndpoint};
-use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -259,10 +258,7 @@ pub async fn handle_socks5_connection(
 
         let target_str = target.to_string();
         let route_key = route_destination_key(&target_str);
-        let has_cached_winner = {
-            let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
-            map.contains_key(route_key)
-        };
+        let has_cached_winner = routing_state().dest_route_winner.contains_key(route_key);
 
         let mut p = [0u8; 4096];
         let wait_ms = if target.port == 443 {
@@ -332,10 +328,10 @@ pub async fn handle_socks5_request_with_target(
 
     let route_key = route_destination_key(&target_label);
 
-    let cached_winner = {
-        let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
-        map.get(route_key).map(|w| w.clone())
-    };
+    let cached_winner = routing_state()
+        .dest_route_winner
+        .get(route_key)
+        .map(|w| w.clone());
 
     let candidates = if let Some(winner) = cached_winner {
         if now_unix_secs().saturating_sub(winner.updated_at_unix) < ROUTE_WINNER_TTL_SECS {
@@ -426,16 +422,13 @@ pub async fn handle_socks5_request_with_target(
             let label = route.candidate.route_label();
             info!(conn_id, target = %target_label, route = %label, "connection established");
 
-            {
-                let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
-                map.insert(
-                    route_key.to_owned(),
-                    RouteWinner {
-                        route_id: route.candidate.route_id(),
-                        updated_at_unix: now_unix_secs(),
-                    },
-                );
-            }
+            routing_state().dest_route_winner.insert(
+                route_key.to_owned(),
+                RouteWinner {
+                    route_id: route.candidate.route_id(),
+                    updated_at_unix: now_unix_secs(),
+                },
+            );
 
             // Record success for the classifier
             classifier_and_persistence::record_destination_success(
@@ -508,8 +501,7 @@ pub async fn handle_socks5_request_with_target(
                         );
 
                         debug!(conn_id, error = %e, signal = ?signal, "upstream failure, invalidating cache for {}", route_key);
-                        let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
-                        map.remove(route_key);
+                        routing_state().dest_route_winner.remove(route_key);
                     }
                     Err(EngineError::Io(std::io::Error::new(
                         e.kind(),
@@ -519,8 +511,7 @@ pub async fn handle_socks5_request_with_target(
             }
         }
         Err(e) => {
-            let map = DEST_ROUTE_WINNER.get_or_init(DashMap::new);
-            map.remove(route_key);
+            routing_state().dest_route_winner.remove(route_key);
             Err(e)
         }
     }

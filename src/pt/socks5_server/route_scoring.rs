@@ -14,7 +14,7 @@ pub fn route_health_score(
         bonus += bypass_bucket_bonus(&bucket, candidate, cfg);
     }
     let local_score = {
-        let map = DEST_ROUTE_HEALTH.get_or_init(dashmap::DashMap::new);
+        let map = &routing_state().dest_route_health;
         if let Some(per_route) = map.get(route_key) {
             if let Some(health) = per_route.get(&route_id) {
                 let mut score = (health.successes as i64 * 3) - (health.failures as i64 * 4);
@@ -42,7 +42,7 @@ pub fn global_bypass_profile_score(
         return 0;
     }
     let primary_key = bypass_profile_health_key(&route_id, candidate.family);
-    let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(dashmap::DashMap::new);
+    let map = &routing_state().global_bypass_profile_health;
     if let Some(health) = map.get(&primary_key) {
         if should_reset_bypass_profile_health(&health, now, cfg) {
             drop(health);
@@ -115,7 +115,8 @@ pub fn is_censored_domain(domain: &str, _relay_opts: &RelayOptions, cfg: &Engine
     let now = now_unix_secs();
 
     // 0. CHECK LEARNED WINNERS: If we have a cached winner for this domain/group, use it
-    if let Some(winners) = DEST_ROUTE_WINNER.get() {
+    {
+        let winners = &routing_state().dest_route_winner;
         for key in [&dest_lower, group_key] {
             if let Some(winner) = winners.get(key) {
                 if winner.route_id.starts_with("bypass:") || winner.route_id.starts_with("native:")
@@ -127,7 +128,8 @@ pub fn is_censored_domain(domain: &str, _relay_opts: &RelayOptions, cfg: &Engine
     }
 
     // 1. DYNAMIC LEARNING: Check classifier for persistent signals
-    if let Some(classifier) = DEST_CLASSIFIER.get() {
+    {
+        let classifier = &routing_state().dest_classifier;
         for key in [&dest_lower, group_key] {
             if let Some(stats) = classifier.get(key) {
                 if let Some(ref winner) = stats.winner {
@@ -187,7 +189,7 @@ pub fn record_route_success_sync(route_key: &str, candidate: &RouteCandidate, cf
     let now = now_unix_secs();
     let route_id = candidate.route_id();
     {
-        let map = DEST_ROUTE_HEALTH.get_or_init(dashmap::DashMap::new);
+        let map = &routing_state().dest_route_health;
         let per_route = map.entry(route_key.to_owned()).or_default();
         let mut health = per_route.entry(route_id.clone()).or_default();
         health.successes += 1;
@@ -212,7 +214,7 @@ pub fn record_route_failure_sync(
     let is_dpi_signal = reason.contains("dpi-signal");
 
     {
-        let map = DEST_ROUTE_HEALTH.get_or_init(dashmap::DashMap::new);
+        let map = &routing_state().dest_route_health;
         let per_route = map.entry(route_key.to_owned()).or_default();
         let mut health = per_route.entry(route_id.clone()).or_default();
         health.failures += 1;
@@ -253,7 +255,7 @@ pub fn record_global_bypass_profile_success_sync(candidate: &RouteCandidate, _cf
         return;
     }
     let key = bypass_profile_health_key(&route_id, candidate.family);
-    let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(dashmap::DashMap::new);
+    let map = &routing_state().global_bypass_profile_health;
     let mut entry = map.entry(key).or_default();
     entry.successes += 1;
     entry.last_success_unix = now_unix_secs();
@@ -270,7 +272,7 @@ pub fn record_global_bypass_profile_failure_sync(
         return;
     }
     let key = bypass_profile_health_key(&route_id, candidate.family);
-    let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(dashmap::DashMap::new);
+    let map = &routing_state().global_bypass_profile_health;
     let mut entry = map.entry(key).or_default();
     entry.failures += 1;
     entry.last_failure_unix = now;
@@ -298,7 +300,7 @@ pub fn select_route_candidates(
 
     if port == 443 || port == 80 || port == 6443 || (5000..=9000).contains(&port) {
         let bypass_cands = select_bypass_candidates(relay_opts, destination, cfg);
-        let native_cands = select_native_candidates(relay_opts);
+        let native_cands = select_native_candidates(relay_opts, destination);
 
         if is_blocked {
             // PROACTIVE BYPASS: For blocked domains try external bypass FIRST (score 1000),
@@ -475,12 +477,35 @@ pub fn select_bypass_candidates(
     out
 }
 
+/// Returns `true` if the destination host is likely served by Cloudflare.
+///
+/// Used to exclude `cloudflare_safe: false` native desync profiles that would
+/// break connections to these services (disorder, padding, etc.).
+fn is_likely_cloudflare_host(dest: &str) -> bool {
+    let d = dest.to_ascii_lowercase();
+    d.contains("discord")
+        || d.contains("cloudflare")
+        || d.contains("instagram")
+        || d.contains("fbcdn")
+        || d.contains("cdninstagram")
+        || d.contains("whatsapp")
+        || d.contains("fb.com")
+        || d.contains("messenger.com")
+}
+
 /// Returns `(profile_idx, profile_total)` pairs for the in-process native desync engine.
-pub fn select_native_candidates(relay_opts: &RelayOptions) -> Vec<(u8, u8)> {
+///
+/// When `destination` is a Cloudflare-hosted service, only profiles with
+/// `cloudflare_safe: true` are returned.
+pub fn select_native_candidates(relay_opts: &RelayOptions, destination: &str) -> Vec<(u8, u8)> {
     match relay_opts.native_bypass.as_ref() {
         Some(engine) => {
+            let is_cf = is_likely_cloudflare_host(destination);
             let total = engine.profile_count() as u8;
-            (0..total).map(|i| (i, total)).collect()
+            (0..total)
+                .filter(|&i| !is_cf || engine.is_profile_cloudflare_safe(i as usize))
+                .map(|i| (i, total))
+                .collect()
         }
         None => Vec::new(),
     }
@@ -498,8 +523,7 @@ pub fn mark_route_capability_healthy(kind: RouteKind, family: RouteIpFamily) {
     if family == RouteIpFamily::Any {
         return;
     }
-    let map =
-        ROUTE_CAPABILITIES.get_or_init(|| std::sync::RwLock::new(RouteCapabilities::default()));
+    let map = &routing_state().route_capabilities;
     if let Ok(mut g) = map.write() {
         match (kind, family) {
             (RouteKind::Direct, RouteIpFamily::V4) => g.direct_v4_weak_until = 0,
@@ -517,8 +541,7 @@ pub fn route_capability_is_available(kind: RouteKind, family: RouteIpFamily, now
     if family == RouteIpFamily::Any {
         return true;
     }
-    let map =
-        ROUTE_CAPABILITIES.get_or_init(|| std::sync::RwLock::new(RouteCapabilities::default()));
+    let map = &routing_state().route_capabilities;
     if let Ok(g) = map.read() {
         let until = match (kind, family) {
             (RouteKind::Direct, RouteIpFamily::V4) => g.direct_v4_weak_until,
@@ -578,7 +601,7 @@ pub fn record_bypass_profile_failure(
         return;
     }
     let next_idx = (current_idx + 1) % total;
-    let idx_map = DEST_BYPASS_PROFILE_IDX.get_or_init(dashmap::DashMap::new);
+    let idx_map = &routing_state().dest_bypass_profile_idx;
     idx_map.insert(destination.to_owned(), next_idx);
 }
 pub fn record_route_success(rk: &str, c: &RouteCandidate, cfg: &EngineConfig) {
@@ -635,7 +658,7 @@ mod native_bypass_tests {
     #[test]
     fn select_native_candidates_empty_when_no_engine() {
         let opts = RelayOptions::default(); // native_bypass = None
-        let cands = select_native_candidates(&opts);
+        let cands = select_native_candidates(&opts, "example.com");
         assert!(cands.is_empty());
     }
 
@@ -644,12 +667,38 @@ mod native_bypass_tests {
         let opts = make_relay_opts_with_engine();
         let engine = opts.native_bypass.as_ref().unwrap();
         let total = engine.profile_count();
-        let cands = select_native_candidates(&opts);
+        let cands = select_native_candidates(&opts, "example.com");
         assert_eq!(cands.len(), total);
         // Each entry: (idx, total)
         for (i, (idx, t)) in cands.iter().enumerate() {
             assert_eq!(*idx as usize, i);
             assert_eq!(*t as usize, total);
+        }
+    }
+
+    #[test]
+    fn cloudflare_host_excludes_unsafe_native_profiles() {
+        let opts = make_relay_opts_with_engine();
+        let engine = opts.native_bypass.as_ref().unwrap();
+
+        let all = select_native_candidates(&opts, "example.com");
+        let cf = select_native_candidates(&opts, "gateway.discord.com");
+
+        // Cloudflare-filtered list should be smaller (some profiles have cloudflare_safe=false)
+        assert!(
+            cf.len() < all.len(),
+            "cloudflare host should have fewer candidates: cf={} all={}",
+            cf.len(),
+            all.len()
+        );
+
+        // All profiles in the cf list must be cloudflare-safe
+        for (idx, _total) in &cf {
+            assert!(
+                engine.is_profile_cloudflare_safe(*idx as usize),
+                "profile {} should be cloudflare-safe but was included for discord",
+                engine.profile_name(*idx as usize)
+            );
         }
     }
 
@@ -721,7 +770,7 @@ mod native_bypass_tests {
     #[test]
     fn global_bypass_profile_score_applies_to_native_prefix() {
         let key = "native:1";
-        let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(dashmap::DashMap::new);
+        let map = &routing_state().global_bypass_profile_health;
         map.insert(
             key.to_owned(),
             BypassProfileHealth {
@@ -758,7 +807,7 @@ mod native_bypass_tests {
         let candidate = RouteCandidate::native_with_family("engine", 3, 12, RouteIpFamily::Any);
         let key = bypass_profile_health_key(&candidate.route_id(), candidate.family);
         // Clear state
-        let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(dashmap::DashMap::new);
+        let map = &routing_state().global_bypass_profile_health;
         map.remove(&key);
 
         record_global_bypass_profile_success_sync(&candidate, &EngineConfig::default());
@@ -772,7 +821,7 @@ mod native_bypass_tests {
     fn record_native_failure_increments_global_health() {
         let candidate = RouteCandidate::native_with_family("engine", 4, 12, RouteIpFamily::Any);
         let key = bypass_profile_health_key(&candidate.route_id(), candidate.family);
-        let map = GLOBAL_BYPASS_PROFILE_HEALTH.get_or_init(dashmap::DashMap::new);
+        let map = &routing_state().global_bypass_profile_health;
         map.remove(&key);
 
         record_global_bypass_profile_failure_sync(

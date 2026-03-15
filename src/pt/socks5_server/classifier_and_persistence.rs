@@ -25,12 +25,12 @@ pub fn record_destination_failure_sync(
 ) {
     let now = now_unix_secs();
     {
-        let map = DEST_FAILURES.get_or_init(dashmap::DashMap::new);
+        let map = &routing_state().dest_failures;
         let mut entry = map.entry(destination.to_owned()).or_insert(0);
         *entry = entry.saturating_add(1).min(8);
     }
     {
-        let map = DEST_CLASSIFIER.get_or_init(dashmap::DashMap::new);
+        let map = &routing_state().dest_classifier;
         let mut stats = map.entry(destination.to_owned()).or_default();
         stats.failures += 1;
         match signal {
@@ -59,11 +59,11 @@ pub fn record_destination_success(
 pub fn record_destination_success_sync(destination: &str, stage: u8, _cfg: &EngineConfig) {
     let now = now_unix_secs();
     {
-        let map = DEST_FAILURES.get_or_init(dashmap::DashMap::new);
+        let map = &routing_state().dest_failures;
         map.remove(destination);
     }
     {
-        let map = DEST_CLASSIFIER.get_or_init(dashmap::DashMap::new);
+        let map = &routing_state().dest_classifier;
         let mut stats = map.entry(destination.to_owned()).or_default();
         stats.successes += 1;
         stats.last_seen_unix = now;
@@ -99,9 +99,10 @@ pub fn load_classifier_store_if_needed(cfg: Arc<EngineConfig>) {
                 &json,
             ) {
                 Ok(data) => {
-                    let map = DEST_CLASSIFIER.get_or_init(dashmap::DashMap::new);
-                    let winners = DEST_ROUTE_WINNER.get_or_init(dashmap::DashMap::new);
-                    let stages = DEST_PREFERRED_STAGE.get_or_init(dashmap::DashMap::new);
+                    let rs = routing_state();
+                    let map = &rs.dest_classifier;
+                    let winners = &rs.dest_route_winner;
+                    let stages = &rs.dest_preferred_stage;
 
                     let now = now_unix_secs();
                     for (k, v) in data {
@@ -150,17 +151,12 @@ pub fn maybe_flush_classifier_store(force: bool, cfg: Arc<EngineConfig>) {
         return;
     }
 
-    let map = match DEST_CLASSIFIER.get() {
-        Some(m) => m,
-        None => return,
-    };
+    let rs = routing_state();
+    let map = &rs.dest_classifier;
 
     if map.is_empty() && !force {
         return;
     }
-
-    let winners = DEST_ROUTE_WINNER.get();
-    let stages = DEST_PREFERRED_STAGE.get();
 
     let mut data: std::collections::HashMap<String, DestinationClassifier> =
         std::collections::HashMap::new();
@@ -171,16 +167,12 @@ pub fn maybe_flush_classifier_store(force: bool, cfg: Arc<EngineConfig>) {
         let mut v = entry.value().clone();
 
         // Sync winner and preferred stage from their respective hot caches
-        if let Some(w_map) = winners {
-            if let Some(winner) = w_map.get(k) {
-                v.winner = Some(winner.clone());
-            }
+        if let Some(winner) = rs.dest_route_winner.get(k) {
+            v.winner = Some(winner.clone());
         }
 
-        if let Some(s_map) = stages {
-            if let Some(stage) = s_map.get(k) {
-                v.preferred_stage = Some(*stage);
-            }
+        if let Some(stage) = rs.dest_preferred_stage.get(k) {
+            v.preferred_stage = Some(*stage);
         }
 
         data.insert(k.clone(), v);

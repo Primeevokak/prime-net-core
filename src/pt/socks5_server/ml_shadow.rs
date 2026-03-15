@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
 
 use crate::config::EngineConfig;
 use crate::pt::socks5_server::telemetry_bus::*;
@@ -13,33 +13,9 @@ pub(super) static ROUTE_DECISION_EVENTS_PENDING: OnceLock<DashMap<u64, RouteDeci
 pub(super) static ROUTE_OUTCOME_EVENTS: OnceLock<DashMap<u64, RouteOutcomeEvent>> = OnceLock::new();
 pub(super) static SHADOW_BANDIT_ARMS: OnceLock<DashMap<String, ShadowBanditArmStats>> =
     OnceLock::new();
-#[allow(dead_code)]
-pub(super) static SHADOW_CANARY_DECISIONS: OnceLock<DashMap<u64, ShadowCanaryDecision>> =
-    OnceLock::new();
-#[allow(dead_code)]
-pub(super) static SHADOW_CANARY_SWITCH_GUARD: OnceLock<DashMap<String, ShadowCanarySwitchGuard>> =
-    OnceLock::new();
-#[allow(dead_code)]
-pub(super) static SHADOW_CANARY_BUCKET_COOLDOWN_UNTIL: OnceLock<DashMap<String, u64>> =
-    OnceLock::new();
-#[allow(dead_code)]
-pub(super) static SHADOW_CANARY_SLO_STATE: OnceLock<RwLock<ShadowCanarySloState>> = OnceLock::new();
-#[allow(dead_code)]
-pub(super) static SHADOW_CANARY_ROLLBACK_UNTIL_UNIX: AtomicU64 = AtomicU64::new(0);
 
 const SHADOW_PRIOR_PSEUDO_PULLS: u64 = 10;
-#[allow(dead_code)]
 const SHADOW_UCB_EXPLORATION_SCALE: f64 = 18.0;
-#[allow(dead_code)]
-const SHADOW_EXPLORATION_BUDGET_PCT: u64 = 5;
-#[allow(dead_code)]
-const PHASE2_CANARY_ENABLED: bool = true;
-#[allow(dead_code)]
-const PHASE2_CANARY_SWITCH_WINDOW_SECS: u64 = 30;
-#[allow(dead_code)]
-const PHASE2_CANARY_MAX_SWITCHES_PER_WINDOW: u8 = 1;
-#[allow(dead_code)]
-const PHASE2_CANARY_PROFILE_ROTATION_COOLDOWN_SECS: u64 = 45;
 const SHADOW_DECAY_HALFLIFE_SECS: u64 = 1800;
 const SHADOW_DECAY_MIN_ELAPSED_SECS: u64 = 10;
 
@@ -57,18 +33,12 @@ pub struct ShadowCanaryDecision {
     pub reason: &'static str,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ShadowCanarySwitchGuard {
-    pub window_started_unix: u64,
-    pub switches_in_window: u8,
-    pub last_arm: String,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ShadowCanarySloState {
-    pub window_started_unix: u64,
-    pub samples: u64,
-    pub failures: u64,
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShadowBanditArmStats {
+    pub pulls: u64,
+    pub reward_sum: i64,
+    pub last_reward: i64,
+    pub last_seen_unix: u64,
 }
 
 impl ShadowArmPrior {
@@ -133,17 +103,6 @@ impl RouteOutcomeEvent {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ShadowBanditArmStats {
-    pub pulls: u64,
-    pub reward_sum: i64,
-    pub last_reward: i64,
-    pub last_seen_unix: u64,
-    pub ema_reward_milli: i64,
-    pub ema_abs_dev_milli: u64,
-    pub drift_alert_streak: u32,
-}
-
 pub fn next_route_decision_id() -> u64 {
     NEXT_ROUTE_DECISION_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -159,7 +118,6 @@ pub fn apply_phase3_ml_override(
     let host = route_destination_host(route_key);
 
     // Explicit domain_profiles override: skip ML entirely and force the configured arm.
-    // Keys are matched as exact host or suffix (e.g. "discord.com" matches "gateway.discord.com").
     if !cfg.routing.domain_profiles.is_empty() {
         for (domain, forced_arm) in &cfg.routing.domain_profiles {
             let domain = domain.trim();
@@ -369,22 +327,51 @@ pub fn complete_route_outcome_event_sync(
     }
 }
 
+/// Compute a reward signal from connection outcome.
+///
+/// Returns a value in `[-100, 70]`. Positive values reinforce the arm; negative
+/// values penalise it. The reward is fed into the UCB bandit via
+/// `update_shadow_bandit_sync`.
 pub fn shadow_reward_from_outcome(
     connect_ok: bool,
     tls_ok_proxy: bool,
-    _b: u64,
-    _l: u64,
-    _e: &str,
+    bytes_u2c: u64,
+    lifetime_ms: u64,
+    _error_class: &str,
 ) -> i64 {
-    if connect_ok && tls_ok_proxy {
-        60
-    } else if connect_ok {
-        20
-    } else {
-        -100
+    if !connect_ok {
+        return -100;
     }
+    if !tls_ok_proxy {
+        return 20;
+    }
+
+    let mut reward: i64 = 60;
+
+    // Fast connection bonus (<200ms).
+    if lifetime_ms > 0 && lifetime_ms < 200 {
+        reward += 10;
+    }
+
+    // Slow connection penalty: -5 per 250ms above 500ms, capped at -20.
+    if lifetime_ms > 500 {
+        let penalty = ((lifetime_ms.saturating_sub(500)) / 250).min(4) as i64 * 5;
+        reward -= penalty;
+    }
+
+    // Silent block: connected + TLS ok but got 0 bytes over 5+ seconds.
+    if bytes_u2c == 0 && lifetime_ms > 5000 {
+        reward = -50;
+    }
+
+    reward
 }
 
+/// Choose the best route arm using UCB1 exploration.
+///
+/// UCB1 scores: `mean_reward + C * sqrt(ln(total_pulls) / pulls)`.
+/// Arms with no prior observations get infinite exploration bonus and are
+/// always tried before exploiting known-good arms.
 pub fn shadow_choose_route_arm(
     bucket: &str,
     route_key: &str,
@@ -394,16 +381,42 @@ pub fn shadow_choose_route_arm(
         return "none".to_owned();
     }
     let map = SHADOW_BANDIT_ARMS.get_or_init(DashMap::new);
+
+    // Total pulls across all candidates — used for the UCB exploration term.
+    let total_pulls: u64 = candidates
+        .iter()
+        .map(|c| shadow_effective_stats(bucket, &c.route_id(), map).0)
+        .sum();
+
+    let ln_total = if total_pulls > 1 {
+        (total_pulls as f64).ln()
+    } else {
+        1.0
+    };
+
     let mut best_arm = candidates[0].route_id();
     let mut best_score = f64::NEG_INFINITY;
+
     for c in candidates {
-        let (pulls, reward_sum) = shadow_effective_stats(bucket, &c.route_id(), map);
-        let score = reward_sum as f64 / pulls.max(1) as f64;
+        let arm_id = c.route_id();
+        // Arms with no real observations always get infinite priority (UCB1 guarantee).
+        let has_real_data = map.contains_key(&format!("{bucket}|{arm_id}"));
+        let score = if !has_real_data {
+            f64::INFINITY
+        } else {
+            let (pulls, reward_sum) = shadow_effective_stats(bucket, &arm_id, map);
+            let pulls_f = pulls.max(1) as f64;
+            let mean_reward = reward_sum as f64 / pulls_f;
+            let exploration = SHADOW_UCB_EXPLORATION_SCALE * (ln_total / pulls_f).sqrt();
+            mean_reward + exploration
+        };
+
         if score > best_score {
             best_score = score;
-            best_arm = c.route_id();
+            best_arm = arm_id;
         }
     }
+
     let _ = route_key;
     best_arm
 }
@@ -432,9 +445,9 @@ fn shadow_effective_stats(
     let prior = shadow_arm_prior(bucket, arm);
     let key = format!("{bucket}|{arm}");
     if let Some(stats) = map.get(&key) {
-        // Apply exponential time-decay so stale observations lose weight over time.
-        // If an ISP updates its DPI, the bandit adapts faster instead of waiting for
-        // enough failures to overcome a large accumulated reward_sum.
+        // Apply exponential time-decay so stale observations lose weight.
+        // If an ISP updates its DPI, the bandit adapts faster instead of waiting
+        // for failures to overcome accumulated reward_sum.
         let decay = if stats.last_seen_unix > 0 {
             let elapsed = now_unix_secs().saturating_sub(stats.last_seen_unix);
             if elapsed >= SHADOW_DECAY_MIN_ELAPSED_SECS {
@@ -458,12 +471,20 @@ fn shadow_effective_stats(
 }
 
 fn shadow_arm_prior(bucket: &str, arm: &str) -> ShadowArmPrior {
+    // Services almost always blocked in RU → prior favours bypass/native.
     match bucket {
-        "youtube" => {
-            if arm == "bypass:1" {
+        "youtube" | "discord" | "instagram" | "facebook" | "twitter" => {
+            if arm.starts_with("bypass:") || arm.starts_with("native:") {
+                ShadowArmPrior::with_mean(40)
+            } else {
+                ShadowArmPrior::with_mean(-20)
+            }
+        }
+        "rutracker" => {
+            if arm.starts_with("bypass:") || arm.starts_with("native:") {
                 ShadowArmPrior::with_mean(60)
             } else {
-                ShadowArmPrior::with_mean(0)
+                ShadowArmPrior::with_mean(-40)
             }
         }
         _ => ShadowArmPrior::with_mean(0),
@@ -472,12 +493,138 @@ fn shadow_arm_prior(bucket: &str, arm: &str) -> ShadowArmPrior {
 
 fn shadow_bucket_name(_rk: &str, host: &str, cfg: &EngineConfig) -> String {
     let bucket = crate::pt::socks5_server::route_scoring::host_service_bucket(host, cfg);
-    if bucket.contains("youtube") {
+    let bucket_lower = bucket.to_ascii_lowercase();
+
+    if bucket_lower.contains("youtube") || bucket_lower.contains("googlevideo") {
         "youtube".to_owned()
+    } else if bucket_lower.contains("discord") {
+        "discord".to_owned()
+    } else if bucket_lower.contains("instagram")
+        || bucket_lower.contains("fbcdn")
+        || bucket_lower.contains("cdninstagram")
+    {
+        "instagram".to_owned()
+    } else if bucket_lower.contains("facebook")
+        || bucket_lower.contains("fb.com")
+        || bucket_lower.contains("messenger.com")
+    {
+        "facebook".to_owned()
+    } else if bucket_lower.contains("rutracker") {
+        "rutracker".to_owned()
+    } else if bucket_lower.contains("twitter")
+        || bucket_lower.contains("x.com")
+        || bucket_lower.contains("twimg")
+    {
+        "twitter".to_owned()
+    } else if bucket_lower.contains("tiktok") || bucket_lower.contains("tiktokcdn") {
+        "tiktok".to_owned()
+    } else if bucket_lower.contains("soundcloud") || bucket_lower.contains("sndcdn") {
+        "soundcloud".to_owned()
     } else {
         "default".to_owned()
     }
 }
 
-pub fn prune_ml_state(_now: u64) {}
+pub fn prune_ml_state(_now: u64) {
+    // TODO: implement ML state pruning
+}
+
 pub fn note_phase2_profile_rotation(_d: &str, _cfg: &EngineConfig) {}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod reward_tests {
+    use super::shadow_reward_from_outcome;
+
+    #[test]
+    fn reward_fast_successful() {
+        let r = shadow_reward_from_outcome(true, true, 1000, 150, "");
+        assert!(r > 60, "fast connection should get bonus: got {r}");
+    }
+
+    #[test]
+    fn reward_slow_successful() {
+        let r = shadow_reward_from_outcome(true, true, 1000, 1500, "");
+        assert!(r < 60, "slow connection should get penalty: got {r}");
+    }
+
+    #[test]
+    fn reward_silent_block() {
+        let r = shadow_reward_from_outcome(true, true, 0, 6000, "");
+        assert!(r < 0, "silent block should be negative: got {r}");
+    }
+
+    #[test]
+    fn reward_connection_failed() {
+        assert_eq!(
+            shadow_reward_from_outcome(false, false, 0, 0, "reset"),
+            -100
+        );
+    }
+
+    #[test]
+    fn reward_connect_ok_tls_fail() {
+        assert_eq!(shadow_reward_from_outcome(true, false, 0, 300, ""), 20);
+    }
+}
+
+#[cfg(test)]
+mod shadow_bandit_tests {
+    use super::*;
+
+    fn init_bandit_arm(bucket: &str, arm: &str, pulls: u64, reward_sum: i64) {
+        let key = format!("{bucket}|{arm}");
+        let map = SHADOW_BANDIT_ARMS.get_or_init(DashMap::new);
+        let mut entry = map.entry(key).or_default();
+        entry.pulls = pulls;
+        entry.reward_sum = reward_sum;
+        entry.last_seen_unix = now_unix_secs();
+    }
+
+    fn make_native_candidates(count: usize) -> Vec<RouteCandidate> {
+        (0..count)
+            .map(|i| {
+                RouteCandidate::native_with_family("test", i as u8, count as u8, RouteIpFamily::Any)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ucb_prefers_untried_arm_over_known_good() {
+        let bucket = "test-ucb-untried";
+        // arm native:1 has many successful pulls
+        init_bandit_arm(bucket, "native:1", 100, 6000);
+        // native:2 and native:3 have 0 pulls — UCB exploration bonus should dominate
+
+        let candidates = make_native_candidates(3);
+        let chosen = shadow_choose_route_arm(bucket, "test:443", &candidates);
+
+        // UCB should choose an untried arm, not the known-good native:1
+        assert_ne!(chosen, "native:1", "UCB should explore untried arms");
+
+        // Cleanup
+        let map = SHADOW_BANDIT_ARMS.get_or_init(DashMap::new);
+        map.remove(&format!("{bucket}|native:1"));
+    }
+
+    #[test]
+    fn ucb_converges_to_best_arm_with_equal_pulls() {
+        let bucket = "test-ucb-converge";
+        init_bandit_arm(bucket, "native:1", 50, 1000); // mean = 20
+        init_bandit_arm(bucket, "native:2", 50, 3000); // mean = 60
+        init_bandit_arm(bucket, "native:3", 50, 500); //  mean = 10
+
+        let candidates = make_native_candidates(3);
+        let chosen = shadow_choose_route_arm(bucket, "test:443", &candidates);
+
+        // With equal pulls, exploration bonus is equal → best mean wins
+        assert_eq!(chosen, "native:2");
+
+        // Cleanup
+        let map = SHADOW_BANDIT_ARMS.get_or_init(DashMap::new);
+        for arm in ["native:1", "native:2", "native:3"] {
+            map.remove(&format!("{bucket}|{arm}"));
+        }
+    }
+}

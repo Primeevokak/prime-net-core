@@ -116,7 +116,7 @@ pub fn tune_relay_for_target(
 
     // 1. Check for a learned preferred stage for this destination or its group
     let learned_stage = {
-        let map = DEST_PREFERRED_STAGE.get_or_init(dashmap::DashMap::new);
+        let map = &routing_state().dest_preferred_stage;
         map.get(&dest_lower)
             .or_else(|| map.get(group_key))
             .map(|v| *v)

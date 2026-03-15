@@ -206,6 +206,16 @@ impl TcpDesyncEngine {
         &self.profiles[idx]
     }
 
+    /// Returns `true` if the profile at `idx` is safe for Cloudflare-hosted targets.
+    ///
+    /// Returns `true` (safe by default) if `idx` is out of range.
+    pub fn is_profile_cloudflare_safe(&self, idx: usize) -> bool {
+        self.profiles
+            .get(idx)
+            .map(|p| p.cloudflare_safe)
+            .unwrap_or(true)
+    }
+
     /// Replace the profile list with a reordered copy (e.g. from discovery cache).
     ///
     /// The packet interceptor is preserved.

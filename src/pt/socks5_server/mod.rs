@@ -341,6 +341,66 @@ pub struct RouteMetrics {
     pub route_failure_native: AtomicU64,
 }
 
+/// Consolidated process-wide routing state.
+///
+/// All per-destination and per-route maps live here.  Access via [`routing_state()`]
+/// which initialises the singleton on first call.
+pub struct RoutingState {
+    /// Per-destination failure counters (capped at 8).
+    pub dest_failures: DashMap<String, u8>,
+    /// Per-destination classifier state (signals, winner, stage).
+    pub dest_classifier: DashMap<String, DestinationClassifier>,
+    /// Per-destination preferred relay stage index.
+    pub dest_preferred_stage: DashMap<String, u8>,
+    /// Per-destination active bypass profile index (rotates on failure).
+    pub dest_bypass_profile_idx: DashMap<String, u8>,
+    /// Per-destination bypass profile failure counters.
+    pub dest_bypass_profile_failures: DashMap<String, u8>,
+    /// Per-destination route winner cache.
+    pub dest_route_winner: DashMap<String, RouteWinner>,
+    /// Per-destination, per-route health counters.
+    pub dest_route_health: DashMap<String, DashMap<String, RouteHealth>>,
+    /// Global health counters for each bypass/native profile across all destinations.
+    pub global_bypass_profile_health: DashMap<String, BypassProfileHealth>,
+    /// Global route capability availability (per kind + family).
+    pub route_capabilities: RwLock<RouteCapabilities>,
+    /// Aggregate routing metrics for the lifetime of the process.
+    pub route_metrics: RouteMetrics,
+}
+
+impl RoutingState {
+    fn new() -> Self {
+        Self {
+            dest_failures: DashMap::new(),
+            dest_classifier: DashMap::new(),
+            dest_preferred_stage: DashMap::new(),
+            dest_bypass_profile_idx: DashMap::new(),
+            dest_bypass_profile_failures: DashMap::new(),
+            dest_route_winner: DashMap::new(),
+            dest_route_health: DashMap::new(),
+            global_bypass_profile_health: DashMap::new(),
+            route_capabilities: RwLock::new(RouteCapabilities::default()),
+            route_metrics: RouteMetrics::default(),
+        }
+    }
+
+    /// Clear all maps — call this in tests to prevent state leak between test cases.
+    #[cfg(test)]
+    pub fn reset(&self) {
+        self.dest_failures.clear();
+        self.dest_classifier.clear();
+        self.dest_preferred_stage.clear();
+        self.dest_bypass_profile_idx.clear();
+        self.dest_bypass_profile_failures.clear();
+        self.dest_route_winner.clear();
+        self.dest_route_health.clear();
+        self.global_bypass_profile_health.clear();
+        if let Ok(mut g) = self.route_capabilities.write() {
+            *g = RouteCapabilities::default();
+        }
+    }
+}
+
 /// A relay configuration together with the stage and how it was selected.
 #[derive(Debug, Clone, Default)]
 pub struct TunedRelay {
@@ -354,28 +414,13 @@ pub struct TunedRelay {
 
 // ── Statics ───────────────────────────────────────────────────────────────────
 
-/// Per-destination failure counters (capped at 8).
-pub static DEST_FAILURES: OnceLock<DashMap<String, u8>> = OnceLock::new();
-/// Per-destination classifier state (signals, winner, stage).
-pub static DEST_CLASSIFIER: OnceLock<DashMap<String, DestinationClassifier>> = OnceLock::new();
-/// Per-destination preferred relay stage index.
-pub static DEST_PREFERRED_STAGE: OnceLock<DashMap<String, u8>> = OnceLock::new();
-/// Per-destination active bypass profile index (rotates on failure).
-pub static DEST_BYPASS_PROFILE_IDX: OnceLock<DashMap<String, u8>> = OnceLock::new();
-/// Per-destination bypass profile failure counters.
-pub static DEST_BYPASS_PROFILE_FAILURES: OnceLock<DashMap<String, u8>> = OnceLock::new();
-/// Per-destination route winner cache.
-pub static DEST_ROUTE_WINNER: OnceLock<DashMap<String, RouteWinner>> = OnceLock::new();
-/// Per-destination, per-route health counters.
-pub static DEST_ROUTE_HEALTH: OnceLock<DashMap<String, DashMap<String, RouteHealth>>> =
-    OnceLock::new();
-/// Global health counters for each bypass/native profile across all destinations.
-pub static GLOBAL_BYPASS_PROFILE_HEALTH: OnceLock<DashMap<String, BypassProfileHealth>> =
-    OnceLock::new();
-/// Global route capability availability (per kind + family).
-pub static ROUTE_CAPABILITIES: OnceLock<RwLock<RouteCapabilities>> = OnceLock::new();
-/// Aggregate routing metrics for the lifetime of the process.
-pub static ROUTE_METRICS: OnceLock<RouteMetrics> = OnceLock::new();
+static ROUTING_STATE: OnceLock<RoutingState> = OnceLock::new();
+
+/// Returns the process-wide [`RoutingState`], initialising it on first call.
+pub fn routing_state() -> &'static RoutingState {
+    ROUTING_STATE.get_or_init(RoutingState::new)
+}
+
 /// Optional domain blocklist loaded from a filter file.
 pub static BLOCKLIST_DOMAINS: OnceLock<crate::blocklist::DomainBloom> = OnceLock::new();
 
