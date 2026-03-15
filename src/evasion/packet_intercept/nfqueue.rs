@@ -110,24 +110,15 @@ impl NfqLib {
         }
 
         Some(Self {
-            open: sym!(b"nfq_open\0", libloading::Symbol<FnNfqOpen>),
-            close: sym!(b"nfq_close\0", libloading::Symbol<FnNfqClose>),
-            create_queue: sym!(b"nfq_create_queue\0", libloading::Symbol<FnNfqCreateQueue>),
-            destroy_queue: sym!(
-                b"nfq_destroy_queue\0",
-                libloading::Symbol<FnNfqDestroyQueue>
-            ),
-            fd: sym!(b"nfq_fd\0", libloading::Symbol<FnNfqFd>),
-            handle_packet: sym!(
-                b"nfq_handle_packet\0",
-                libloading::Symbol<FnNfqHandlePacket>
-            ),
-            get_payload: sym!(b"nfq_get_payload\0", libloading::Symbol<FnNfqGetPayload>),
-            get_pkt_hdr: sym!(
-                b"nfq_get_msg_packet_hdr\0",
-                libloading::Symbol<FnNfqGetPacketHdr>
-            ),
-            set_verdict: sym!(b"nfq_set_verdict\0", libloading::Symbol<FnNfqSetVerdict>),
+            open: sym!(b"nfq_open\0", FnNfqOpen),
+            close: sym!(b"nfq_close\0", FnNfqClose),
+            create_queue: sym!(b"nfq_create_queue\0", FnNfqCreateQueue),
+            destroy_queue: sym!(b"nfq_destroy_queue\0", FnNfqDestroyQueue),
+            fd: sym!(b"nfq_fd\0", FnNfqFd),
+            handle_packet: sym!(b"nfq_handle_packet\0", FnNfqHandlePacket),
+            get_payload: sym!(b"nfq_get_payload\0", FnNfqGetPayload),
+            get_pkt_hdr: sym!(b"nfq_get_msg_packet_hdr\0", FnNfqGetPacketHdr),
+            set_verdict: sym!(b"nfq_set_verdict\0", FnNfqSetVerdict),
             _lib: lib,
         })
     }
@@ -183,7 +174,7 @@ fn run_nfq_disorder_thread(
     lib: Arc<NfqLib>,
     _local_port: u16,
     delay_ms: u64,
-    cancel_rx: oneshot::Receiver<()>,
+    mut cancel_rx: oneshot::Receiver<()>,
 ) {
     // SAFETY: nfq_open returns a valid handle or NULL.
     let h = unsafe { (lib.open)() };
@@ -198,7 +189,7 @@ fn run_nfq_disorder_thread(
         pkt1: Option<(u32, Vec<u8>)>,
         pkt2: Option<(u32, Vec<u8>)>,
     }
-    let mut slots = Slots {
+    let slots = Slots {
         pkt1: None,
         pkt2: None,
     };
