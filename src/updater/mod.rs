@@ -330,9 +330,13 @@ impl AutoUpdater {
 }
 
 fn validate_update_api_url(url: &str) -> Result<()> {
-    // When GITHUB_API_URL is set (e.g. for integration testing), skip strict validation.
-    if std::env::var("GITHUB_API_URL").is_ok() {
-        return Ok(());
+    // When GITHUB_API_URL is set (e.g. for integration testing against a mock server),
+    // allow the URL only if it actually starts with that custom base — not any arbitrary URL.
+    if let Ok(custom_base) = std::env::var("GITHUB_API_URL") {
+        let base = custom_base.trim_end_matches('/');
+        if !base.is_empty() && url.starts_with(base) {
+            return Ok(());
+        }
     }
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| EngineError::Internal(format!("invalid updater API URL '{url}': {e}")))?;
@@ -351,10 +355,7 @@ fn validate_update_api_url(url: &str) -> Result<()> {
 }
 
 fn validate_update_download_url(url: &str) -> Result<()> {
-    // When GITHUB_API_URL is set (e.g. for integration testing), skip strict validation.
-    if std::env::var("GITHUB_API_URL").is_ok() {
-        return Ok(());
-    }
+    // Download URLs always come from GitHub release assets — GITHUB_API_URL does not apply.
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| EngineError::Internal(format!("invalid updater download URL '{url}': {e}")))?;
     if parsed.scheme() != "https" {

@@ -14,7 +14,6 @@ use tracing::{info, warn};
 use crate::blocklist_runtime::{
     initialize_runtime_blocklist, is_bypass_domain_runtime, log_runtime_blocklist_stats,
 };
-use crate::packet_bypass::maybe_start_packet_bypass;
 
 #[derive(Debug, Clone)]
 pub struct SocksOpts {
@@ -77,33 +76,16 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
         }
     }
 
-    // No PT: Initialize runtime blocklist and Packet Bypass (ciadpi)
+    // No PT: Initialize runtime blocklist and native bypass engine.
     let blocklist_stats = initialize_runtime_blocklist(&cfg.blocklist).await?;
     log_runtime_blocklist_stats(&blocklist_stats);
 
-    let packet_bypass = match maybe_start_packet_bypass(cfg.evasion.packet_bypass_enabled).await {
-        Ok(g) => g,
-        Err(e) => {
-            warn!(target: "socks_cmd", error = %e, "packet-level bypass backend failed to start; using internal relay only");
-            None
-        }
-    };
-
     let mut relay_opts = build_direct_relay_options(&cfg);
-    if let Some(addrs) = packet_bypass
-        .as_ref()
-        .map(|g| g.socks5_addrs())
-        .filter(|v| !v.is_empty())
-    {
-        relay_opts.bypass_socks5 = None; // Disable legacy single-addr mode
-        relay_opts.bypass_socks5_pool = addrs.clone();
+
+    // Wire the runtime domain-check function so route scoring can classify blocked domains.
+    if cfg.evasion.packet_bypass_enabled || relay_opts.fragment_client_hello {
         relay_opts.bypass_domain_check = Some(is_bypass_domain_runtime);
-        info!(
-            target: "socks_cmd",
-            backends = relay_opts.bypass_socks5_pool.len(),
-            "packet bypass active: blocked domains will be tunneled through ciadpi pool"
-        );
-    } else if !relay_opts.fragment_client_hello {
+    } else {
         warn!(target: "socks_cmd", "no bypass transport or internal evasion active; running as plain SOCKS5 proxy");
     }
 
