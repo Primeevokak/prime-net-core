@@ -151,16 +151,20 @@ pub fn is_censored_domain(domain: &str, _relay_opts: &RelayOptions, cfg: &Engine
         }
     }
 
+    // Strip port from dest_lower for domain-only lookups (blocklist and bypass check
+    // store bare hostnames like "rbc.ru", not "rbc.ru:443").
+    let dest_host = dest_lower.split(':').next().unwrap_or(&dest_lower);
+
     // 2. Check global engine blocklist
     if let Some(bloom) = BLOCKLIST_DOMAINS.get() {
-        if bloom.contains_host_or_suffix(&dest_lower) {
+        if bloom.contains_host_or_suffix(dest_host) {
             return true;
         }
     }
 
     // 3. Custom check function fallback
     if let Some(check_fn) = _relay_opts.bypass_domain_check {
-        if check_fn(domain) {
+        if check_fn(dest_host) {
             return true;
         }
     }
