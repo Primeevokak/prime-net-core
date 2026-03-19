@@ -189,6 +189,16 @@ fn run_nfq_disorder_thread(
         pkt1: Option<(u32, Vec<u8>)>,
         pkt2: Option<(u32, Vec<u8>)>,
     }
+
+    // Fat-pointer bundle passed to the C callback.
+    // #[repr(C)] guarantees the field layout matches what cb expects when it
+    // casts the void* back to *mut UserData.
+    #[repr(C)]
+    struct UserData {
+        slots: Slots,
+        lib_ptr: *const NfqLib,
+    }
+
     let slots = Slots {
         pkt1: None,
         pkt2: None,
@@ -201,10 +211,10 @@ fn run_nfq_disorder_thread(
         nfad: *mut nfq_data,
         user: *mut std::ffi::c_void,
     ) -> std::ffi::c_int {
-        // SAFETY: user pointer is a valid &mut Slots for the duration of the call.
-        let slots = &mut *(user as *mut Slots);
-        let lib_ptr = *(user.add(std::mem::size_of::<Slots>()) as *const *const NfqLib);
-        let lib = &*lib_ptr;
+        // SAFETY: user is a valid *mut UserData for the duration of the call.
+        let user_data = &mut *(user as *mut UserData);
+        let slots = &mut user_data.slots;
+        let lib = &*user_data.lib_ptr;
 
         let hdr = (lib.get_pkt_hdr)(nfad);
         if hdr.is_null() {
@@ -238,14 +248,8 @@ fn run_nfq_disorder_thread(
         0
     }
 
-    // Build a fat pointer layout: [Slots, *const NfqLib] for the callback.
-    // This avoids global state.  The pointer lives for the duration of this function.
-    let lib_ptr: *const NfqLib = Arc::as_ptr(&lib);
-    struct UserData {
-        slots: Slots,
-        lib_ptr: *const NfqLib,
-    }
     // SAFETY: lib_ptr points to data kept alive by lib Arc above.
+    let lib_ptr: *const NfqLib = Arc::as_ptr(&lib);
     let mut user = UserData { slots, lib_ptr };
 
     // SAFETY: h is valid; cb has the correct signature; &mut user is valid for

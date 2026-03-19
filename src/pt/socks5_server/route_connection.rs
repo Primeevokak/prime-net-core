@@ -1,6 +1,6 @@
 use crate::config::EngineConfig;
 use crate::error::{EngineError, Result};
-use crate::pt::socks5_server::ml_shadow::complete_route_outcome_event;
+use crate::pt::socks5_server::ml_shadow::{complete_route_outcome_event, next_route_decision_id};
 use crate::pt::socks5_server::protocol_handlers::tune_relay_for_target;
 use crate::pt::{BoxStream, DynOutbound, TargetAddr, TargetEndpoint};
 use std::net::SocketAddr;
@@ -214,7 +214,10 @@ pub async fn connect_via_best_route(
             stream,
             candidate: cand,
             route_key: target_label.to_owned(),
-            decision_id: conn_id,
+            // Use a unique decision ID distinct from conn_id: one connection may make
+            // several routing decisions (retries, race restarts), and the ML shadow keyed
+            // by decision_id must not collide across them.
+            decision_id: next_route_decision_id(),
             initial_client_data: initial_client_data.unwrap_or_default(),
             initial_upstream_data: u2c,
             client_data_sent: sent,
@@ -546,7 +549,17 @@ async fn read_socks5_target_endpoint_with_atyp(
             tcp.read_exact(&mut d).await?;
             TargetAddr::Domain(String::from_utf8_lossy(&d).to_string())
         }
-        _ => return Err(EngineError::Internal("unsupported atyp".to_owned())),
+        0x04 => {
+            // RFC 1928 §5: IPv6 address, 16 octets in network byte order.
+            let mut ip = [0u8; 16];
+            tcp.read_exact(&mut ip).await?;
+            TargetAddr::Ip(std::net::IpAddr::V6(ip.into()))
+        }
+        _ => {
+            return Err(EngineError::Internal(format!(
+                "unsupported SOCKS5 atyp: {atyp:#x}"
+            )))
+        }
     };
     let mut p = [0u8; 2];
     tcp.read_exact(&mut p).await?;
@@ -574,8 +587,10 @@ async fn read_initial_upstream_response<S: AsyncReadExt + Unpin>(
         tokio::time::timeout(Duration::from_millis(3000), stream.read(&mut buf)).await
     {
         if n > 0 {
-            // Validate TLS record type on HTTPS port.
-            if port == 443 && buf[0] != 0x16 {
+            // Validate TLS record type on HTTPS ports (443 and 8443 are always TLS;
+            // other ports in the native-candidate range can carry plaintext).
+            let is_tls_port = port == 443 || port == 8443;
+            if is_tls_port && buf[0] != 0x16 {
                 debug!(
                     conn_id,
                     route = %route_label,
@@ -592,14 +607,11 @@ async fn read_initial_upstream_response<S: AsyncReadExt + Unpin>(
             }
             initial.extend_from_slice(&buf[..n]);
 
-            // Read more data in the next 50 ms — some servers send ServerHello
+            // Read more data for up to 50 ms — some servers send ServerHello
             // in multiple TCP segments (e.g. strict Meta servers).
             let mut extra = [0u8; 4096];
-            while let Ok(Ok(Ok(en))) = tokio::time::timeout(
-                Duration::from_millis(50),
-                tokio::time::timeout(Duration::from_millis(10), stream.read(&mut extra)),
-            )
-            .await
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+            while let Ok(Ok(en)) = tokio::time::timeout_at(deadline, stream.read(&mut extra)).await
             {
                 if en == 0 {
                     break;

@@ -252,8 +252,18 @@ impl TcpDesyncEngine {
 
         let delay = profile.inter_fragment_delay_ms;
 
-        // HTTP-split profiles handle port-80 plaintext before TLS is checked.
+        // HTTP-split only makes sense for plaintext HTTP (port 80).
+        // If the first byte is 0x16, this is a TLS ClientHello — skip the HttpSplit
+        // technique and fall through to the TLS-aware path below.
         if let DesyncTechnique::HttpSplit { at } = &profile.technique {
+            if !data.is_empty() && data[0] == 0x16 {
+                // TLS data reached an HttpSplit profile — treat as plain split at the
+                // TLS record boundary (first 5 bytes = header, rest = payload).
+                let split = data.len().min(5);
+                tcp_segment_split(writer, data, split, delay).await?;
+                writer.flush().await?;
+                return Ok(());
+            }
             let split = http_split_offset(data, *at);
             tcp_segment_split(writer, data, split, delay).await?;
             writer.flush().await?;

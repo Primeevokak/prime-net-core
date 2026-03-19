@@ -246,13 +246,17 @@ fn bootstrap_http_client() -> Result<reqwest::Client> {
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(45))
         .user_agent("prime-net-engine/pt-bootstrap");
-    if let Ok(proxy) = std::env::var("PRIME_PT_BOOTSTRAP_PROXY") {
-        let p = proxy.trim();
-        if !p.is_empty() {
-            builder = builder.proxy(reqwest::Proxy::all(p).map_err(|e| {
-                EngineError::Config(format!("invalid PRIME_PT_BOOTSTRAP_PROXY: {e}"))
-            })?);
-        }
+    let explicit_proxy = std::env::var("PRIME_PT_BOOTSTRAP_PROXY")
+        .ok()
+        .filter(|p| !p.trim().is_empty());
+    if let Some(proxy) = explicit_proxy {
+        builder = builder.proxy(reqwest::Proxy::all(proxy.trim()).map_err(|e| {
+            EngineError::Config(format!("invalid PRIME_PT_BOOTSTRAP_PROXY: {e}"))
+        })?);
+    } else {
+        // No explicit proxy configured — bypass system/env proxies to avoid
+        // accidentally routing bootstrap traffic through the engine itself.
+        builder = builder.no_proxy();
     }
     Ok(builder.build()?)
 }

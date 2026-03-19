@@ -221,10 +221,12 @@ async fn handshake(
 
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
+    // 15-second hard cap: a server that never sends \r\n\r\n would block forever otherwise.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
-        let n = stream
-            .read(&mut tmp)
+        let n = tokio::time::timeout_at(deadline, stream.read(&mut tmp))
             .await
+            .map_err(|_| EngineError::Internal("websocket handshake timed out (15 s)".to_owned()))?
             .map_err(|e| EngineError::Internal(format!("websocket handshake read failed: {e}")))?;
         if n == 0 {
             return Err(EngineError::Internal("websocket handshake: EOF".to_owned()));

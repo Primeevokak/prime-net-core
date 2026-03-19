@@ -280,6 +280,7 @@ async fn resolve_sha256_from_sidecar(source_url: &str) -> Result<Option<[u8; 32]
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
         .user_agent("prime-net-engine/packet-bypass-bootstrap")
+        .no_proxy()
         .build()
         .map_err(|e| EngineError::Config(format!("failed to build integrity-check client: {e}")))?;
 

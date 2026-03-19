@@ -52,7 +52,10 @@ impl ProxyDiagnostics {
     }
 
     pub async fn check_pac_server(url: &str) -> DiagnosticResult {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap_or_default();
         match client.get(url).timeout(Duration::from_secs(2)).send().await {
             Ok(resp) if resp.status().is_success() => DiagnosticResult::ok("PAC server responding"),
             Ok(resp) => DiagnosticResult::error(

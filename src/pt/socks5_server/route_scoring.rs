@@ -642,6 +642,21 @@ mod native_bypass_tests {
     use crate::evasion::TcpDesyncEngine;
     use std::sync::Arc;
 
+    // Tests that mutate the shared `routing_state()` (insert/remove health entries or call
+    // `reset()`) must not run concurrently — they race over the same DashMap entries.
+    // Acquiring this lock serializes only the mutating tests; pure-read tests are unaffected.
+    static ROUTING_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire the per-module serialization lock.
+    ///
+    /// Uses `unwrap_or_else(|p| p.into_inner())` so that a panic in one test does not
+    /// poison the mutex and block all subsequent tests in the suite.
+    fn lock_routing_state() -> std::sync::MutexGuard<'static, ()> {
+        ROUTING_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     fn make_relay_opts_with_engine() -> RelayOptions {
         RelayOptions {
             native_bypass: Some(Arc::new(TcpDesyncEngine::with_default_profiles())),
@@ -794,6 +809,7 @@ mod native_bypass_tests {
 
     #[test]
     fn global_bypass_profile_score_applies_to_native_prefix() {
+        let _guard = lock_routing_state();
         let key = "native:1";
         let map = &routing_state().global_bypass_profile_health;
         map.insert(
@@ -829,6 +845,7 @@ mod native_bypass_tests {
 
     #[test]
     fn record_native_success_increments_global_health() {
+        let _guard = lock_routing_state();
         let candidate = RouteCandidate::native_with_family("engine", 3, 12, RouteIpFamily::Any);
         let key = bypass_profile_health_key(&candidate.route_id(), candidate.family);
         // Clear state
@@ -844,6 +861,7 @@ mod native_bypass_tests {
 
     #[test]
     fn record_native_failure_increments_global_health() {
+        let _guard = lock_routing_state();
         let candidate = RouteCandidate::native_with_family("engine", 4, 12, RouteIpFamily::Any);
         let key = bypass_profile_health_key(&candidate.route_id(), candidate.family);
         let map = &routing_state().global_bypass_profile_health;
@@ -868,6 +886,7 @@ mod native_bypass_tests {
     /// candidates rather than excluding it as it would under plain index order.
     #[test]
     fn ml_sorted_candidates_promote_high_score_profile() {
+        let _guard = lock_routing_state();
         routing_state().reset();
 
         let opts = RelayOptions {
