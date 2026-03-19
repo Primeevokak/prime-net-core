@@ -12,7 +12,10 @@ use crate::pt::{BoxStream, OutboundConnector};
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// How long (in seconds) a learned route winner is considered fresh before a re-race.
-pub const ROUTE_WINNER_TTL_SECS: u64 = 900;
+///
+/// 2 hours: ISP DPI strategies change slowly.  The winner cache is invalidated on failure
+/// regardless of TTL, so a stale winner never persists through an actual block event.
+pub const ROUTE_WINNER_TTL_SECS: u64 = 7200;
 /// Consecutive failures before a route is marked "weak".
 pub const ROUTE_FAILS_BEFORE_WEAK: u8 = 2;
 /// Base weak-penalty duration in seconds.
@@ -366,6 +369,11 @@ pub struct RoutingState {
     pub route_capabilities: RwLock<RouteCapabilities>,
     /// Aggregate routing metrics for the lifetime of the process.
     pub route_metrics: RouteMetrics,
+    /// Domains with detected QUIC silent drop.
+    ///
+    /// Key: `"domain.com:443"`. Value: unix timestamp of detection.
+    /// TTL: `QUIC_SILENT_DROP_TTL_SECS` (1800 s).
+    pub quic_silent_drop_cache: DashMap<String, u64>,
 }
 
 impl RoutingState {
@@ -381,6 +389,7 @@ impl RoutingState {
             global_bypass_profile_health: DashMap::new(),
             route_capabilities: RwLock::new(RouteCapabilities::default()),
             route_metrics: RouteMetrics::default(),
+            quic_silent_drop_cache: DashMap::new(),
         }
     }
 
@@ -395,6 +404,7 @@ impl RoutingState {
         self.dest_route_winner.clear();
         self.dest_route_health.clear();
         self.global_bypass_profile_health.clear();
+        self.quic_silent_drop_cache.clear();
         if let Ok(mut g) = self.route_capabilities.write() {
             *g = RouteCapabilities::default();
         }

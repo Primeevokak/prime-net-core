@@ -59,6 +59,7 @@ impl HealthChecker {
         );
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
+            .no_proxy()
             .build();
         let Ok(client) = client else {
             return HealthCheckResult::info("PAC check unavailable", "");

@@ -18,7 +18,7 @@ pub async fn handle_socks4(
     peer: SocketAddr,
     client: String,
     outbound: DynOutbound,
-    _cfg: Arc<EngineConfig>,
+    cfg: Arc<EngineConfig>,
     cmd: u8,
     _silent_drop: bool,
     relay_opts: RelayOptions,
@@ -50,7 +50,14 @@ pub async fn handle_socks4(
         .await?;
     tcp.write_all(&[0x00, 0x5a, 0x00, 0x00, 0, 0, 0, 0]).await?;
 
-    let tuned = tune_relay_for_target(relay_opts, port, &target_addr.to_string(), true, false);
+    let tuned = tune_relay_for_target(
+        relay_opts,
+        port,
+        &target_addr.to_string(),
+        true,
+        false,
+        &cfg,
+    );
     let (c2u, u2c) = relay_bidirectional(
         &mut tcp,
         &mut out,

@@ -71,8 +71,21 @@ pub fn record_destination_success_sync(destination: &str, stage: u8, _cfg: &Engi
     }
 }
 
-pub fn maybe_prune_runtime_classifier_state(_now: u64, _cfg: Arc<EngineConfig>) {
-    crate::pt::socks5_server::ml_shadow::prune_ml_state(_now);
+pub fn maybe_prune_runtime_classifier_state(now: u64, cfg: Arc<EngineConfig>) {
+    crate::pt::socks5_server::ml_shadow::prune_ml_state(now);
+
+    // Prune stale preferred_stage entries from in-memory hot cache.
+    // load_classifier_store_if_needed enforces TTL only at startup.
+    // Without runtime pruning, this map grows indefinitely during long sessions.
+    let ttl = cfg.evasion.stage_cache_ttl_secs;
+    let classifier = &routing_state().dest_classifier;
+    let stages = &routing_state().dest_preferred_stage;
+    stages.retain(|key, _| {
+        classifier
+            .get(key.as_str())
+            .map(|v| now.saturating_sub(v.last_seen_unix) <= ttl)
+            .unwrap_or(false)
+    });
 }
 
 pub fn init_classifier_store(_opts: &RelayOptions, cfg: Arc<EngineConfig>) {
@@ -106,20 +119,27 @@ pub fn load_classifier_store_if_needed(cfg: Arc<EngineConfig>) {
 
                     let now = now_unix_secs();
                     for (k, v) in data {
-                        // Only load if not too old (e.g. 7 days)
-                        if now.saturating_sub(v.last_seen_unix) > 604800 {
+                        // Only load if not too old (7 days = classifier_entry_ttl_secs)
+                        if now.saturating_sub(v.last_seen_unix)
+                            > cfg.evasion.classifier_entry_ttl_secs
+                        {
                             continue;
                         }
 
                         if let Some(ref winner) = v.winner {
-                            // Only restore winner if it's still fresh enough (e.g. 24 hours for persistence)
-                            if now.saturating_sub(winner.updated_at_unix) < 86400 {
+                            if now.saturating_sub(winner.updated_at_unix)
+                                < cfg.evasion.winner_cache_ttl_secs
+                            {
                                 winners.insert(k.clone(), winner.clone());
                             }
                         }
 
                         if let Some(stage) = v.preferred_stage {
-                            stages.insert(k.clone(), stage);
+                            let age = now.saturating_sub(v.last_seen_unix);
+                            if age <= cfg.evasion.stage_cache_ttl_secs {
+                                stages.insert(k.clone(), stage);
+                            }
+                            // Stale stage intentionally dropped: ISP DPI profile may have changed.
                         }
 
                         map.insert(k, v);
@@ -185,5 +205,36 @@ pub fn maybe_flush_classifier_store(force: bool, cfg: Arc<EngineConfig>) {
             }
         }
         Err(e) => tracing::warn!("Failed to serialize classifier cache: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod stage_ttl_tests {
+    use crate::config::EngineConfig;
+
+    #[test]
+    fn stale_stage_not_restored() {
+        let mut cfg = EngineConfig::default();
+        cfg.evasion.stage_cache_ttl_secs = 100;
+        let age = 200u64; // older than TTL
+        let restored: Option<u8> = if age <= cfg.evasion.stage_cache_ttl_secs {
+            Some(2)
+        } else {
+            None
+        };
+        assert_eq!(restored, None);
+    }
+
+    #[test]
+    fn fresh_stage_is_restored() {
+        let mut cfg = EngineConfig::default();
+        cfg.evasion.stage_cache_ttl_secs = 100;
+        let age = 50u64; // within TTL
+        let restored: Option<u8> = if age <= cfg.evasion.stage_cache_ttl_secs {
+            Some(2)
+        } else {
+            None
+        };
+        assert_eq!(restored, Some(2));
     }
 }

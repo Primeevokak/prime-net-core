@@ -306,9 +306,24 @@ pub fn select_route_candidates(
         let bypass_cands = select_bypass_candidates(relay_opts, destination, cfg);
         let native_cands = select_native_candidates(relay_opts, destination);
 
+        // ML-rank all native candidates by bandit health score so the profiles the bandit
+        // has learned work best enter the first race.  On cold-start every score is 0 and
+        // selection falls back to index order — identical to the previous behaviour.
+        let route_key = route_destination_key(destination);
+        let now = now_unix_secs();
+        let mut ranked_native: Vec<RouteCandidate> = native_cands
+            .into_iter()
+            .map(|(idx, total)| RouteCandidate::native_with_family("engine", idx, total, family))
+            .collect();
+        ranked_native.sort_by(|a, b| {
+            route_health_score(route_key, b, now, cfg)
+                .cmp(&route_health_score(route_key, a, now, cfg))
+        });
+
         if is_blocked {
             // PROACTIVE BYPASS: For blocked domains try external bypass FIRST (score 1000),
-            // then native desync profiles (score 900), direct is last-resort fallback.
+            // then the top-8 ML-ranked native desync profiles (score 900).
+            // Direct is last-resort fallback only.
             let mut count = 0;
             for (addr, idx, total) in bypass_cands {
                 out.push(RouteCandidate {
@@ -320,16 +335,8 @@ pub fn select_route_candidates(
                     break;
                 }
             }
-            let mut native_count = 0;
-            for (idx, total) in native_cands {
-                out.push(RouteCandidate {
-                    score: 900,
-                    ..RouteCandidate::native_with_family("engine", idx, total, family)
-                });
-                native_count += 1;
-                if native_count >= 4 {
-                    break;
-                }
+            for cand in ranked_native.into_iter().take(8) {
+                out.push(RouteCandidate { score: 900, ..cand });
             }
             // Direct is a very late fallback
             out.push(RouteCandidate {
@@ -337,7 +344,8 @@ pub fn select_route_candidates(
                 ..RouteCandidate::direct_with_family("adaptive", family)
             });
         } else {
-            // Normal domains: Direct first, then bypass pool, then up to 2 native profiles as backup.
+            // Normal domains: Direct first, then bypass pool, then up to 4 ML-ranked
+            // native profiles as backup.
             out.push(RouteCandidate {
                 score: 100,
                 ..RouteCandidate::direct_with_family("adaptive", family)
@@ -347,15 +355,8 @@ pub fn select_route_candidates(
                     "pool", addr, idx, total, family,
                 ));
             }
-            let mut native_count = 0;
-            for (idx, total) in native_cands {
-                out.push(RouteCandidate::native_with_family(
-                    "engine", idx, total, family,
-                ));
-                native_count += 1;
-                if native_count >= 2 {
-                    break;
-                }
+            for cand in ranked_native.into_iter().take(4) {
+                out.push(cand);
             }
         }
     } else {
@@ -615,6 +616,26 @@ pub fn record_route_failure(rk: &str, c: &RouteCandidate, r: &'static str, cfg: 
     record_route_failure_sync(rk, c, r, cfg);
 }
 
+/// TTL (in seconds) for QUIC silent-drop cache entries.
+pub(crate) const QUIC_SILENT_DROP_TTL_SECS: u64 = 1800;
+
+/// Returns `true` if `key` (e.g. `"domain.com:443"`) was recently detected as a
+/// QUIC silent-drop destination and the entry is still within its TTL.
+pub(crate) fn is_quic_silent_drop_cached(key: &str) -> bool {
+    routing_state()
+        .quic_silent_drop_cache
+        .get(key)
+        .map(|ts| now_unix_secs().saturating_sub(*ts) < QUIC_SILENT_DROP_TTL_SECS)
+        .unwrap_or(false)
+}
+
+/// Records `key` as a QUIC silent-drop destination with the current timestamp.
+pub(crate) fn record_quic_silent_drop(key: &str) {
+    routing_state()
+        .quic_silent_drop_cache
+        .insert(key.to_owned(), now_unix_secs());
+}
+
 #[cfg(test)]
 mod native_bypass_tests {
     use super::*;
@@ -744,11 +765,11 @@ mod native_bypass_tests {
         let cands =
             select_route_candidates(&opts, &target, 443, "example.com", &EngineConfig::default());
 
-        // For normal domains: Direct + up to 2 Native (no bypass pool)
+        // For normal domains: Direct + up to 4 Native (no bypass pool)
         let native_count = cands.iter().filter(|c| c.kind == RouteKind::Native).count();
         assert!(
-            native_count > 0 && native_count <= 2,
-            "normal domain: up to 2 native candidates, got {}",
+            native_count > 0 && native_count <= 4,
+            "normal domain: up to 4 native candidates, got {}",
             native_count
         );
         assert!(cands.iter().any(|c| c.kind == RouteKind::Direct));
@@ -838,6 +859,66 @@ mod native_bypass_tests {
         let failures = map.get(&key).expect("health entry created").failures;
         assert_eq!(failures, 1);
         map.remove(&key);
+    }
+
+    // ── ML-sort: bandit score influences first-race candidate selection ───────
+
+    /// Seed profile 15 (0-based index 14) with a high global health score, then verify
+    /// that `select_route_candidates` for a blocked domain places it in the first 8
+    /// candidates rather than excluding it as it would under plain index order.
+    #[test]
+    fn ml_sorted_candidates_promote_high_score_profile() {
+        routing_state().reset();
+
+        let opts = RelayOptions {
+            bypass_domain_check: Some(|h| h.contains("censored.example")),
+            ..make_relay_opts_with_engine()
+        };
+        let engine = opts.native_bypass.as_ref().unwrap();
+        let total = engine.profile_count();
+        // Test only makes sense when there are enough profiles.
+        if total < 16 {
+            return;
+        }
+
+        // Give profile index 14 (native:15) a high global health score.
+        let high_idx: u8 = 14;
+        let key = format!("native:{}", high_idx + 1);
+        routing_state().global_bypass_profile_health.insert(
+            key.clone(),
+            BypassProfileHealth {
+                successes: 50,
+                failures: 0,
+                last_success_unix: now_unix_secs(),
+                ..Default::default()
+            },
+        );
+
+        let target = crate::pt::TargetAddr::Domain("censored.example.com".to_owned());
+        let cands = select_route_candidates(
+            &opts,
+            &target,
+            443,
+            "censored.example.com",
+            &EngineConfig::default(),
+        );
+
+        let native_indices: Vec<u8> = cands
+            .iter()
+            .filter(|c| c.kind == RouteKind::Native)
+            .map(|c| c.bypass_profile_idx)
+            .collect();
+
+        assert!(
+            native_indices.contains(&high_idx),
+            "profile {} should be in the first-race candidates after ML promotion; got {:?}",
+            high_idx,
+            native_indices
+        );
+
+        // Cleanup
+        routing_state().global_bypass_profile_health.remove(&key);
+        routing_state().reset();
     }
 
     // ── Non-TLS port: no native candidates ───────────────────────────────────

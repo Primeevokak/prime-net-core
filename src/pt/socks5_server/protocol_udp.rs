@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
@@ -8,7 +9,9 @@ use crate::anticensorship::ResolverChain;
 use crate::config::EngineConfig;
 use crate::error::Result;
 use crate::evasion::quic_initial::{parse_quic_initial_header, send_fake_quic_initial};
-use crate::pt::socks5_server::route_scoring::is_censored_domain;
+use crate::pt::socks5_server::route_scoring::{
+    is_censored_domain, is_quic_silent_drop_cached, record_quic_silent_drop,
+};
 use crate::pt::socks5_server::state_and_startup::RelayOptions;
 
 /// IP TTL for fake QUIC Initial probes (should expire before reaching the server).
@@ -51,9 +54,16 @@ pub async fn handle_udp_associate(
 
     let mut buf = vec![0u8; 65535];
     let mut client_source_addr: Option<SocketAddr> = None;
-    let mut remote_to_target = std::collections::HashMap::new();
+    let mut remote_to_target = HashMap::new();
 
     let mut tcp_buf = [0u8; 1];
+
+    // QUIC silent-drop probe state (all owned by this task — no shared state, no race).
+    // Key: "domain:443", Value: Instant when the probe packet was sent.
+    let mut quic_pending: HashMap<String, tokio::time::Instant> = HashMap::new();
+    // Maps resolved SocketAddr back to the cache key so we can clear the probe on response.
+    let mut addr_to_domain: HashMap<SocketAddr, String> = HashMap::new();
+    let mut probe_check = tokio::time::interval(std::time::Duration::from_secs(1));
 
     loop {
         tokio::select! {
@@ -77,7 +87,16 @@ pub async fn handle_udp_associate(
 
                         if Some(src) == client_source_addr {
                             // Packet from client -> remote
-                            match handle_client_to_remote(conn_id, &udp_send, &buf[..n], &resolver, &cfg, &relay_opts).await {
+                            match handle_client_to_remote(
+                                conn_id,
+                                &udp_send,
+                                &buf[..n],
+                                &resolver,
+                                &cfg,
+                                &relay_opts,
+                                &mut quic_pending,
+                                &mut addr_to_domain,
+                            ).await {
                                 Ok(Some(target_addr)) => {
                                     remote_to_target.insert(target_addr, target_addr);
                                 }
@@ -88,6 +107,16 @@ pub async fn handle_udp_associate(
                             }
                         } else {
                             // Packet from remote -> client
+                            if cfg.evasion.quic_probe_timeout_ms > 0 {
+                                if let Some(domain_key) = addr_to_domain.remove(&src) {
+                                    quic_pending.remove(&domain_key);
+                                    debug!(
+                                        conn_id,
+                                        key = %domain_key,
+                                        "QUIC probe resolved: response received"
+                                    );
+                                }
+                            }
                             if let Some(target) = remote_to_target.get(&src) {
                                 if let Some(client_addr) = client_source_addr {
                                     if let Err(e) = send_to_client(conn_id, &udp_send, client_addr, target, &buf[..n]).await {
@@ -100,6 +129,22 @@ pub async fn handle_udp_associate(
                     Err(_) => break,
                 }
             }
+            // Check for expired QUIC probes (silent-drop detection)
+            _ = probe_check.tick(), if cfg.evasion.quic_probe_timeout_ms > 0 => {
+                let timeout = std::time::Duration::from_millis(cfg.evasion.quic_probe_timeout_ms);
+                let mut stale_keys: Vec<String> = Vec::new();
+                quic_pending.retain(|key, started_at| {
+                    if started_at.elapsed() > timeout {
+                        debug!(conn_id, key = %key, "QUIC probe expired → silent drop");
+                        record_quic_silent_drop(key);
+                        stale_keys.push(key.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                addr_to_domain.retain(|_, v| !stale_keys.contains(v));
+            }
             _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
                 debug!(conn_id, "UDP relay idle timeout");
                 break;
@@ -110,6 +155,7 @@ pub async fn handle_udp_associate(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_client_to_remote(
     conn_id: u64,
     socket: &UdpSocket,
@@ -117,6 +163,8 @@ async fn handle_client_to_remote(
     resolver: &ResolverChain,
     cfg: &EngineConfig,
     relay_opts: &RelayOptions,
+    quic_pending: &mut HashMap<String, tokio::time::Instant>,
+    addr_to_domain: &mut HashMap<SocketAddr, String>,
 ) -> std::io::Result<Option<SocketAddr>> {
     if data.len() < 4 {
         return Ok(None);
@@ -125,6 +173,10 @@ async fn handle_client_to_remote(
     if frag != 0 {
         return Ok(None);
     }
+
+    // Probe state owned by relay loop — registered AFTER successful send to avoid
+    // false positives if send_to fails.
+    let mut probe_hint: Option<(String, SocketAddr)> = None;
 
     let atyp = data[3];
     let (target_addr, header_len) = match atyp {
@@ -168,11 +220,28 @@ async fn handle_client_to_remote(
                 );
             }
 
+            let cache_key = format!("{domain}:443");
+            if port == 443
+                && cfg.evasion.quic_probe_timeout_ms > 0
+                && is_quic_silent_drop_cached(&cache_key)
+            {
+                debug!(
+                    conn_id,
+                    domain = %domain,
+                    "QUIC silent-drop cache hit: blocking UDP → TCP fallback"
+                );
+                return Ok(None);
+            }
+
             // ANTI-LEAK: Use encrypted resolver instead of system lookup_host
             match resolver.resolve(&domain).await {
                 Ok(ips) => {
                     if let Some(ip) = ips.first() {
-                        (SocketAddr::new(*ip, port), 5 + len + 2)
+                        let resolved_addr = SocketAddr::new(*ip, port);
+                        if port == 443 && cfg.evasion.quic_probe_timeout_ms > 0 {
+                            probe_hint = Some((cache_key, resolved_addr));
+                        }
+                        (resolved_addr, 5 + len + 2)
                     } else {
                         return Ok(None);
                     }
@@ -216,6 +285,16 @@ async fn handle_client_to_remote(
     }
 
     socket.send_to(payload, target_addr).await?;
+
+    // Register the probe only after a successful send — avoids false silent-drop
+    // classification if the local send itself fails.
+    if let Some((key, resolved_addr)) = probe_hint {
+        if !quic_pending.contains_key(&key) {
+            quic_pending.insert(key.clone(), tokio::time::Instant::now());
+            addr_to_domain.insert(resolved_addr, key);
+        }
+    }
+
     Ok(Some(target_addr))
 }
 
@@ -242,4 +321,38 @@ async fn send_to_client(
 
     socket.send_to(&reply, client_addr).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod quic_silent_drop_tests {
+    use crate::pt::socks5_server::route_scoring::{
+        is_quic_silent_drop_cached, record_quic_silent_drop, QUIC_SILENT_DROP_TTL_SECS,
+    };
+    use crate::pt::socks5_server::{now_unix_secs, routing_state};
+
+    #[test]
+    fn quic_silent_drop_absent_returns_false() {
+        let key = "absent-quic-test.invalid:443";
+        routing_state().quic_silent_drop_cache.remove(key);
+        assert!(!is_quic_silent_drop_cached(key));
+    }
+
+    #[test]
+    fn quic_silent_drop_present_returns_true() {
+        let key = "present-quic-test.invalid:443";
+        record_quic_silent_drop(key);
+        assert!(is_quic_silent_drop_cached(key));
+        routing_state().quic_silent_drop_cache.remove(key);
+    }
+
+    #[test]
+    fn quic_silent_drop_expired_returns_false() {
+        let key = "expired-quic-test.invalid:443";
+        routing_state().quic_silent_drop_cache.insert(
+            key.to_owned(),
+            now_unix_secs().saturating_sub(QUIC_SILENT_DROP_TTL_SECS + 1),
+        );
+        assert!(!is_quic_silent_drop_cached(key));
+        routing_state().quic_silent_drop_cache.remove(key);
+    }
 }

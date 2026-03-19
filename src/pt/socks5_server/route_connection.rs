@@ -93,95 +93,107 @@ pub async fn connect_via_best_route(
         let icd = initial_client_data.clone();
 
         winners.spawn(async move {
-            let delay = (idx as u64) * 100;
+            // 50 ms stagger between candidates reduces thundering-herd while still
+            // allowing later (potentially better-scored) profiles to start quickly.
+            let delay = (idx as u64) * 50;
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
 
-            let mut initial_u2c = Vec::new();
-            let mut sent = false;
+            // Hard cap per candidate: 5 s covers connect + initial-response read
+            // (3 s) with margin.  Losing tasks are reaped faster after a winner
+            // is found.
+            tokio::time::timeout(Duration::from_secs(5), async move {
+                let mut initial_u2c = Vec::new();
+                let mut sent = false;
 
-            // Native routes connect via raw TcpStream to enable OOB byte injection
-            // and fake low-TTL probes.  All other routes go through connect_route_candidate.
-            if c.kind == RouteKind::Native {
-                if let Some(ref engine) = ro.native_bypass {
-                    let profile_idx = c.bypass_profile_idx as usize;
-                    let resolver = out.resolver().ok_or(EngineError::ResolverMissing)?;
-                    let direct = crate::pt::direct::DirectOutbound::new(resolver);
+                // Native routes connect via raw TcpStream to enable OOB byte injection
+                // and fake low-TTL probes.  All other routes go through connect_route_candidate.
+                if c.kind == RouteKind::Native {
+                    if let Some(ref engine) = ro.native_bypass {
+                        let profile_idx = c.bypass_profile_idx as usize;
+                        let resolver = out.resolver().ok_or(EngineError::ResolverMissing)?;
+                        let direct = crate::pt::direct::DirectOutbound::new(resolver);
 
-                    // Send a fake low-TTL probe to desync the DPI's TCP state table.
-                    if let Some(probe) = engine.profile_fake_probe(profile_idx) {
-                        if let Ok(addr) = direct.resolve_target_ip(&t).await {
-                            if let Some(sni) = probe.fake_sni {
-                                // Crafted TLS ClientHello probe — DPI parses the fake SNI
-                                // then loses state when the probe expires (low TTL).
-                                let _ = crate::evasion::dpi_bypass::send_fake_sni_probe(
-                                    addr, probe.ttl, sni,
-                                )
-                                .await;
-                            } else if probe.data_size == 0 {
-                                let _ = crate::evasion::dpi_bypass::send_tcb_desync_probe(
-                                    addr, probe.ttl,
-                                )
-                                .await;
-                            } else {
-                                let _ = crate::evasion::dpi_bypass::send_fake_payload_probe(
-                                    addr,
-                                    probe.ttl,
-                                    probe.data_size,
-                                )
-                                .await;
+                        // Send a fake low-TTL probe to desync the DPI's TCP state table.
+                        if let Some(probe) = engine.profile_fake_probe(profile_idx) {
+                            if let Ok(addr) = direct.resolve_target_ip(&t).await {
+                                if let Some(sni) = probe.fake_sni {
+                                    // Crafted TLS ClientHello probe — DPI parses the fake SNI
+                                    // then loses state when the probe expires (low TTL).
+                                    let _ = crate::evasion::dpi_bypass::send_fake_sni_probe(
+                                        addr, probe.ttl, sni,
+                                    )
+                                    .await;
+                                } else if probe.data_size == 0 {
+                                    let _ = crate::evasion::dpi_bypass::send_tcb_desync_probe(
+                                        addr, probe.ttl,
+                                    )
+                                    .await;
+                                } else {
+                                    let _ = crate::evasion::dpi_bypass::send_fake_payload_probe(
+                                        addr,
+                                        probe.ttl,
+                                        probe.data_size,
+                                    )
+                                    .await;
+                                }
                             }
                         }
-                    }
 
-                    let mut tcp = direct.connect_tcp_stream(t.clone()).await?;
+                        let mut tcp = direct.connect_tcp_stream(t.clone()).await?;
 
-                    if let Some(ref data) = icd {
-                        engine
-                            .apply_to_tcp_stream(profile_idx, &mut tcp, data)
-                            .await
-                            .map_err(EngineError::Io)?;
-                        sent = true;
-                        let label = c.route_label();
-                        initial_u2c =
-                            read_initial_upstream_response(&mut tcp, t.port, conn_id, &label)
-                                .await?;
-                    }
+                        if let Some(ref data) = icd {
+                            engine
+                                .apply_to_tcp_stream(profile_idx, &mut tcp, data)
+                                .await
+                                .map_err(EngineError::Io)?;
+                            sent = true;
+                            let label = c.route_label();
+                            initial_u2c =
+                                read_initial_upstream_response(&mut tcp, t.port, conn_id, &label)
+                                    .await?;
+                        }
 
-                    let stream: BoxStream = Box::new(tcp);
-                    return Ok((c, stream, initial_u2c, sent));
-                }
-            }
-
-            // Direct, Bypass, or Native without an engine.
-            let mut stream =
-                connect_route_candidate(conn_id, &t, &tl, &c, out, &ro, config.clone()).await?;
-
-            if let Some(ref data) = icd {
-                match c.kind {
-                    RouteKind::Native => {
-                        // Native without engine — pass through unchanged.
-                        stream.write_all(data).await?;
-                        stream.flush().await?;
-                    }
-                    RouteKind::Direct if ro.fragment_client_hello && is_tls_client_hello(data) => {
-                        let _ = fragment_and_send_tls_hello(data, &mut stream, &ro)
-                            .await
-                            .map_err(EngineError::Io)?;
-                    }
-                    _ => {
-                        stream.write_all(data).await?;
-                        stream.flush().await?;
+                        let stream: BoxStream = Box::new(tcp);
+                        return Ok((c, stream, initial_u2c, sent));
                     }
                 }
-                sent = true;
-                let label = c.route_label();
-                initial_u2c =
-                    read_initial_upstream_response(&mut stream, t.port, conn_id, &label).await?;
-            }
 
-            Ok((c, stream, initial_u2c, sent))
+                // Direct, Bypass, or Native without an engine.
+                let mut stream =
+                    connect_route_candidate(conn_id, &t, &tl, &c, out, &ro, config.clone()).await?;
+
+                if let Some(ref data) = icd {
+                    match c.kind {
+                        RouteKind::Native => {
+                            // Native without engine — pass through unchanged.
+                            stream.write_all(data).await?;
+                            stream.flush().await?;
+                        }
+                        RouteKind::Direct
+                            if ro.fragment_client_hello && is_tls_client_hello(data) =>
+                        {
+                            let _ = fragment_and_send_tls_hello(data, &mut stream, &ro)
+                                .await
+                                .map_err(EngineError::Io)?;
+                        }
+                        _ => {
+                            stream.write_all(data).await?;
+                            stream.flush().await?;
+                        }
+                    }
+                    sent = true;
+                    let label = c.route_label();
+                    initial_u2c =
+                        read_initial_upstream_response(&mut stream, t.port, conn_id, &label)
+                            .await?;
+                }
+
+                Ok((c, stream, initial_u2c, sent))
+            })
+            .await
+            .unwrap_or_else(|_| Err(EngineError::Internal("race candidate timed out".to_owned())))
         });
     }
 
@@ -323,7 +335,7 @@ pub async fn handle_socks5_request_with_target(
     icd: Option<Vec<u8>>,
 ) -> Result<()> {
     let target_label = target.to_string();
-    let tuned = tune_relay_for_target(relay_opts, target.port, &target_label, false, false);
+    let tuned = tune_relay_for_target(relay_opts, target.port, &target_label, false, false, &cfg);
     let relay_opts = tuned.options;
 
     let route_key = route_destination_key(&target_label);

@@ -15,7 +15,10 @@ pub struct CrashReport<'a> {
 }
 
 pub async fn send_crash_report(endpoint: &str, report: &CrashReport<'_>) -> Result<()> {
-    reqwest::Client::new()
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .map_err(|e| crate::error::EngineError::Internal(e.to_string()))?
         .post(endpoint)
         .json(report)
         .send()

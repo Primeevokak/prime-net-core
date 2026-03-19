@@ -104,12 +104,29 @@ pub async fn handle_http_proxy(
     }
 }
 
+/// Returns `true` if `dest_lower` (which may include a port, e.g. `"cdn1.sndcdn.com:443"`)
+/// matches any suffix entry in `cfg.evasion.aggressive_fragment_domains`.
+fn matches_aggressive_fragment(dest_lower: &str, cfg: &EngineConfig) -> bool {
+    let host = dest_lower.split(':').next().unwrap_or(dest_lower);
+    cfg.evasion
+        .aggressive_fragment_domains
+        .iter()
+        .any(|suffix| {
+            let s = suffix.trim().trim_start_matches('.');
+            if s.is_empty() {
+                return false;
+            }
+            host == s || host.ends_with(&format!(".{s}"))
+        })
+}
+
 pub fn tune_relay_for_target(
     mut opts: RelayOptions,
     port: u16,
     destination: &str,
     _s4: bool,
     _http: bool,
+    cfg: &EngineConfig,
 ) -> TunedRelay {
     let dest_lower = destination.to_lowercase();
     let group_key = route_destination_key(&dest_lower);
@@ -136,8 +153,8 @@ pub fn tune_relay_for_target(
         };
     }
 
-    // 2. Fallback to domain-based hardcoded rules
-    let is_censored = dest_lower.contains("soundcloud") || dest_lower.contains("sndcdn");
+    // 2. Fallback: aggressive_fragment_domains from config
+    let is_censored = matches_aggressive_fragment(&dest_lower, cfg);
 
     let stage = if is_censored && port == 443 {
         // For highly censored platforms, use small chunks for Direct mode
@@ -158,5 +175,29 @@ pub fn tune_relay_for_target(
         } else {
             StageSelectionSource::Default
         },
+    }
+}
+
+#[cfg(test)]
+mod aggressive_fragment_tests {
+    use super::*;
+    use crate::config::EngineConfig;
+
+    #[test]
+    fn aggressive_fragment_suffix_match() {
+        let mut cfg = EngineConfig::default();
+        cfg.evasion.aggressive_fragment_domains = vec!["sndcdn.com".to_owned()];
+        assert!(matches_aggressive_fragment("cdn1.sndcdn.com:443", &cfg));
+        assert!(matches_aggressive_fragment("sndcdn.com:443", &cfg));
+        assert!(!matches_aggressive_fragment("example.com:443", &cfg));
+        // Substring without suffix must not match
+        assert!(!matches_aggressive_fragment("notsndcdn.com:443", &cfg));
+    }
+
+    #[test]
+    fn aggressive_fragment_empty_list_no_match() {
+        let mut cfg = EngineConfig::default();
+        cfg.evasion.aggressive_fragment_domains = vec![];
+        assert!(!matches_aggressive_fragment("soundcloud.com:443", &cfg));
     }
 }

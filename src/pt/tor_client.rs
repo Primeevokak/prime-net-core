@@ -378,7 +378,14 @@ fn bootstrap_http_client() -> Result<reqwest::Client> {
             builder = builder.proxy(reqwest::Proxy::all(p).map_err(|e| {
                 EngineError::Config(format!("invalid PRIME_PT_BOOTSTRAP_PROXY: {e}"))
             })?);
+        } else {
+            // Empty env var means explicit "no proxy" — honour it.
+            builder = builder.no_proxy();
         }
+    } else {
+        // No env var set: bypass system proxy to avoid looping through ourselves
+        // when the engine has configured itself as the system proxy.
+        builder = builder.no_proxy();
     }
     Ok(builder.build()?)
 }

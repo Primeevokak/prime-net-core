@@ -228,6 +228,26 @@ pub struct EvasionConfig {
     pub classifier_entry_ttl_secs: u64,
     #[serde(default = "default_strategy_race_enabled")]
     pub strategy_race_enabled: bool,
+    /// Домены, для которых принудительно включать фрагментацию ClientHello и stage=2
+    /// с первого соединения, не дожидаясь обучения классификатора.
+    /// Поддерживает суффиксное совпадение: "sndcdn.com" матчит "cdn1.sndcdn.com".
+    #[serde(default = "default_aggressive_fragment_domains")]
+    pub aggressive_fragment_domains: Vec<String>,
+    /// TTL для preferred_stage в секундах.
+    /// После истечения stage не восстанавливается при старте и прунится из памяти.
+    /// Default: 172800 (48 часов).
+    #[serde(default = "default_stage_cache_ttl_secs")]
+    pub stage_cache_ttl_secs: u64,
+    /// TTL для winner-записи при загрузке из диска (секунды).
+    /// Default: 86400 (24 часа) — текущее поведение, теперь конфигурируемое.
+    #[serde(default = "default_winner_cache_ttl_secs")]
+    pub winner_cache_ttl_secs: u64,
+    /// Таймаут ожидания первого UDP-ответа при QUIC-соединении на порт 443 (мс).
+    /// При истечении домен помечается как "QUIC silent drop" на 1800 секунд.
+    /// При следующем подключении UDP блокируется → приложение переходит на TCP.
+    /// 0 = отключено (текущее поведение, обратная совместимость).
+    #[serde(default = "default_quic_probe_timeout_ms")]
+    pub quic_probe_timeout_ms: u64,
 }
 
 impl Default for EvasionConfig {
@@ -257,6 +277,10 @@ impl Default for EvasionConfig {
             classifier_cache_path: default_classifier_cache_path(),
             classifier_entry_ttl_secs: 604800,
             strategy_race_enabled: true,
+            aggressive_fragment_domains: default_aggressive_fragment_domains(),
+            stage_cache_ttl_secs: default_stage_cache_ttl_secs(),
+            winner_cache_ttl_secs: default_winner_cache_ttl_secs(),
+            quic_probe_timeout_ms: default_quic_probe_timeout_ms(),
         }
     }
 }
@@ -568,3 +592,9 @@ fn default_blocklist_cache_path() -> String {
     }
     "blocklist.json".to_owned()
 }
+fn default_aggressive_fragment_domains() -> Vec<String> {
+    vec!["soundcloud.com".to_owned(), "sndcdn.com".to_owned()]
+}
+fn default_stage_cache_ttl_secs() -> u64 { 172800 }
+fn default_winner_cache_ttl_secs() -> u64 { 86400 }
+fn default_quic_probe_timeout_ms() -> u64 { 0 }

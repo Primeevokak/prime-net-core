@@ -192,7 +192,7 @@ mod tests {
         let destination = "example.com:443";
         let key = destination.to_owned();
         routing_state().dest_failures.insert(key.clone(), 8);
-        let _tuned = tune_relay_for_target(RelayOptions::default(), 443, destination, false, false);
+        let _tuned = tune_relay_for_target(RelayOptions::default(), 443, destination, false, false, &EngineConfig::default());
         #[cfg(not(windows))]
         {
             assert!(_tuned.options.fragment_size_min >= 32);
@@ -212,7 +212,7 @@ mod tests {
             sni_case_toggle: true,
             ..RelayOptions::default()
         };
-        let tuned = tune_relay_for_target(base, 443, "www.youtube.com:443", false, true);
+        let tuned = tune_relay_for_target(base, 443, "www.youtube.com:443", false, true, &EngineConfig::default());
         assert!(!tuned.options.fragment_client_hello);
         assert!(!tuned.options.split_at_sni);
         assert!(tuned.options.client_hello_split_offsets.is_empty());
