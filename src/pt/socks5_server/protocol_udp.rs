@@ -61,8 +61,9 @@ pub async fn handle_udp_associate(
     // QUIC silent-drop probe state (all owned by this task — no shared state, no race).
     // Key: "domain:443", Value: Instant when the probe packet was sent.
     let mut quic_pending: HashMap<String, tokio::time::Instant> = HashMap::new();
-    // Maps resolved SocketAddr back to the cache key so we can clear the probe on response.
-    let mut addr_to_domain: HashMap<SocketAddr, String> = HashMap::new();
+    // Maps resolved SocketAddr → list of pending cache keys.
+    // Vec because multiple domains can resolve to the same IP (CDN/Cloudflare).
+    let mut addr_to_domain: HashMap<SocketAddr, Vec<String>> = HashMap::new();
     let mut probe_check = tokio::time::interval(std::time::Duration::from_secs(1));
 
     loop {
@@ -108,12 +109,15 @@ pub async fn handle_udp_associate(
                         } else {
                             // Packet from remote -> client
                             if cfg.evasion.quic_probe_timeout_ms > 0 {
-                                if let Some(domain_key) = addr_to_domain.remove(&src) {
-                                    quic_pending.remove(&domain_key);
+                                if let Some(keys) = addr_to_domain.remove(&src) {
+                                    for domain_key in &keys {
+                                        quic_pending.remove(domain_key);
+                                    }
                                     debug!(
                                         conn_id,
-                                        key = %domain_key,
-                                        "QUIC probe resolved: response received"
+                                        keys = ?keys,
+                                        "QUIC probe resolved: response received, cleared {} pending probe(s)",
+                                        keys.len()
                                     );
                                 }
                             }
@@ -143,7 +147,10 @@ pub async fn handle_udp_associate(
                         true
                     }
                 });
-                addr_to_domain.retain(|_, v| !stale_keys.contains(v));
+                addr_to_domain.retain(|_, keys| {
+                    keys.retain(|k| !stale_keys.contains(k));
+                    !keys.is_empty()
+                });
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
                 debug!(conn_id, "UDP relay idle timeout");
@@ -164,7 +171,7 @@ async fn handle_client_to_remote(
     cfg: &EngineConfig,
     relay_opts: &RelayOptions,
     quic_pending: &mut HashMap<String, tokio::time::Instant>,
-    addr_to_domain: &mut HashMap<SocketAddr, String>,
+    addr_to_domain: &mut HashMap<SocketAddr, Vec<String>>,
 ) -> std::io::Result<Option<SocketAddr>> {
     if data.len() < 4 {
         return Ok(None);
@@ -291,7 +298,7 @@ async fn handle_client_to_remote(
     if let Some((key, resolved_addr)) = probe_hint {
         if !quic_pending.contains_key(&key) {
             quic_pending.insert(key.clone(), tokio::time::Instant::now());
-            addr_to_domain.insert(resolved_addr, key);
+            addr_to_domain.entry(resolved_addr).or_default().push(key);
         }
     }
 
@@ -354,5 +361,48 @@ mod quic_silent_drop_tests {
         );
         assert!(!is_quic_silent_drop_cached(key));
         routing_state().quic_silent_drop_cache.remove(key);
+    }
+
+    #[test]
+    fn addr_to_domain_collision_both_keys_cleared_on_response() {
+        // Simulates two domains resolving to the same IP.
+        use std::collections::HashMap;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let shared_ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443);
+        let mut addr_to_domain: HashMap<SocketAddr, Vec<String>> = HashMap::new();
+        let mut quic_pending: HashMap<String, tokio::time::Instant> = HashMap::new();
+
+        // Register two domains to the same IP
+        let key1 = "domain-a.example:443".to_owned();
+        let key2 = "domain-b.example:443".to_owned();
+
+        quic_pending.insert(key1.clone(), tokio::time::Instant::now());
+        addr_to_domain
+            .entry(shared_ip)
+            .or_default()
+            .push(key1.clone());
+
+        quic_pending.insert(key2.clone(), tokio::time::Instant::now());
+        addr_to_domain
+            .entry(shared_ip)
+            .or_default()
+            .push(key2.clone());
+
+        assert_eq!(addr_to_domain[&shared_ip].len(), 2);
+
+        // Simulate response from shared IP
+        if let Some(keys) = addr_to_domain.remove(&shared_ip) {
+            for k in &keys {
+                quic_pending.remove(k);
+            }
+        }
+
+        // Both probes must be cleared — no false silent drop for either domain
+        assert!(
+            quic_pending.is_empty(),
+            "both probes must be cleared on response"
+        );
+        assert!(addr_to_domain.is_empty());
     }
 }
