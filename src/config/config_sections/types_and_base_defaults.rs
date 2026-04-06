@@ -181,6 +181,98 @@ pub struct DomainFrontingRule {
     pub provider: FrontingProvider,
 }
 
+/// Serializable representation of a split-point for native desync profiles.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitAtConfig {
+    /// Fixed byte offset from the start of the data.
+    Fixed(usize),
+    /// Split right before the SNI extension.
+    BeforeSni,
+    /// Split 1 byte into the SNI extension.
+    IntoSni,
+    /// Split through the middle of the SNI hostname.
+    MidSni,
+}
+
+/// Serializable representation of an HTTP split-point.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpSplitAtConfig {
+    /// Split right before the `Host:` header line.
+    BeforeHostHeader,
+    /// Split at a fixed byte offset.
+    Fixed(usize),
+}
+
+/// Serializable representation of a desync technique for user-defined profiles.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NativeTechniqueConfig {
+    /// Send two TLS records instead of one, split at `split_at`.
+    TlsRecordSplit { split_at: SplitAtConfig },
+    /// Send two TCP segments, split at `split_at`.
+    TcpSegmentSplit { split_at: SplitAtConfig },
+    /// TLS record split combined with an OOB (URG) byte.
+    TlsRecordSplitOob { split_at: SplitAtConfig },
+    /// TCP segment split combined with an OOB (URG) byte.
+    TcpSegmentSplitOob { split_at: SplitAtConfig },
+    /// Split an HTTP/1.x request at `http_split_at`.
+    HttpSplit { http_split_at: HttpSplitAtConfig },
+    /// Split into N+1 TCP segments at multiple `points`.
+    MultiSplit { points: Vec<SplitAtConfig> },
+    /// TLS record split with a dummy ApplicationData record injected between fragments.
+    TlsRecordPadding { split_at: SplitAtConfig },
+    /// Send TCP segment 2 before segment 1 (requires WinDivert/NFQueue).
+    TcpDisorder { delay_ms: u64 },
+}
+
+/// Configuration for a low-TTL fake probe sent before the real TCP connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FakeProbeConfig {
+    /// IP TTL for the probe connection (typically 3–5 hops).
+    pub ttl: u8,
+    /// Random bytes to send in the probe body; 0 = empty probe (TCB-desync only).
+    #[serde(default)]
+    pub data_size: usize,
+    /// If set, send a crafted TLS ClientHello with this SNI instead of random bytes.
+    #[serde(default)]
+    pub fake_sni: Option<String>,
+}
+
+/// User-defined native desync profile loaded from config.
+///
+/// Appended to (or replacing) the built-in profile set at engine startup.
+/// Use this to experiment with custom DPI evasion parameters for your ISP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeProfileConfig {
+    /// Unique name shown in logs and ML route stats.
+    pub name: String,
+    /// The DPI evasion technique to apply to the first outbound data segment.
+    pub technique: NativeTechniqueConfig,
+    /// Whether this profile is safe for Cloudflare-hosted targets.
+    ///
+    /// Profiles that send out-of-order TCP segments must set this to `false`
+    /// as Cloudflare edges reject disordered segments.
+    #[serde(default = "default_true")]
+    pub cloudflare_safe: bool,
+    /// Optional low-TTL probe sent before the real connection to desync DPI.
+    #[serde(default)]
+    pub fake_probe: Option<FakeProbeConfig>,
+    /// Randomize ASCII case of the SNI hostname bytes (e.g. `DiScOrD.cOm`).
+    #[serde(default)]
+    pub randomize_sni_case: bool,
+    /// Milliseconds to wait between TCP segment flushes.
+    ///
+    /// Defeats DPI with short reassembly timers that discard incomplete buffers.
+    #[serde(default)]
+    pub inter_fragment_delay_ms: Option<u64>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvasionConfig {
     #[serde(default = "default_prime_mode")]
@@ -248,6 +340,21 @@ pub struct EvasionConfig {
     /// 0 = отключено (текущее поведение, обратная совместимость).
     #[serde(default = "default_quic_probe_timeout_ms")]
     pub quic_probe_timeout_ms: u64,
+    /// Additional native desync profiles defined in user config.
+    ///
+    /// These are appended to the built-in profile list. Set
+    /// `disable_default_native_profiles: true` to use only these.
+    #[serde(default)]
+    pub native_profiles: Vec<NativeProfileConfig>,
+    /// When `true`, skip the built-in profile set and use only `native_profiles`.
+    ///
+    /// Useful for ISP-specific fine-tuning where built-ins are known to be ineffective.
+    #[serde(default)]
+    pub disable_default_native_profiles: bool,
+    /// When `true`, engage a kill switch that redirects the system proxy to a dead port
+    /// if the SOCKS5 listener becomes unreachable, preventing traffic leaks.
+    #[serde(default)]
+    pub kill_switch_enabled: bool,
 }
 
 impl Default for EvasionConfig {
@@ -281,6 +388,9 @@ impl Default for EvasionConfig {
             stage_cache_ttl_secs: default_stage_cache_ttl_secs(),
             winner_cache_ttl_secs: default_winner_cache_ttl_secs(),
             quic_probe_timeout_ms: default_quic_probe_timeout_ms(),
+            native_profiles: Vec::new(),
+            disable_default_native_profiles: false,
+            kill_switch_enabled: false,
         }
     }
 }

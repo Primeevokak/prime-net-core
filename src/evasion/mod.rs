@@ -10,6 +10,7 @@ pub mod traffic_shaping;
 pub use dpi_bypass::{BypassMethod, DesyncStrategy, DpiBypass, DpiBypassError, DpiBypassExt};
 pub use fragmenting_io::{FragmentConfig, FragmentHandle, FragmentingIo};
 pub use packet_intercept::PacketInterceptor;
+pub use profile_discovery::ProfileDiscoveryCache;
 pub use tcp_desync::{
     DesyncTechnique, FakeProbe, HttpSplitAt, NativeDesyncProfile, SplitAt, TcpDesyncEngine,
 };

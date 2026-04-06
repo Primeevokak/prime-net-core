@@ -103,9 +103,42 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
     // Initialize in-process TcpDesyncEngine (native bypass) — no binary required.
     // Enabled alongside packet bypass or whenever evasion is active.
     if cfg.evasion.packet_bypass_enabled || relay_opts.fragment_client_hello {
-        let engine = Arc::new(TcpDesyncEngine::with_default_profiles());
+        let mut engine = TcpDesyncEngine::with_config(&cfg.evasion);
+
+        // Run profile discovery synchronously (with 10 s timeout) so that the ML scorer
+        // encounters the most effective profiles first from the very first connection.
+        let cache_path = prime_net_engine_core::evasion::profile_discovery::cache_path();
+        let mut cache = prime_net_engine_core::evasion::ProfileDiscoveryCache::load(&cache_path);
+        if !cache.all_fresh((0..engine.profile_count()).map(|i| engine.profile_name(i))) {
+            info!(target: "socks_cmd", "running profile discovery (first run or stale cache)");
+            let discovery_result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                prime_net_engine_core::evasion::profile_discovery::run_profile_discovery(
+                    &engine, &mut cache,
+                ),
+            )
+            .await;
+            match discovery_result {
+                Ok(reordered) if !reordered.is_empty() => {
+                    info!(
+                        target: "socks_cmd",
+                        profiles = reordered.len(),
+                        "profile discovery complete — profiles reordered by effectiveness"
+                    );
+                    engine.set_profiles(reordered);
+                    cache.save(&cache_path);
+                }
+                Ok(_) => {
+                    info!(target: "socks_cmd", "profile discovery returned no results");
+                }
+                Err(_) => {
+                    warn!(target: "socks_cmd", "profile discovery timed out — using default ordering");
+                }
+            }
+        }
+
         let profiles = engine.profile_count();
-        relay_opts.native_bypass = Some(engine);
+        relay_opts.native_bypass = Some(Arc::new(engine));
         info!(
             target: "socks_cmd",
             profiles,
@@ -129,10 +162,19 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
         relay_opts,
     )
     .await?;
-    println!("SOCKS5 listening on {}", guard.listen_addr());
+    let listen_addr = guard.listen_addr();
+    println!("SOCKS5 listening on {listen_addr}");
     println!("Hint (TUN): run tun2socks and point it to this SOCKS5 endpoint.");
 
     proxy_cleanup.armed = maybe_auto_configure_system_proxy(&cfg);
+
+    // Spawn the kill switch monitor after the listener is ready so the first
+    // liveness check reliably finds the port open.
+    let _kill_switch = prime_net_engine_core::platform::kill_switch::spawn_kill_switch_monitor(
+        listen_addr,
+        cfg.evasion.kill_switch_enabled,
+    );
+
     let _keep = guard;
     wait_for_shutdown().await;
     Ok(())

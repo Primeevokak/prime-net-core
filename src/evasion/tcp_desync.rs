@@ -7,6 +7,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::warn;
 
+use crate::config::EvasionConfig;
 use crate::evasion::packet_intercept::PacketInterceptor;
 use crate::evasion::tls_parser::{parse_client_hello, ParsedClientHello};
 
@@ -99,7 +100,7 @@ pub enum DesyncTechnique {
 ///
 /// Poisons the DPI middlebox's TCP state-tracking table so it desynchronises
 /// from the real connection that follows.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct FakeProbe {
     /// IP TTL for the probe connection (typically 3–5 hops).
     pub ttl: u8,
@@ -111,14 +112,14 @@ pub struct FakeProbe {
     /// Preferred over `data_size > 0` because DPI that parses TLS records will
     /// actually extract the fake SNI and create state for a connection that then
     /// expires (TTL exhausted), leaving the DPI confused before the real ClientHello.
-    pub fake_sni: Option<&'static str>,
+    pub fake_sni: Option<String>,
 }
 
 /// A named native desync profile.
 #[derive(Debug, Clone)]
 pub struct NativeDesyncProfile {
     /// Short identifier used in logs and route-race labels.
-    pub name: &'static str,
+    pub name: String,
     /// The desync technique to apply to the first TLS ClientHello or HTTP request.
     pub technique: DesyncTechnique,
     /// If `false`, this profile is skipped for Cloudflare-hosted targets (Discord,
@@ -189,6 +190,33 @@ impl TcpDesyncEngine {
         }
     }
 
+    /// Build an engine from [`EvasionConfig`], merging user-defined profiles with defaults.
+    ///
+    /// When `cfg.disable_default_native_profiles` is `true`, only `cfg.native_profiles`
+    /// are used.  Otherwise user profiles are appended after the built-in set.
+    pub fn with_config(cfg: &EvasionConfig) -> Self {
+        let interceptor = crate::evasion::packet_intercept::best_available_interceptor();
+        let mut profiles = if cfg.disable_default_native_profiles {
+            Vec::new()
+        } else {
+            default_native_profiles()
+        };
+        for p in &cfg.native_profiles {
+            match native_profile_from_config(p) {
+                Ok(profile) => profiles.push(profile),
+                Err(e) => warn!(
+                    profile = %p.name,
+                    error = %e,
+                    "skipping invalid native profile from config"
+                ),
+            }
+        }
+        Self {
+            profiles,
+            packet_interceptor: interceptor,
+        }
+    }
+
     /// Number of profiles loaded in this engine.
     pub fn profile_count(&self) -> usize {
         self.profiles.len()
@@ -196,7 +224,10 @@ impl TcpDesyncEngine {
 
     /// Name of the profile at `idx` (for logging); returns `"unknown"` if out of range.
     pub fn profile_name(&self, idx: usize) -> &str {
-        self.profiles.get(idx).map(|p| p.name).unwrap_or("unknown")
+        self.profiles
+            .get(idx)
+            .map(|p| p.name.as_str())
+            .unwrap_or("unknown")
     }
 
     /// Reference to the profile at `idx`; panics if out of range.
@@ -805,6 +836,81 @@ fn http_split_offset(data: &[u8], at: HttpSplitAt) -> usize {
     }
 }
 
+// ── Config conversion ─────────────────────────────────────────────────────────
+
+/// Convert a [`NativeProfileConfig`] from user config into a [`NativeDesyncProfile`].
+fn native_profile_from_config(
+    cfg: &crate::config::NativeProfileConfig,
+) -> std::result::Result<NativeDesyncProfile, String> {
+    use crate::config::{HttpSplitAtConfig, NativeTechniqueConfig, SplitAtConfig};
+
+    fn convert_split(s: &SplitAtConfig) -> SplitAt {
+        match s {
+            SplitAtConfig::Fixed(n) => SplitAt::Fixed(*n),
+            SplitAtConfig::BeforeSni => SplitAt::BeforeSni,
+            SplitAtConfig::IntoSni => SplitAt::IntoSni,
+            SplitAtConfig::MidSni => SplitAt::MidSni,
+        }
+    }
+
+    fn convert_http_split(s: &HttpSplitAtConfig) -> HttpSplitAt {
+        match s {
+            HttpSplitAtConfig::BeforeHostHeader => HttpSplitAt::BeforeHostHeader,
+            HttpSplitAtConfig::Fixed(n) => HttpSplitAt::Fixed(*n),
+        }
+    }
+
+    if cfg.name.trim().is_empty() {
+        return Err("profile name must not be empty".to_owned());
+    }
+
+    let technique = match &cfg.technique {
+        NativeTechniqueConfig::TlsRecordSplit { split_at } => DesyncTechnique::TlsRecordSplit {
+            at: convert_split(split_at),
+        },
+        NativeTechniqueConfig::TcpSegmentSplit { split_at } => DesyncTechnique::TcpSegmentSplit {
+            at: convert_split(split_at),
+        },
+        NativeTechniqueConfig::TlsRecordSplitOob { split_at } => {
+            DesyncTechnique::TlsRecordSplitOob {
+                at: convert_split(split_at),
+            }
+        }
+        NativeTechniqueConfig::TcpSegmentSplitOob { split_at } => {
+            DesyncTechnique::TcpSegmentSplitOob {
+                at: convert_split(split_at),
+            }
+        }
+        NativeTechniqueConfig::HttpSplit { http_split_at } => DesyncTechnique::HttpSplit {
+            at: convert_http_split(http_split_at),
+        },
+        NativeTechniqueConfig::MultiSplit { points } => DesyncTechnique::MultiSplit {
+            points: points.iter().map(convert_split).collect(),
+        },
+        NativeTechniqueConfig::TlsRecordPadding { split_at } => DesyncTechnique::TlsRecordPadding {
+            at: convert_split(split_at),
+        },
+        NativeTechniqueConfig::TcpDisorder { delay_ms } => DesyncTechnique::TcpDisorder {
+            delay_ms: *delay_ms,
+        },
+    };
+
+    let fake_probe = cfg.fake_probe.as_ref().map(|p| FakeProbe {
+        ttl: p.ttl,
+        data_size: p.data_size,
+        fake_sni: p.fake_sni.clone(),
+    });
+
+    Ok(NativeDesyncProfile {
+        name: cfg.name.clone(),
+        technique,
+        cloudflare_safe: cfg.cloudflare_safe,
+        fake_probe,
+        randomize_sni_case: cfg.randomize_sni_case,
+        inter_fragment_delay_ms: cfg.inter_fragment_delay_ms,
+    })
+}
+
 // ── Default profiles ──────────────────────────────────────────────────────────
 
 /// Return the platform-appropriate default native desync profiles.
@@ -817,7 +923,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         // 1. TLS record split right into the SNI extension — safest for Cloudflare.
         //    Equivalent: --tlsrec 1+s
         NativeDesyncProfile {
-            name: "tlsrec-into-sni",
+            name: "tlsrec-into-sni".to_owned(),
             technique: DesyncTechnique::TlsRecordSplit {
                 at: SplitAt::IntoSni,
             },
@@ -829,7 +935,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         // 2. TLS record split before the SNI extension.
         //    Equivalent: --tlsrec SNI-1
         NativeDesyncProfile {
-            name: "tlsrec-before-sni",
+            name: "tlsrec-before-sni".to_owned(),
             technique: DesyncTechnique::TlsRecordSplit {
                 at: SplitAt::BeforeSni,
             },
@@ -841,7 +947,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         // 3. TCP segment split right into the SNI extension.
         //    Equivalent: --split 1+s
         NativeDesyncProfile {
-            name: "split-into-sni",
+            name: "split-into-sni".to_owned(),
             technique: DesyncTechnique::TcpSegmentSplit {
                 at: SplitAt::IntoSni,
             },
@@ -853,7 +959,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         // 4. TLS record split through the middle of the SNI hostname.
         //    Equivalent: --tlsrec mid+s
         NativeDesyncProfile {
-            name: "tlsrec-mid-sni",
+            name: "tlsrec-mid-sni".to_owned(),
             technique: DesyncTechnique::TlsRecordSplit {
                 at: SplitAt::MidSni,
             },
@@ -865,7 +971,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         // 5. TLS record split at a fixed 5-byte offset into the payload.
         //    Equivalent: --tlsrec 5
         NativeDesyncProfile {
-            name: "tlsrec-fixed-5",
+            name: "tlsrec-fixed-5".to_owned(),
             technique: DesyncTechnique::TlsRecordSplit {
                 at: SplitAt::Fixed(5),
             },
@@ -877,7 +983,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         // 6. TCP segment split before the SNI extension.
         //    Equivalent: --split before-sni
         NativeDesyncProfile {
-            name: "split-before-sni",
+            name: "split-before-sni".to_owned(),
             technique: DesyncTechnique::TcpSegmentSplit {
                 at: SplitAt::BeforeSni,
             },
@@ -889,7 +995,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         // 7. TCP segment split at fixed byte 1.
         //    Equivalent: --split 1
         NativeDesyncProfile {
-            name: "split-fixed-1",
+            name: "split-fixed-1".to_owned(),
             technique: DesyncTechnique::TcpSegmentSplit {
                 at: SplitAt::Fixed(1),
             },
@@ -901,7 +1007,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         // 8. TCP segment split at fixed byte 3.
         //    Equivalent: --split 3
         NativeDesyncProfile {
-            name: "split-fixed-3",
+            name: "split-fixed-3".to_owned(),
             technique: DesyncTechnique::TcpSegmentSplit {
                 at: SplitAt::Fixed(3),
             },
@@ -912,7 +1018,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         },
         // 9. HTTP-level split before the Host: header — effective for port-80 DPI.
         NativeDesyncProfile {
-            name: "http-before-host",
+            name: "http-before-host".to_owned(),
             technique: DesyncTechnique::HttpSplit {
                 at: HttpSplitAt::BeforeHostHeader,
             },
@@ -924,7 +1030,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         // 10. TLS record split + fake low-TTL TCB probe (TTL=3).
         //     The probe desynchronises the DPI state table before the real SYN.
         NativeDesyncProfile {
-            name: "tlsrec-into-sni-fake-ttl3",
+            name: "tlsrec-into-sni-fake-ttl3".to_owned(),
             technique: DesyncTechnique::TlsRecordSplit {
                 at: SplitAt::IntoSni,
             },
@@ -939,7 +1045,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         },
         // 11. TCP segment split + fake low-TTL probe.
         NativeDesyncProfile {
-            name: "split-into-sni-fake-ttl3",
+            name: "split-into-sni-fake-ttl3".to_owned(),
             technique: DesyncTechnique::TcpSegmentSplit {
                 at: SplitAt::IntoSni,
             },
@@ -955,7 +1061,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         // 12. Multi-split across the SNI region (3 split points → 4 segments).
         //     Targets DPI that reassembles exactly 2 fragments but gives up on 3+.
         NativeDesyncProfile {
-            name: "multi-split-sni-region",
+            name: "multi-split-sni-region".to_owned(),
             technique: DesyncTechnique::MultiSplit {
                 points: vec![SplitAt::BeforeSni, SplitAt::IntoSni, SplitAt::MidSni],
             },
@@ -967,7 +1073,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         // 13. Multi-split with fixed offsets (4 split points → 5 segments).
         //     Confuses DPI doing offset-based packet inspection.
         NativeDesyncProfile {
-            name: "multi-split-fixed",
+            name: "multi-split-fixed".to_owned(),
             technique: DesyncTechnique::MultiSplit {
                 points: vec![
                     SplitAt::Fixed(1),
@@ -984,7 +1090,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         // 14. TCP split + 100 ms inter-fragment delay.
         //     Defeats DPI with short reassembly timers that discard incomplete buffers.
         NativeDesyncProfile {
-            name: "split-into-sni-delay-100",
+            name: "split-into-sni-delay-100".to_owned(),
             technique: DesyncTechnique::TcpSegmentSplit {
                 at: SplitAt::IntoSni,
             },
@@ -995,7 +1101,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         },
         // 15. TLS record split + 250 ms inter-fragment delay.
         NativeDesyncProfile {
-            name: "tlsrec-into-sni-delay-250",
+            name: "tlsrec-into-sni-delay-250".to_owned(),
             technique: DesyncTechnique::TlsRecordSplit {
                 at: SplitAt::IntoSni,
             },
@@ -1007,7 +1113,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         // 16. TCP split + SNI case randomization.
         //     Defeats DPI with exact-match SNI string filters (e.g. "discord.com").
         NativeDesyncProfile {
-            name: "split-into-sni-case-rand",
+            name: "split-into-sni-case-rand".to_owned(),
             technique: DesyncTechnique::TcpSegmentSplit {
                 at: SplitAt::IntoSni,
             },
@@ -1018,7 +1124,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         },
         // 17. TLS record split + SNI case randomization.
         NativeDesyncProfile {
-            name: "tlsrec-into-sni-case-rand",
+            name: "tlsrec-into-sni-case-rand".to_owned(),
             technique: DesyncTechnique::TlsRecordSplit {
                 at: SplitAt::IntoSni,
             },
@@ -1030,7 +1136,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         // 18. TLS record split + dummy ApplicationData padding between fragments.
         //     The injected record confuses stateful DPI that tracks handshake context.
         NativeDesyncProfile {
-            name: "tlsrec-pad-into-sni",
+            name: "tlsrec-pad-into-sni".to_owned(),
             technique: DesyncTechnique::TlsRecordPadding {
                 at: SplitAt::IntoSni,
             },
@@ -1041,7 +1147,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         },
         // 19. TLS record split before SNI + dummy ApplicationData padding.
         NativeDesyncProfile {
-            name: "tlsrec-pad-before-sni",
+            name: "tlsrec-pad-before-sni".to_owned(),
             technique: DesyncTechnique::TlsRecordPadding {
                 at: SplitAt::BeforeSni,
             },
@@ -1055,7 +1161,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         //     valid ClientHello that DPI parses and creates state for, then discards on TTL
         //     expiry.  The real ClientHello arrives into a confused DPI state.
         NativeDesyncProfile {
-            name: "tlsrec-into-sni-fake-sni-probe",
+            name: "tlsrec-into-sni-fake-sni-probe".to_owned(),
             technique: DesyncTechnique::TlsRecordSplit {
                 at: SplitAt::IntoSni,
             },
@@ -1063,14 +1169,14 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             fake_probe: Some(FakeProbe {
                 ttl: 3,
                 data_size: 0,
-                fake_sni: Some("www.google.com"),
+                fake_sni: Some("www.google.com".to_owned()),
             }),
             randomize_sni_case: false,
             inter_fragment_delay_ms: None,
         },
         // 21. TCP segment split + fake ClientHello probe.
         NativeDesyncProfile {
-            name: "split-into-sni-fake-sni-probe",
+            name: "split-into-sni-fake-sni-probe".to_owned(),
             technique: DesyncTechnique::TcpSegmentSplit {
                 at: SplitAt::IntoSni,
             },
@@ -1078,7 +1184,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             fake_probe: Some(FakeProbe {
                 ttl: 3,
                 data_size: 0,
-                fake_sni: Some("www.google.com"),
+                fake_sni: Some("www.google.com".to_owned()),
             }),
             randomize_sni_case: false,
             inter_fragment_delay_ms: None,
@@ -1092,7 +1198,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
     profiles.extend([
         // 22. TCP disorder with 15 ms delay — sends segment 2 before segment 1.
         NativeDesyncProfile {
-            name: "tcp-disorder-15ms",
+            name: "tcp-disorder-15ms".to_owned(),
             technique: DesyncTechnique::TcpDisorder { delay_ms: 15 },
             cloudflare_safe: false,
             fake_probe: None,
@@ -1101,7 +1207,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         },
         // 23. TCP disorder with 40 ms delay — longer gap defeats eager reassemblers.
         NativeDesyncProfile {
-            name: "tcp-disorder-40ms",
+            name: "tcp-disorder-40ms".to_owned(),
             technique: DesyncTechnique::TcpDisorder { delay_ms: 40 },
             cloudflare_safe: false,
             fake_probe: None,
@@ -1118,7 +1224,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         // 18. TLS record split + OOB byte between fragments.
         //     Equivalent: --tlsrec 1+s --oob
         NativeDesyncProfile {
-            name: "tlsrec-into-sni-oob",
+            name: "tlsrec-into-sni-oob".to_owned(),
             technique: DesyncTechnique::TlsRecordSplitOob {
                 at: SplitAt::IntoSni,
             },
@@ -1129,7 +1235,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         },
         // 19. TLS record split before SNI + OOB byte.
         NativeDesyncProfile {
-            name: "tlsrec-before-sni-oob",
+            name: "tlsrec-before-sni-oob".to_owned(),
             technique: DesyncTechnique::TlsRecordSplitOob {
                 at: SplitAt::BeforeSni,
             },
@@ -1141,7 +1247,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         // 20. TCP segment split into SNI + OOB byte.
         //     Equivalent: --split 1+s --oob
         NativeDesyncProfile {
-            name: "split-into-sni-oob",
+            name: "split-into-sni-oob".to_owned(),
             technique: DesyncTechnique::TcpSegmentSplitOob {
                 at: SplitAt::IntoSni,
             },
@@ -1152,7 +1258,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
         },
         // 21. TCP segment split before SNI + OOB byte.
         NativeDesyncProfile {
-            name: "split-before-sni-oob",
+            name: "split-before-sni-oob".to_owned(),
             technique: DesyncTechnique::TcpSegmentSplitOob {
                 at: SplitAt::BeforeSni,
             },
@@ -1384,5 +1490,190 @@ mod tests {
             record.to_ascii_lowercase(),
             "lowercased output must equal lowercased input"
         );
+    }
+}
+
+#[cfg(test)]
+mod config_conversion_tests {
+    use crate::config::{
+        FakeProbeConfig, HttpSplitAtConfig, NativeProfileConfig, NativeTechniqueConfig,
+        SplitAtConfig,
+    };
+
+    use super::*;
+
+    #[test]
+    fn native_profile_config_deserializes_from_toml() {
+        let toml = r#"
+            name = "my-custom-split"
+            cloudflare_safe = true
+
+            [technique]
+            kind = "tls_record_split"
+            split_at = "into_sni"
+        "#;
+        let cfg: NativeProfileConfig = toml::from_str(toml).expect("should deserialize");
+        assert_eq!(cfg.name, "my-custom-split");
+        assert!(cfg.cloudflare_safe);
+        assert!(cfg.fake_probe.is_none());
+        assert!(!cfg.randomize_sni_case);
+        assert!(matches!(
+            cfg.technique,
+            NativeTechniqueConfig::TlsRecordSplit {
+                split_at: SplitAtConfig::IntoSni
+            }
+        ));
+    }
+
+    #[test]
+    fn native_profile_config_with_fake_probe_deserializes() {
+        let toml = r#"
+            name = "split-fake-sni"
+            cloudflare_safe = true
+
+            [technique]
+            kind = "tcp_segment_split"
+            split_at = "before_sni"
+
+            [fake_probe]
+            ttl = 3
+            fake_sni = "www.google.com"
+        "#;
+        let cfg: NativeProfileConfig = toml::from_str(toml).expect("should deserialize");
+        let probe = cfg.fake_probe.expect("fake_probe should be set");
+        assert_eq!(probe.ttl, 3);
+        assert_eq!(probe.fake_sni.as_deref(), Some("www.google.com"));
+    }
+
+    #[test]
+    fn native_profile_from_config_converts_tls_record_split() {
+        let cfg = NativeProfileConfig {
+            name: "test-tlsrec".to_owned(),
+            technique: NativeTechniqueConfig::TlsRecordSplit {
+                split_at: SplitAtConfig::IntoSni,
+            },
+            cloudflare_safe: true,
+            fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
+        };
+        let profile = native_profile_from_config(&cfg).expect("conversion should succeed");
+        assert_eq!(profile.name, "test-tlsrec");
+        assert!(profile.cloudflare_safe);
+        assert!(matches!(
+            profile.technique,
+            DesyncTechnique::TlsRecordSplit {
+                at: SplitAt::IntoSni
+            }
+        ));
+        assert!(profile.fake_probe.is_none());
+    }
+
+    #[test]
+    fn native_profile_from_config_converts_fake_probe() {
+        let cfg = NativeProfileConfig {
+            name: "test-fake-probe".to_owned(),
+            technique: NativeTechniqueConfig::TcpSegmentSplit {
+                split_at: SplitAtConfig::BeforeSni,
+            },
+            cloudflare_safe: false,
+            fake_probe: Some(FakeProbeConfig {
+                ttl: 4,
+                data_size: 16,
+                fake_sni: Some("www.bing.com".to_owned()),
+            }),
+            randomize_sni_case: true,
+            inter_fragment_delay_ms: Some(50),
+        };
+        let profile = native_profile_from_config(&cfg).expect("conversion should succeed");
+        let probe = profile.fake_probe.expect("fake_probe should be converted");
+        assert_eq!(probe.ttl, 4);
+        assert_eq!(probe.data_size, 16);
+        assert_eq!(probe.fake_sni.as_deref(), Some("www.bing.com"));
+        assert!(profile.randomize_sni_case);
+        assert_eq!(profile.inter_fragment_delay_ms, Some(50));
+    }
+
+    #[test]
+    fn native_profile_from_config_rejects_empty_name() {
+        let cfg = NativeProfileConfig {
+            name: "   ".to_owned(),
+            technique: NativeTechniqueConfig::TlsRecordSplit {
+                split_at: SplitAtConfig::IntoSni,
+            },
+            cloudflare_safe: true,
+            fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
+        };
+        let result = native_profile_from_config(&cfg);
+        assert!(result.is_err(), "empty name should be rejected");
+    }
+
+    #[test]
+    fn native_profile_from_config_converts_http_split() {
+        let cfg = NativeProfileConfig {
+            name: "test-http".to_owned(),
+            technique: NativeTechniqueConfig::HttpSplit {
+                http_split_at: HttpSplitAtConfig::BeforeHostHeader,
+            },
+            cloudflare_safe: true,
+            fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
+        };
+        let profile = native_profile_from_config(&cfg).expect("conversion should succeed");
+        assert!(matches!(
+            profile.technique,
+            DesyncTechnique::HttpSplit {
+                at: HttpSplitAt::BeforeHostHeader
+            }
+        ));
+    }
+
+    #[test]
+    fn with_config_appends_user_profiles_to_defaults() {
+        let mut evasion_cfg = crate::config::EvasionConfig::default();
+        evasion_cfg.native_profiles.push(NativeProfileConfig {
+            name: "user-custom".to_owned(),
+            technique: NativeTechniqueConfig::TlsRecordSplit {
+                split_at: SplitAtConfig::MidSni,
+            },
+            cloudflare_safe: true,
+            fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
+        });
+
+        let engine = TcpDesyncEngine::with_config(&evasion_cfg);
+        let default_count = default_native_profiles().len();
+        assert_eq!(
+            engine.profile_count(),
+            default_count + 1,
+            "user profile should be appended after defaults"
+        );
+        assert_eq!(engine.profile_name(default_count), "user-custom");
+    }
+
+    #[test]
+    fn with_config_disable_defaults_uses_only_user_profiles() {
+        let evasion_cfg = crate::config::EvasionConfig {
+            disable_default_native_profiles: true,
+            native_profiles: vec![NativeProfileConfig {
+                name: "only-this".to_owned(),
+                technique: NativeTechniqueConfig::TcpSegmentSplit {
+                    split_at: SplitAtConfig::Fixed(5),
+                },
+                cloudflare_safe: false,
+                fake_probe: None,
+                randomize_sni_case: false,
+                inter_fragment_delay_ms: None,
+            }],
+            ..crate::config::EvasionConfig::default()
+        };
+
+        let engine = TcpDesyncEngine::with_config(&evasion_cfg);
+        assert_eq!(engine.profile_count(), 1);
+        assert_eq!(engine.profile_name(0), "only-this");
     }
 }

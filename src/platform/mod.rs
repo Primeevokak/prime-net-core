@@ -1,6 +1,7 @@
 use crate::error::Result;
 
 pub mod diagnostics;
+pub mod kill_switch;
 pub mod ttl;
 
 #[cfg(target_os = "linux")]

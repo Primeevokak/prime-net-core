@@ -118,7 +118,7 @@ pub async fn connect_via_best_route(
                         // Send a fake low-TTL probe to desync the DPI's TCP state table.
                         if let Some(probe) = engine.profile_fake_probe(profile_idx) {
                             if let Ok(addr) = direct.resolve_target_ip(&t).await {
-                                if let Some(sni) = probe.fake_sni {
+                                if let Some(sni) = probe.fake_sni.as_deref() {
                                     // Crafted TLS ClientHello probe — DPI parses the fake SNI
                                     // then loses state when the probe expires (low TTL).
                                     let _ = crate::evasion::dpi_bypass::send_fake_sni_probe(

@@ -525,13 +525,122 @@ fn shadow_bucket_name(_rk: &str, host: &str, cfg: &EngineConfig) -> String {
     }
 }
 
-pub fn prune_ml_state(_now: u64) {
-    // TODO: implement ML state pruning
+/// Remove stale ML state entries to prevent unbounded memory growth.
+///
+/// Should be called periodically (e.g. every minute) with the current Unix timestamp.
+/// Prunes:
+/// - Pending decision events older than 5 minutes (orphaned — no outcome was received).
+/// - Completed outcome events older than 30 minutes (no longer needed for scoring).
+/// - Bandit arms not seen in 7 days (forgotten so the engine re-explores with fresh data).
+pub fn prune_ml_state(now: u64) {
+    // Orphaned decision events (no outcome received) older than 5 minutes are stale.
+    // They accumulate when connections are cancelled or the client disconnects.
+    const PENDING_MAX_AGE_SECS: u64 = 300;
+    if let Some(pending) = ROUTE_DECISION_EVENTS_PENDING.get() {
+        pending.retain(|_, event| now.saturating_sub(event.timestamp_unix) <= PENDING_MAX_AGE_SECS);
+    }
+
+    // Completed outcome events older than 30 minutes are no longer needed for scoring.
+    const OUTCOME_MAX_AGE_SECS: u64 = 1800;
+    if let Some(outcomes) = ROUTE_OUTCOME_EVENTS.get() {
+        outcomes
+            .retain(|_, event| now.saturating_sub(event.timestamp_unix) <= OUTCOME_MAX_AGE_SECS);
+    }
+
+    // Bandit arms not seen in 7 days are forgotten so the engine re-explores with fresh data.
+    const ARM_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+    if let Some(arms) = SHADOW_BANDIT_ARMS.get() {
+        arms.retain(|_, stats| now.saturating_sub(stats.last_seen_unix) <= ARM_MAX_AGE_SECS);
+    }
 }
 
 pub fn note_phase2_profile_rotation(_d: &str, _cfg: &EngineConfig) {}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    #[test]
+    fn prune_removes_stale_arms() {
+        let map = SHADOW_BANDIT_ARMS.get_or_init(DashMap::new);
+
+        // Insert a fresh arm and a stale arm.
+        let fresh_key = "prune-test-bucket|fresh-arm".to_owned();
+        let stale_key = "prune-test-bucket|stale-arm".to_owned();
+
+        let now = now_unix_secs();
+        // Fresh arm: last seen 1 hour ago — within 7-day window.
+        map.insert(
+            fresh_key.clone(),
+            ShadowBanditArmStats {
+                pulls: 5,
+                reward_sum: 100,
+                last_reward: 20,
+                last_seen_unix: now.saturating_sub(3600),
+            },
+        );
+        // Stale arm: last seen 8 days ago — outside 7-day window.
+        map.insert(
+            stale_key.clone(),
+            ShadowBanditArmStats {
+                pulls: 3,
+                reward_sum: 60,
+                last_reward: 20,
+                last_seen_unix: now.saturating_sub(8 * 24 * 3600),
+            },
+        );
+
+        prune_ml_state(now);
+
+        assert!(
+            map.contains_key(&fresh_key),
+            "fresh arm should survive pruning"
+        );
+        assert!(!map.contains_key(&stale_key), "stale arm should be pruned");
+
+        // Cleanup.
+        map.remove(&fresh_key);
+    }
+
+    #[test]
+    fn prune_keeps_all_arms_when_none_stale() {
+        let map = SHADOW_BANDIT_ARMS.get_or_init(DashMap::new);
+        let now = now_unix_secs();
+
+        let key1 = "prune-keep-test|arm-a".to_owned();
+        let key2 = "prune-keep-test|arm-b".to_owned();
+
+        map.insert(
+            key1.clone(),
+            ShadowBanditArmStats {
+                pulls: 1,
+                reward_sum: 10,
+                last_reward: 10,
+                last_seen_unix: now,
+            },
+        );
+        map.insert(
+            key2.clone(),
+            ShadowBanditArmStats {
+                pulls: 2,
+                reward_sum: 40,
+                last_reward: 20,
+                last_seen_unix: now.saturating_sub(60),
+            },
+        );
+
+        prune_ml_state(now);
+
+        assert!(map.contains_key(&key1), "recent arm should survive");
+        assert!(map.contains_key(&key2), "recent arm should survive");
+
+        // Cleanup.
+        map.remove(&key1);
+        map.remove(&key2);
+    }
+}
 
 #[cfg(test)]
 mod reward_tests {
