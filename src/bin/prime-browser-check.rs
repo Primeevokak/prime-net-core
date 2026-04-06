@@ -53,7 +53,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    let stderr = engine_child.stderr.take().unwrap();
+    let Some(stderr) = engine_child.stderr.take() else {
+        eprintln!("Engine stderr not available (not piped)");
+        std::process::exit(1);
+    };
     let reader = BufReader::new(stderr);
     let mut lines = reader.lines();
 
@@ -70,7 +73,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !user_data_dir.exists() {
         std::fs::create_dir_all(&user_data_dir)?;
     }
-    let user_data_str = user_data_dir.to_str().unwrap();
+    let Some(user_data_str) = user_data_dir.to_str() else {
+        eprintln!("Chrome user data dir path contains non-UTF-8 characters");
+        std::process::exit(1);
+    };
 
     let mut browser_child = Command::new(chrome_path)
         .args([

@@ -58,7 +58,7 @@ impl Default for TunOpts {
             tun_name: "prime0".to_owned(),
             tun_addr: Ipv4Addr::new(10, 88, 0, 1),
             tun_prefix: 16,
-            socks_addr: "127.0.0.1:1080".parse().unwrap(),
+            socks_addr: SocketAddr::from(([127, 0, 0, 1], 1080)),
             mtu: 1500,
             print_routes_only: false,
         }

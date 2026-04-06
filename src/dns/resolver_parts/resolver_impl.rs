@@ -282,8 +282,9 @@ impl UniversalDnsResolver {
         }
 
         // Remove guard from map after successful build
-        let guards = RESOLVER_BUILD_GUARDS.get().unwrap();
-        guards.lock().remove(&key);
+        if let Some(guards) = RESOLVER_BUILD_GUARDS.get() {
+            guards.lock().remove(&key);
+        }
 
         Ok(resolver)
     }

@@ -344,9 +344,20 @@ pub struct PrivacyConfig {
 pub struct PrivacySignalsConfig { pub send_dnt: bool, pub send_gpc: bool }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserAgentConfig { pub enabled: bool, pub preset: UserAgentPreset, pub custom_value: String }
+pub struct UserAgentConfig {
+    pub enabled: bool,
+    pub preset: UserAgentPreset,
+    pub custom_value: String,
+}
+
 impl Default for UserAgentConfig {
-    fn default() -> Self { Self { enabled: false, preset: UserAgentPreset::ChromeWindows, custom_value: String::new() } }
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            preset: UserAgentPreset::ChromeWindows,
+            custom_value: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -443,16 +454,53 @@ pub struct PluggableTransportConfig {
 pub enum PluggableTransportKind { Trojan, Shadowsocks, Obfs4, Snowflake }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrojanPtConfig { pub server: String, pub password: String, pub sni: Option<String>, pub alpn_protocols: Vec<String>, pub insecure_skip_verify: bool }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShadowsocksPtConfig { pub server: String, pub password: String, pub method: String }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Obfs4PtConfig { pub server: String, pub fingerprint: Option<String>, pub cert: String, pub iat_mode: Option<u8>, pub tor_bin: String, pub tor_args: Vec<String>, pub obfs4proxy_bin: String, pub obfs4proxy_args: Vec<String> }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnowflakePtConfig { pub tor_bin: String, pub tor_args: Vec<String>, pub snowflake_bin: String, pub broker: Option<String>, pub front: Option<String>, pub amp_cache: Option<String>, pub stun_servers: Vec<String>, pub bridge: Option<String>, pub snowflake_args: Vec<String> }
+pub struct TrojanPtConfig {
+    pub server: String,
+    pub password: String,
+    pub sni: Option<String>,
+    pub alpn_protocols: Vec<String>,
+    pub insecure_skip_verify: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SystemProxyConfig { pub auto_configure: bool, pub mode: SystemProxyMode, pub pac_port: u16, pub socks_endpoint: String }
+pub struct ShadowsocksPtConfig {
+    pub server: String,
+    pub password: String,
+    pub method: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Obfs4PtConfig {
+    pub server: String,
+    pub fingerprint: Option<String>,
+    pub cert: String,
+    pub iat_mode: Option<u8>,
+    pub tor_bin: String,
+    pub tor_args: Vec<String>,
+    pub obfs4proxy_bin: String,
+    pub obfs4proxy_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnowflakePtConfig {
+    pub tor_bin: String,
+    pub tor_args: Vec<String>,
+    pub snowflake_bin: String,
+    pub broker: Option<String>,
+    pub front: Option<String>,
+    pub amp_cache: Option<String>,
+    pub stun_servers: Vec<String>,
+    pub bridge: Option<String>,
+    pub snowflake_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemProxyConfig {
+    pub auto_configure: bool,
+    pub mode: SystemProxyMode,
+    pub pac_port: u16,
+    pub socks_endpoint: String,
+}
 
 impl Default for SystemProxyConfig {
     fn default() -> Self {
@@ -529,8 +577,29 @@ pub enum UpdateChannel { #[default] Stable, Beta, Nightly }
 pub struct TelemetryConfig { pub crash_reports: bool, pub endpoint: String }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TransportConfig { pub http3_connect_timeout_ms: u64, pub http3_request_timeout_ms: u64, pub http3_only: bool, pub prefer_http3: bool, pub http3_idle_timeout_ms: u64, pub http3_keep_alive_interval_ms: Option<u64>, pub http3_insecure_skip_verify: bool }
-impl Default for TransportConfig { fn default() -> Self { Self { http3_connect_timeout_ms: 5000, http3_request_timeout_ms: 30000, http3_only: false, prefer_http3: true, http3_idle_timeout_ms: 10000, http3_keep_alive_interval_ms: Some(5000), http3_insecure_skip_verify: false } } }
+pub struct TransportConfig {
+    pub http3_connect_timeout_ms: u64,
+    pub http3_request_timeout_ms: u64,
+    pub http3_only: bool,
+    pub prefer_http3: bool,
+    pub http3_idle_timeout_ms: u64,
+    pub http3_keep_alive_interval_ms: Option<u64>,
+    pub http3_insecure_skip_verify: bool,
+}
+
+impl Default for TransportConfig {
+    fn default() -> Self {
+        Self {
+            http3_connect_timeout_ms: 5000,
+            http3_request_timeout_ms: 30000,
+            http3_only: false,
+            prefer_http3: true,
+            http3_idle_timeout_ms: 10000,
+            http3_keep_alive_interval_ms: Some(5000),
+            http3_insecure_skip_verify: false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum EchMode { Grease, Real, Auto }

@@ -26,7 +26,6 @@ const BUILTIN_URL_KEYWORDS: &[&str] = &[
 
 #[derive(Debug, Clone)]
 pub struct TrackerBlocker {
-    #[allow(dead_code)]
     mode: TrackerBlockerMode,
     domains: HashSet<String>,
     keywords: Vec<String>,
