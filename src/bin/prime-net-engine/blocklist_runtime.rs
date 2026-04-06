@@ -98,7 +98,10 @@ pub async fn initialize_runtime_blocklist(cfg: &BlocklistConfig) -> Result<Runti
     let mut cache_updated = false;
 
     let mut source = cfg.source.clone();
-    if source.contains("zapret-info") || source.contains("z-i") {
+    if source.contains("zapret-info")
+        || source.contains("z-i")
+        || source.contains("prime-net/blocklist")
+    {
         source = prime_net_engine_core::blocklist::DEFAULT_BLOCKLIST_SOURCE.to_owned();
     }
 

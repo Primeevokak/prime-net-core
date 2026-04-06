@@ -761,7 +761,7 @@ fn default_updater_repo() -> String { "prime-net/engine".to_owned() }
 fn default_blocklist_enabled() -> bool { true }
 fn default_blocklist_auto_update() -> bool { true }
 fn default_blocklist_update_interval_hours() -> u64 { 24 }
-fn default_blocklist_source() -> String { "https://raw.githubusercontent.com/prime-net/blocklist/main/blocklist.json".to_owned() }
+fn default_blocklist_source() -> String { "https://antifilter.download/list/domains.lst".to_owned() }
 fn default_blocklist_cache_path() -> String {
     if let Some(dir) = dirs::cache_dir() {
         let path = dir.join("prime-net-engine").join("blocklist.json");
