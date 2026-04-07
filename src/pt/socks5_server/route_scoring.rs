@@ -156,9 +156,11 @@ pub fn is_censored_domain(domain: &str, _relay_opts: &RelayOptions, cfg: &Engine
     let dest_host = dest_lower.split(':').next().unwrap_or(&dest_lower);
 
     // 2. Check global engine blocklist
-    if let Some(bloom) = BLOCKLIST_DOMAINS.get() {
-        if bloom.contains_host_or_suffix(dest_host) {
-            return true;
+    if let Some(rw) = BLOCKLIST_DOMAINS.get() {
+        if let Ok(bloom) = rw.read() {
+            if bloom.contains_host_or_suffix(dest_host) {
+                return true;
+            }
         }
     }
 

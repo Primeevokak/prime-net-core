@@ -183,8 +183,12 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
         cfg.evasion.kill_switch_enabled,
     );
 
-    // Spawn config file watcher for hot reload.
-    let _config_watcher = opts.config_path.clone().map(spawn_config_watcher);
+    // Spawn config file watcher for hot reload. The cancellation token lets us
+    // stop it cleanly on shutdown so no background tasks outlive the runtime.
+    let config_watcher_cancel = opts.config_path.clone().map(|p| {
+        let (_handle, token) = spawn_config_watcher(p);
+        token
+    });
 
     // Spawn stats file writer so the GUI can poll real-time engine metrics.
     let _stats_writer = opts.stats_file.clone().map(|path| {
@@ -198,6 +202,9 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
 
     let _keep = guard;
     wait_for_shutdown().await;
+    if let Some(token) = config_watcher_cancel {
+        token.cancel();
+    }
     Ok(())
 }
 
@@ -346,6 +353,11 @@ async fn wait_for_shutdown() {
 
     #[cfg(not(windows))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
     }
 }

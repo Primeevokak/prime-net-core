@@ -255,6 +255,13 @@ pub async fn handle_socks5_connection(
     if hdr[0] == 0x05 {
         let mut m = vec![0u8; hdr[1] as usize];
         tcp.read_exact(&mut m).await?;
+        if !m.contains(&0x00) {
+            // RFC 1928 §3: no acceptable method — reply 0xFF and close
+            let _ = tcp.write_all(&[0x05, 0xFF]).await;
+            return Err(EngineError::Internal(
+                "SOCKS5 client offered no acceptable auth method".to_owned(),
+            ));
+        }
         tcp.write_all(&[0x05, 0x00]).await?;
         let mut req = [0u8; 4];
         tcp.read_exact(&mut req).await?;
@@ -504,6 +511,9 @@ pub async fn handle_socks5_request_with_target(
                         &format!("{:?}", signal),
                         &cfg,
                     );
+
+                    // Always update per-route health so the ML scorer learns from relay failures
+                    record_route_failure(route_key, &route.candidate, "relay-phase", &cfg);
 
                     // Record failure for the classifier if it's a strong blocking signal
                     if signal == BlockingSignal::Reset || signal == BlockingSignal::Timeout {

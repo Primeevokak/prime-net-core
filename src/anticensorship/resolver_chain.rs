@@ -103,7 +103,9 @@ impl ResolverChain {
     async fn resolve_parallel(&self, domain: &str) -> Result<Vec<IpAddr>> {
         use tokio::task::JoinSet;
         use tokio::time::{Duration, Instant};
-        const DNS_PARALLEL_COLLECT_WINDOW_MS: u64 = 250;
+        // 50ms window: fast enough to collect concurrent results from multiple
+        // resolvers without adding noticeable latency to single-resolver paths.
+        const DNS_PARALLEL_COLLECT_WINDOW_MS: u64 = 50;
         let mut set = JoinSet::new();
 
         for kind in &self.chain {

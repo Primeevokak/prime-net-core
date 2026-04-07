@@ -146,7 +146,7 @@ pub struct NativeDesyncProfile {
 ///
 /// The optional `packet_interceptor` enables [`DesyncTechnique::TcpDisorder`]
 /// profiles.  When absent those profiles fall back to a plain TCP split.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TcpDesyncEngine {
     profiles: Vec<NativeDesyncProfile>,
     /// Packet-level interceptor for TCP disorder (WinDivert / NFQueue).

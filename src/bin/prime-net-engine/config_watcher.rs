@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use prime_net_engine_core::EngineConfig;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::blocklist_runtime::reload_blocklist;
@@ -12,13 +13,18 @@ use crate::blocklist_runtime::reload_blocklist;
 /// Spawn a background task that polls `path` for modification time changes
 /// every 5 seconds and applies hot-reloadable config changes.
 ///
+/// Returns both the `JoinHandle` and a [`CancellationToken`] that can be used
+/// to shut down the watcher cleanly on engine shutdown.
+///
 /// Hot-reloadable: blocklist source/settings.
 /// Requires restart: SOCKS5 bind address, transport type, evasion profiles.
-pub fn spawn_config_watcher(path: PathBuf) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(watch_loop(path))
+pub fn spawn_config_watcher(path: PathBuf) -> (tokio::task::JoinHandle<()>, CancellationToken) {
+    let token = CancellationToken::new();
+    let handle = tokio::spawn(watch_loop(path, token.clone()));
+    (handle, token)
 }
 
-async fn watch_loop(path: PathBuf) {
+async fn watch_loop(path: PathBuf, cancel: CancellationToken) {
     let Ok(meta) = std::fs::metadata(&path) else {
         warn!(target: "socks_cmd", path = %path.display(), "config watcher: cannot stat config file — hot reload disabled");
         return;
@@ -32,7 +38,10 @@ async fn watch_loop(path: PathBuf) {
     interval.tick().await; // consume the first immediate tick
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = interval.tick() => {},
+        }
 
         let Ok(meta) = std::fs::metadata(&path) else {
             continue;

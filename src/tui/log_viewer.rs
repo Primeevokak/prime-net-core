@@ -25,6 +25,8 @@ pub struct LogViewer {
     category_filter: RwLock<Option<String>>,
     search_query: RwLock<String>,
     use_regex: AtomicBool,
+    /// Cached compiled regex — rebuilt whenever `search_query` changes.
+    cached_regex: RwLock<Option<Regex>>,
     auto_scroll: AtomicBool,
     selected_line: AtomicUsize,
 }
@@ -55,6 +57,7 @@ impl LogViewer {
             category_filter: RwLock::new(None),
             search_query: RwLock::new(String::new()),
             use_regex: AtomicBool::new(false),
+            cached_regex: RwLock::new(None),
             auto_scroll: AtomicBool::new(true),
             selected_line: AtomicUsize::new(0),
         }
@@ -112,7 +115,8 @@ impl LogViewer {
         }
 
         if self.use_regex.load(Ordering::Relaxed) {
-            if let Ok(re) = Regex::new(&search_query) {
+            let cached = self.cached_regex.read();
+            if let Some(re) = cached.as_ref() {
                 return re.is_match(&entry.message) || re.is_match(&entry.target);
             }
         }
@@ -139,9 +143,9 @@ impl LogViewer {
         }
 
         let mut snapshot = self.filtered_snapshot.write();
-        // Check dirty again after write lock
+        // Check dirty again after acquiring the write lock
         if !self.cache_dirty.load(Ordering::Relaxed) {
-            return (**snapshot).clone().into();
+            return snapshot.clone();
         }
 
         let logs = self.logs.read();
@@ -160,7 +164,7 @@ impl LogViewer {
         *snapshot = Arc::new(storage.clone());
         self.cache_dirty.store(false, Ordering::Relaxed);
 
-        Arc::new(storage.clone())
+        snapshot.clone()
     }
 
     pub fn visible_logs(&self, max_lines: usize) -> Vec<LogEntry> {
@@ -181,11 +185,19 @@ impl LogViewer {
         }
     }
 
+    /// Clears the incremental filter cache and marks it dirty so the next
+    /// [`filtered_logs`] call performs a full re-filter from `logs`.
+    fn invalidate_filter_cache(&self) {
+        self.filtered_storage.write().clear();
+        self.cache_dirty.store(true, Ordering::Relaxed);
+    }
+
     pub fn set_filter_level(&self, filter_level: Option<Level>) {
         let mut current = self.filter_level.write();
         if *current != filter_level {
             *current = filter_level;
-            self.cache_dirty.store(true, Ordering::Relaxed);
+            drop(current);
+            self.invalidate_filter_cache();
         }
     }
 
@@ -197,7 +209,8 @@ impl LogViewer {
         let mut current = self.category_filter.write();
         if *current != category {
             *current = category;
-            self.cache_dirty.store(true, Ordering::Relaxed);
+            drop(current);
+            self.invalidate_filter_cache();
         }
     }
 
@@ -208,15 +221,21 @@ impl LogViewer {
     pub fn set_search_query(&self, query: String) {
         let mut current = self.search_query.write();
         if *current != query {
+            // Recompile the cached regex whenever the query changes
+            *self.cached_regex.write() = if query.is_empty() {
+                None
+            } else {
+                Regex::new(&query).ok()
+            };
             *current = query;
-            self.cache_dirty.store(true, Ordering::Relaxed);
+            self.invalidate_filter_cache();
         }
     }
 
     pub fn set_use_regex(&self, use_regex: bool) {
         let prev = self.use_regex.swap(use_regex, Ordering::Relaxed);
         if prev != use_regex {
-            self.cache_dirty.store(true, Ordering::Relaxed);
+            self.invalidate_filter_cache();
         }
     }
 

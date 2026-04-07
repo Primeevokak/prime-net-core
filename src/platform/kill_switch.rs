@@ -96,7 +96,7 @@ async fn check_port_alive(addr: SocketAddr) -> bool {
 /// Traffic will fail-closed: applications will see connection refused rather than
 /// leaking through an unprotected network path.
 async fn engage_kill_switch(_proxy_port: u16) {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     {
         let dead_endpoint = format!("127.0.0.1:{DEAD_PORT}");
         if let Err(e) = crate::platform::system_proxy_manager().enable(&dead_endpoint) {
@@ -107,23 +107,13 @@ async fn engage_kill_switch(_proxy_port: u16) {
             );
         }
     }
-    #[cfg(target_os = "linux")]
-    warn!(
-        target: "kill_switch",
-        "kill switch engaged — block outbound traffic with iptables to prevent leaks"
-    );
-    #[cfg(target_os = "macos")]
-    warn!(
-        target: "kill_switch",
-        "kill switch engaged — route traffic through proxy or block with pf to prevent leaks"
-    );
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     warn!(target: "kill_switch", "kill switch engaged");
 }
 
 /// Disengage the kill switch by disabling the dead-port proxy redirect.
 async fn disengage_kill_switch() {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     {
         if let Err(e) = crate::platform::system_proxy_manager().disable() {
             warn!(
@@ -133,7 +123,7 @@ async fn disengage_kill_switch() {
             );
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     info!(target: "kill_switch", "kill switch disengaged");
 }
 

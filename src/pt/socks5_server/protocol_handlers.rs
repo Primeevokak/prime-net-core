@@ -23,12 +23,16 @@ pub async fn handle_http_proxy(
     first_two: [u8; 2],
     relay_opts: RelayOptions,
 ) -> Result<()> {
+    const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
     let mut buf = Vec::with_capacity(2048);
     buf.extend_from_slice(&first_two);
     let mut tmp = [0u8; 512];
     loop {
         if find_http_header_end(&buf).is_some() {
             break;
+        }
+        if buf.len() >= MAX_HTTP_HEADER_BYTES {
+            return Err(EngineError::Internal("HTTP header too large".to_owned()));
         }
         let n = tcp.read(&mut tmp).await?;
         if n == 0 {
@@ -100,6 +104,12 @@ pub async fn handle_http_proxy(
         )
         .await
     } else {
+        // Only CONNECT is supported; return a proper error so the client knows why
+        let _ = tcp
+            .write_all(
+                b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await;
         Ok(())
     }
 }

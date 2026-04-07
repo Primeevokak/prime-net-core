@@ -329,7 +329,9 @@ impl ConfigEditor {
                 self.validation_errors.clear();
             }
             Err(e) => {
-                self.validation_errors.insert(field, e.message.to_owned());
+                // Key must match the render-side format: "section.field"
+                let full_key = format!("{}.{}", section_key(self.current_section), field);
+                self.validation_errors.insert(full_key, e.message.to_owned());
             }
         }
         Ok(())

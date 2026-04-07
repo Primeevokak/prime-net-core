@@ -213,8 +213,10 @@ fn parse_pt_kind(value: &str) -> Result<PluggableTransportKind> {
     match value.trim().to_ascii_lowercase().as_str() {
         "trojan" => Ok(PluggableTransportKind::Trojan),
         "shadowsocks" | "ss" => Ok(PluggableTransportKind::Shadowsocks),
+        "obfs4" => Ok(PluggableTransportKind::Obfs4),
+        "snowflake" => Ok(PluggableTransportKind::Snowflake),
         _ => Err(EngineError::InvalidInput(
-            "kind должен быть trojan|shadowsocks".to_owned(),
+            "kind должен быть trojan|shadowsocks|obfs4|snowflake".to_owned(),
         )),
     }
 }

@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::warn;
 use url::Url;
 
 use crate::error::{EngineError, Result};
@@ -189,9 +190,20 @@ pub async fn update_blocklist(source: &str, cache_path: &Path) -> Result<Blockli
         source
     };
 
+    // Some blocklist sources (e.g. antifilter.download) use self-signed certificates.
+    // WARN: this makes the download MITM-able. Keep this in scope only for blocklist fetches.
+    let tls_accept_invalid = source_url.starts_with("https://antifilter.download")
+        || source_url.starts_with("https://reestr.rublacklist");
+    if tls_accept_invalid {
+        warn!(
+            target: "blocklist",
+            source = %source_url,
+            "blocklist source uses invalid TLS — cert verification disabled for this request"
+        );
+    }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(tls_accept_invalid)
         .no_proxy()
         .build()
         .map_err(|e| EngineError::Internal(format!("failed to build blocklist client: {e}")))?;

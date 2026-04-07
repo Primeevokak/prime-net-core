@@ -33,10 +33,18 @@ pub async fn handle_socks4(
     tcp.read_exact(&mut ip_buf).await?;
     let target_addr = TargetAddr::Ip(std::net::IpAddr::V4(ip_buf.into()));
 
-    // Read user ID (and discard)
+    // Read user ID (and discard) — cap at 255 bytes to prevent unbounded reads
+    const MAX_USER_ID_LEN: usize = 255;
+    let mut read_count = 0usize;
     loop {
+        if read_count >= MAX_USER_ID_LEN {
+            return Err(EngineError::Internal(
+                "SOCKS4 user ID exceeds 255 bytes".to_owned(),
+            ));
+        }
         let mut b = [0u8; 1];
         tcp.read_exact(&mut b).await?;
+        read_count += 1;
         if b[0] == 0 {
             break;
         }

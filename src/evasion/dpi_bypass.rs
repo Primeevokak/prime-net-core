@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use rand::Rng;
+use socket2::{Domain, Protocol, Socket, Type};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -253,18 +254,42 @@ pub(crate) async fn write_oob_at(
     Ok(())
 }
 
+/// Connect to `addr` with TTL pre-set so the **SYN** itself carries the low TTL.
+///
+/// `TcpStream::connect` sends the SYN before returning, so calling `set_ttl` on
+/// an already-connected stream is too late — only subsequent packets get the low
+/// TTL.  Using `socket2` lets us set `IP_TTL` on the socket *before* the SYN is
+/// sent, which is required for effective TCB-desync probing.
+async fn connect_with_ttl(addr: SocketAddr, ttl: u8) -> std::io::Result<TcpStream> {
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_ttl(u32::from(ttl.max(1)))?;
+    socket.set_nonblocking(true)?;
+    // Begin non-blocking connect; the OS sends SYN with the TTL already set.
+    let _ = socket.connect(&addr.into());
+    let std_stream: std::net::TcpStream = socket.into();
+    TcpStream::from_std(std_stream)
+}
+
 /// Send a short-lived low-TTL probe to influence DPI TCP state.
 ///
-/// Best-effort: errors are ignored by callers.
+/// The SYN itself carries the low TTL so that a stateful DPI box sees the SYN,
+/// opens tracking state, but the probe packets never reach the destination server
+/// (they expire in transit).  Best-effort: errors are ignored by callers.
 pub(crate) async fn send_tcb_desync_probe(addr: SocketAddr, fake_ttl: u8) -> std::io::Result<()> {
-    // Best-effort: short-lived low-TTL probe connection to influence DPI state.
-    if let Ok(Ok(mut probe)) =
-        tokio::time::timeout(Duration::from_millis(150), TcpStream::connect(addr)).await
-    {
-        let _ = probe.set_ttl(u32::from(fake_ttl.max(1)));
+    let connect_fut = async {
+        let mut probe = connect_with_ttl(addr, fake_ttl).await?;
+        // Wait for the connection to complete (or fail) before writing.
+        let _ = probe.writable().await;
         let _ = probe.write_all(b"\0").await;
         let _ = probe.shutdown().await;
-    }
+        Ok::<_, std::io::Error>(())
+    };
+    let _ = tokio::time::timeout(Duration::from_millis(250), connect_fut).await;
     Ok(())
 }
 
@@ -277,15 +302,16 @@ pub(crate) async fn send_fake_payload_probe(
     data_size: usize,
 ) -> std::io::Result<()> {
     use rand::RngCore;
-    if let Ok(Ok(mut probe)) =
-        tokio::time::timeout(Duration::from_millis(200), TcpStream::connect(addr)).await
-    {
-        let _ = probe.set_ttl(u32::from(ttl.max(1)));
+    let connect_fut = async {
+        let mut probe = connect_with_ttl(addr, ttl).await?;
+        let _ = probe.writable().await;
         let mut junk = vec![0u8; data_size.clamp(1, 1024)];
         rand::thread_rng().fill_bytes(&mut junk);
         let _ = probe.write_all(&junk).await;
         let _ = probe.shutdown().await;
-    }
+        Ok::<_, std::io::Error>(())
+    };
+    let _ = tokio::time::timeout(Duration::from_millis(250), connect_fut).await;
     Ok(())
 }
 
@@ -304,13 +330,14 @@ pub(crate) async fn send_fake_sni_probe(
     fake_sni: &str,
 ) -> std::io::Result<()> {
     let payload = build_fake_client_hello(fake_sni);
-    if let Ok(Ok(mut probe)) =
-        tokio::time::timeout(Duration::from_millis(200), TcpStream::connect(addr)).await
-    {
-        let _ = probe.set_ttl(u32::from(ttl.max(1)));
+    let connect_fut = async {
+        let mut probe = connect_with_ttl(addr, ttl).await?;
+        let _ = probe.writable().await;
         let _ = probe.write_all(&payload).await;
         let _ = probe.shutdown().await;
-    }
+        Ok::<_, std::io::Error>(())
+    };
+    let _ = tokio::time::timeout(Duration::from_millis(250), connect_fut).await;
     Ok(())
 }
 

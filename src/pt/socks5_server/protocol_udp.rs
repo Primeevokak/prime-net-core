@@ -65,6 +65,9 @@ pub async fn handle_udp_associate(
     // Vec because multiple domains can resolve to the same IP (CDN/Cloudflare).
     let mut addr_to_domain: HashMap<SocketAddr, Vec<String>> = HashMap::new();
     let mut probe_check = tokio::time::interval(std::time::Duration::from_secs(1));
+    // Idle timeout created once outside the loop so it tracks real elapsed idle time.
+    let idle_timeout = tokio::time::sleep(std::time::Duration::from_secs(300));
+    tokio::pin!(idle_timeout);
 
     loop {
         tokio::select! {
@@ -152,7 +155,7 @@ pub async fn handle_udp_associate(
                     !keys.is_empty()
                 });
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
+            _ = &mut idle_timeout => {
                 debug!(conn_id, "UDP relay idle timeout");
                 break;
             }
@@ -286,7 +289,11 @@ async fn handle_client_to_remote(
             let target = target_addr;
             let dcid = hdr.dcid.clone();
             tokio::spawn(async move {
-                send_fake_quic_initial(target, &dcid, "www.google.com", FAKE_QUIC_TTL).await;
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    send_fake_quic_initial(target, &dcid, "www.google.com", FAKE_QUIC_TTL),
+                )
+                .await;
             });
         }
     }

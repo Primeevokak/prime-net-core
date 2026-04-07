@@ -577,8 +577,27 @@ pub async fn run_tun(cfg: EngineConfig, opts: &TunOpts) -> Result<()> {
             error!("TUN background SOCKS5 error: {e}");
         }
     });
-    // Give SOCKS5 a moment to bind
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Wait until SOCKS5 is actually accepting connections (up to 5 s)
+    let socks_ready = {
+        let addr = opts.socks_addr;
+        async move {
+            for _ in 0..50u32 {
+                if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            false
+        }
+    };
+    if !tokio::time::timeout(Duration::from_secs(5), socks_ready)
+        .await
+        .unwrap_or(false)
+    {
+        return Err(EngineError::Internal(
+            "SOCKS5 did not become ready within 5 s".to_owned(),
+        ));
+    }
 
     // 2. Create TUN device
     let mut tun_config = tun2::Configuration::default();

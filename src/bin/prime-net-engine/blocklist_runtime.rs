@@ -73,7 +73,10 @@ impl DomainMatcher {
 /// Set `RUNTIME_MATCHER` on first call; update its contents on subsequent calls.
 fn set_or_update_matcher(matcher: DomainMatcher) {
     if let Some(rw) = RUNTIME_MATCHER.get() {
-        *rw.write().unwrap() = matcher;
+        match rw.write() {
+            Ok(mut guard) => *guard = matcher,
+            Err(e) => warn!(target: "socks_cmd", error = %e, "blocklist RwLock poisoned"),
+        }
     } else {
         let _ = RUNTIME_MATCHER.set(std::sync::RwLock::new(matcher));
     }
@@ -157,7 +160,7 @@ pub async fn initialize_runtime_blocklist(cfg: &BlocklistConfig) -> Result<Runti
             global_bloom.insert(&normalized);
         }
     }
-    let _ = prime_net_engine_core::pt::socks5_server::BLOCKLIST_DOMAINS.set(global_bloom);
+    prime_net_engine_core::pt::socks5_server::set_blocklist_domains(global_bloom);
 
     set_or_update_matcher(matcher);
 
@@ -191,9 +194,11 @@ pub fn is_bypass_domain_runtime(host: &str) -> bool {
     if blocklist_builtin::is_bypass_domain(host) {
         return true;
     }
-    RUNTIME_MATCHER
-        .get()
-        .is_some_and(|rw| rw.read().unwrap().contains_host_or_suffix(host))
+    RUNTIME_MATCHER.get().is_some_and(|rw| {
+        rw.read()
+            .map(|guard| guard.contains_host_or_suffix(host))
+            .unwrap_or(false)
+    })
 }
 
 pub fn sync_domains_to_pt_tools(domains: &[String]) -> Result<Option<PathBuf>> {

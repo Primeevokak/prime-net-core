@@ -432,7 +432,23 @@ pub fn routing_state() -> &'static RoutingState {
 }
 
 /// Optional domain blocklist loaded from a filter file.
-pub static BLOCKLIST_DOMAINS: OnceLock<crate::blocklist::DomainBloom> = OnceLock::new();
+///
+/// Wrapped in `RwLock` so the hot-reload path can update it without restarting.
+/// Use [`set_blocklist_domains`] / [`get_blocklist_domains`] instead of accessing
+/// this directly.
+pub static BLOCKLIST_DOMAINS: OnceLock<std::sync::RwLock<crate::blocklist::DomainBloom>> =
+    OnceLock::new();
+
+/// Replace the global blocklist bloom filter, initialising the slot on first call.
+pub fn set_blocklist_domains(bloom: crate::blocklist::DomainBloom) {
+    if let Some(rw) = BLOCKLIST_DOMAINS.get() {
+        if let Ok(mut guard) = rw.write() {
+            *guard = bloom;
+        }
+    } else {
+        let _ = BLOCKLIST_DOMAINS.set(std::sync::RwLock::new(bloom));
+    }
+}
 
 // ── Submodules ────────────────────────────────────────────────────────────────
 

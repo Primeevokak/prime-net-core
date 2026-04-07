@@ -42,8 +42,10 @@ impl EchManager {
                 return Err(EngineError::InvalidInput("domain is empty".to_owned()));
             }
 
-            // Best-effort: use system DNS config for bootstrapping ECH configs (HTTPS RR).
-            // Anti-censorship flows can instead do this via ResolverChain once it's wired through.
+            // TODO: pass a ResolverChain reference here instead of using the system DNS.
+            // On censored networks the system DNS returns NXDOMAIN for HTTPS RR lookups,
+            // so ECH config discovery silently fails.  The ResolverChain (DoH/DoT/DoQ) must
+            // be threaded through to this call site before ECH can work on blocked networks.
             let resolver = TokioResolver::builder_tokio()
                 .map_err(|e| EngineError::Internal(format!("system resolver build failed: {e}")))?
                 .build();

@@ -200,9 +200,13 @@ pub fn maybe_flush_classifier_store(force: bool, cfg: Arc<EngineConfig>) {
 
     match serde_json::to_string_pretty(&data) {
         Ok(json) => {
-            if let Err(e) = std::fs::write(path, json) {
-                tracing::warn!("Failed to write classifier cache {}: {}", path, e);
-            }
+            let path_owned = path.to_owned();
+            // Use spawn_blocking so the file write does not stall the async runtime
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = std::fs::write(&path_owned, json) {
+                    tracing::warn!("Failed to write classifier cache {}: {}", path_owned, e);
+                }
+            });
         }
         Err(e) => tracing::warn!("Failed to serialize classifier cache: {}", e),
     }

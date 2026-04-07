@@ -27,6 +27,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
+use crate::evasion::dpi_bypass::{send_fake_sni_probe, send_tcb_desync_probe};
+
 use crate::evasion::tcp_desync::{NativeDesyncProfile, TcpDesyncEngine};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -96,6 +98,22 @@ impl ProfileDiscoveryCache {
         }
     }
 
+    /// Replace the entry for `profile_name` with fresh results.
+    ///
+    /// Unlike [`record`] this **overwrites** rather than accumulates so that a
+    /// stale "3/3 wins" from a previous run cannot inflate the score if the
+    /// current run found "0/3 wins".
+    pub fn record_overwrite(&mut self, profile_name: &str, wins: u32, probes: u32) {
+        self.entries.insert(
+            profile_name.to_owned(),
+            ProfileWinEntry {
+                wins,
+                probes,
+                last_run: now_secs(),
+            },
+        );
+    }
+
     /// Record `wins` wins and `probes` total probes for `profile_name`.
     pub fn record(&mut self, profile_name: &str, wins: u32, probes: u32) {
         let now = now_secs();
@@ -137,33 +155,62 @@ impl ProfileDiscoveryCache {
 /// Probe all profiles in `engine` against the test endpoints, update `cache`,
 /// and return a new profile list sorted by win count (highest first).
 ///
-/// This function is async but CPU-light — most time is spent awaiting network I/O.
-/// Spawn it as a background task so it does not block proxy startup.
+/// Profiles are probed **in parallel** (one task per profile) so discovery
+/// completes in `O(1 round)` rather than `O(profiles)` rounds.  Spawn this as
+/// a background task so it does not block proxy startup.
 pub async fn run_profile_discovery(
     engine: &TcpDesyncEngine,
     cache: &mut ProfileDiscoveryCache,
 ) -> Vec<NativeDesyncProfile> {
     let count = engine.profile_count();
     info!(
-        "profile discovery: probing {} profiles against {} endpoints",
+        "profile discovery: probing {} profiles against {} endpoints (parallel)",
         count,
         TEST_ENDPOINTS.len()
     );
 
-    for idx in 0..count {
-        let name = engine.profile_name(idx).to_owned();
+    // Collect per-profile data upfront so we can move it into spawned tasks.
+    let profiles_to_probe: Vec<(usize, String)> = (0..count)
+        .filter(|&idx| {
+            let name = engine.profile_name(idx);
+            if cache.is_fresh(name) {
+                debug!("profile discovery: '{}' cache is fresh, skipping", name);
+                false
+            } else {
+                true
+            }
+        })
+        .map(|idx| (idx, engine.profile_name(idx).to_owned()))
+        .collect();
 
-        if cache.is_fresh(&name) {
-            debug!("profile discovery: '{}' cache is fresh, skipping", name);
-            continue;
+    if profiles_to_probe.is_empty() {
+        return sort_profiles_by_cache(engine, cache);
+    }
+
+    // Clone the engine so each task can probe independently.
+    let engine_arc = std::sync::Arc::new(engine.clone());
+    let mut tasks = tokio::task::JoinSet::new();
+
+    for (idx, name) in profiles_to_probe {
+        let eng = engine_arc.clone();
+        tasks.spawn(async move {
+            let (wins, probes) = probe_profile(&eng, idx).await;
+            (name, wins, probes)
+        });
+    }
+
+    while let Some(res) = tasks.join_next().await {
+        match res {
+            Ok((name, wins, probes)) => {
+                // Overwrite (not accumulate) so stale wins from prior runs are discarded.
+                cache.record_overwrite(&name, wins, probes);
+                debug!(
+                    "profile discovery: '{}' — {}/{} probes succeeded",
+                    name, wins, probes
+                );
+            }
+            Err(e) => warn!("profile discovery: task panicked: {e}"),
         }
-
-        let (wins, probes) = probe_profile(engine, idx).await;
-        cache.record(&name, wins, probes);
-        debug!(
-            "profile discovery: '{}' — {}/{} probes succeeded",
-            name, wins, probes
-        );
     }
 
     sort_profiles_by_cache(engine, cache)
@@ -176,9 +223,9 @@ async fn probe_profile(engine: &TcpDesyncEngine, profile_idx: usize) -> (u32, u3
     let mut wins = 0u32;
     let mut total = 0u32;
 
-    for (endpoint, _domain) in TEST_ENDPOINTS {
+    for (endpoint, sni) in TEST_ENDPOINTS {
         total += 1;
-        if probe_single(engine, profile_idx, endpoint).await {
+        if probe_single(engine, profile_idx, endpoint, sni).await {
             wins += 1;
         }
     }
@@ -186,24 +233,41 @@ async fn probe_profile(engine: &TcpDesyncEngine, profile_idx: usize) -> (u32, u3
     (wins, total)
 }
 
-/// Connect to `endpoint`, apply the profile's desync technique, and check
-/// whether the server responds with a TLS ServerHello.
+/// Connect to `endpoint`, apply the profile's desync technique (including its
+/// fake probe if configured), and check whether the server responds with a TLS
+/// ServerHello.
 ///
 /// Returns `true` on success.
-async fn probe_single(engine: &TcpDesyncEngine, profile_idx: usize, endpoint: &str) -> bool {
+async fn probe_single(
+    engine: &TcpDesyncEngine,
+    profile_idx: usize,
+    endpoint: &str,
+    sni: &str,
+) -> bool {
     let result = tokio::time::timeout(PROBE_TIMEOUT, async {
-        let mut stream = TcpStream::connect(endpoint).await?;
+        let addr: std::net::SocketAddr = endpoint
+            .parse()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
 
-        // Build a minimal TLS ClientHello for "discord.com".
-        let hello = build_probe_client_hello("discord.com");
+        // Send the profile's fake probe BEFORE the real connection — this is what
+        // actually desynchronises DPI state; without it, profiles with fake_probe
+        // would score identically to their simpler counterparts.
+        if let Some(fp) = engine.profile_fake_probe(profile_idx) {
+            if let Some(ref fake_sni) = fp.fake_sni {
+                let _ = send_fake_sni_probe(addr, fp.ttl, fake_sni).await;
+            } else {
+                let _ = send_tcb_desync_probe(addr, fp.ttl).await;
+            }
+        }
 
-        // Apply the desync technique.
+        let mut stream = TcpStream::connect(addr).await?;
+        let hello = build_probe_client_hello(sni);
+
         engine
             .apply_to_tcp_stream(profile_idx, &mut stream, &hello)
             .await?;
         stream.flush().await?;
 
-        // Wait for any server response.
         let mut resp = [0u8; 64];
         let n = stream.read(&mut resp).await?;
 
