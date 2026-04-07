@@ -527,6 +527,17 @@ pub async fn handle_socks5_request_with_target(
         }
         Err(e) => {
             routing_state().dest_route_winner.remove(route_key);
+            // All route candidates failed — record a blocking signal so the dynamic
+            // classifier learns this destination is blocked.  Without this call the
+            // classifier never sees the failure and keeps treating the destination as
+            // unblocked on every subsequent connection (e.g. Telegram IP addresses).
+            classifier_and_persistence::record_destination_failure(
+                route_key,
+                BlockingSignal::Timeout,
+                0,
+                tuned.stage,
+                &cfg,
+            );
             Err(e)
         }
     }

@@ -494,12 +494,17 @@ fn smoltcp_thread(
 //
 // wintun.dll is the WireGuard WinTUN driver interface.
 // It must reside next to the executable — no installation required.
-// We download it automatically on first use, similar to ciadpi bootstrap.
+//
+// The DLL is embedded in the binary at build time by build.rs (downloaded
+// once via PowerShell during `cargo build`).  At runtime we simply write it
+// next to the executable if it is not already present.
 
 #[cfg(target_os = "windows")]
-const WINTUN_ZIP_URL: &str = "https://www.wintun.net/builds/wintun-0.14.1.zip";
-#[cfg(target_os = "windows")]
 const WINTUN_DLL_NAME: &str = "wintun.dll";
+
+// Embedded at build time by build.rs → OUT_DIR/wintun.dll.
+#[cfg(target_os = "windows")]
+const WINTUN_DLL_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wintun.dll"));
 
 #[cfg(target_os = "windows")]
 async fn ensure_wintun() -> Result<()> {
@@ -514,61 +519,9 @@ async fn ensure_wintun() -> Result<()> {
         return Ok(());
     }
 
-    info!("wintun.dll not found — downloading from {WINTUN_ZIP_URL}");
+    info!("wintun.dll not found — extracting from embedded binary");
 
-    // Select DLL by current architecture
-    let arch = if cfg!(target_arch = "x86_64") {
-        "amd64"
-    } else if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else {
-        "x86"
-    };
-    let inner_path = format!("wintun/bin/{arch}/wintun.dll");
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .danger_accept_invalid_certs(false)
-        .no_proxy()
-        .build()
-        .map_err(|e| EngineError::Internal(format!("wintun: http client: {e}")))?;
-
-    let resp = client
-        .get(WINTUN_ZIP_URL)
-        .send()
-        .await
-        .map_err(|e| EngineError::Internal(format!("wintun: download failed: {e}")))?;
-
-    if !resp.status().is_success() {
-        return Err(EngineError::Internal(format!(
-            "wintun: server returned {}",
-            resp.status()
-        )));
-    }
-
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| EngineError::Internal(format!("wintun: read body: {e}")))?;
-
-    info!(
-        "wintun zip downloaded ({} KB), extracting {inner_path}",
-        bytes.len() / 1024
-    );
-
-    let cursor = std::io::Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(cursor)
-        .map_err(|e| EngineError::Internal(format!("wintun: zip parse: {e}")))?;
-
-    let mut entry = archive
-        .by_name(&inner_path)
-        .map_err(|_| EngineError::Internal(format!("wintun: {inner_path} not found in zip")))?;
-
-    let mut dll_bytes = Vec::new();
-    std::io::Read::read_to_end(&mut entry, &mut dll_bytes)
-        .map_err(|e| EngineError::Internal(format!("wintun: read dll: {e}")))?;
-
-    std::fs::write(&dll_path, &dll_bytes)
+    std::fs::write(&dll_path, WINTUN_DLL_BYTES)
         .map_err(|e| EngineError::Internal(format!("wintun: write dll: {e}")))?;
 
     info!("wintun.dll installed → {}", dll_path.display());
@@ -577,10 +530,32 @@ async fn ensure_wintun() -> Result<()> {
 
 // ─── Public entry point ────────────────────────────────────────────────────
 
+/// Returns `true` when the calling process holds the Administrators token.
+///
+/// WinTUN requires administrator rights to create a kernel TUN adapter.
+/// Checking this upfront gives a clear error instead of the opaque
+/// `WintunCreateAdapter failed "No inner logs"` message from the driver.
+#[cfg(target_os = "windows")]
+fn is_running_as_admin() -> bool {
+    use windows_sys::Win32::UI::Shell::IsUserAnAdmin;
+    // SAFETY: IsUserAnAdmin() is a read-only, thread-safe Windows API call.
+    unsafe { IsUserAnAdmin() != 0 }
+}
+
 pub async fn run_tun(cfg: EngineConfig, opts: &TunOpts) -> Result<()> {
     if opts.print_routes_only {
         print_routing_instructions(opts);
         return Ok(());
+    }
+
+    // On Windows, TUN/WinTUN requires administrator privileges to create a kernel adapter.
+    #[cfg(target_os = "windows")]
+    if !is_running_as_admin() {
+        return Err(EngineError::Internal(
+            "TUN mode requires Administrator privileges — \
+             re-launch the application as Administrator and try again"
+                .to_owned(),
+        ));
     }
 
     // On Windows, ensure wintun.dll is present before creating the TUN device

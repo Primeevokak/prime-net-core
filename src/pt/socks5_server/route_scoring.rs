@@ -584,7 +584,15 @@ pub fn route_destination_key(rk: &str) -> &str {
         return "soundcloud.com";
     }
 
-    // 2. Generic SLD-based grouping (e.g., sub.example.com -> example.com)
+    // 2. IP addresses: use the full address as the key.
+    // Grouping by "last two octets" (e.g., "167.51") produces meaningless buckets
+    // that conflate unrelated IPs and prevent the dynamic classifier from learning
+    // per-IP blocking signals (e.g., all Telegram IPs are individually IP-blocked).
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return host;
+    }
+
+    // 3. Generic SLD-based grouping (e.g., sub.example.com -> example.com)
     let parts: Vec<&str> = host.split('.').collect();
     if parts.len() >= 2 {
         let len = parts.len();
