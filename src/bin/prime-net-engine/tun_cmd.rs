@@ -50,6 +50,13 @@ pub struct TunOpts {
     pub mtu: u16,
     /// Print routing setup commands and exit without starting
     pub print_routes_only: bool,
+    /// Automatically configure system routes so all traffic goes through TUN.
+    pub auto_route: bool,
+    /// CIDRs that must bypass the TUN and go through the original gateway
+    /// (split tunneling — e.g. your bypass proxy server IP).
+    pub exclude: Vec<crate::auto_route::Cidr>,
+    /// If set, engine stats are written to this path every 5 s.
+    pub stats_file: Option<std::path::PathBuf>,
 }
 
 impl Default for TunOpts {
@@ -61,6 +68,9 @@ impl Default for TunOpts {
             socks_addr: SocketAddr::from(([127, 0, 0, 1], 1080)),
             mtu: 1500,
             print_routes_only: false,
+            auto_route: false,
+            exclude: Vec::new(),
+            stats_file: None,
         }
     }
 }
@@ -580,10 +590,13 @@ pub async fn run_tun(cfg: EngineConfig, opts: &TunOpts) -> Result<()> {
     // 1. Start SOCKS5 in background
     let socks_cfg = cfg.clone();
     let socks_bind = opts.socks_addr.to_string();
+    let stats_file = opts.stats_file.clone();
     tokio::spawn(async move {
         let socks_opts = crate::socks_cmd::SocksOpts {
             bind: socks_bind,
             silent_drop: true,
+            config_path: None,
+            stats_file,
         };
         if let Err(e) = crate::socks_cmd::run_socks(socks_cfg, &socks_opts).await {
             error!("TUN background SOCKS5 error: {e}");
@@ -609,9 +622,34 @@ pub async fn run_tun(cfg: EngineConfig, opts: &TunOpts) -> Result<()> {
         addr = %opts.tun_addr,
         prefix = opts.tun_prefix,
         socks = %opts.socks_addr,
+        auto_route = opts.auto_route,
         "TUN/VPN mode started"
     );
-    print_routing_instructions(opts);
+
+    // 2b. Auto-route: add 0/1 and 128/1 routes through TUN.
+    let _route_guard = if opts.auto_route {
+        match crate::auto_route::AutoRouteGuard::setup(
+            &opts.tun_name,
+            opts.tun_addr,
+            opts.exclude.clone(),
+        ) {
+            Ok(guard) => {
+                info!("auto-route: routing configured — all traffic now goes through TUN");
+                Some(guard)
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "auto-route setup failed — continuing without automatic routing; \
+                     configure routes manually"
+                );
+                None
+            }
+        }
+    } else {
+        print_routing_instructions(opts);
+        None
+    };
 
     let (mut tun_reader, mut tun_writer) = tokio::io::split(tun_dev);
 

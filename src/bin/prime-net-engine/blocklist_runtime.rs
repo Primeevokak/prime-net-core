@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use crate::blocklist_builtin;
 
 const PT_TOOLS_DOMAIN_FILE: &str = "blocked-domains.txt";
-static RUNTIME_MATCHER: OnceLock<DomainMatcher> = OnceLock::new();
+static RUNTIME_MATCHER: OnceLock<std::sync::RwLock<DomainMatcher>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct RuntimeBlocklistStats {
@@ -70,9 +70,18 @@ impl DomainMatcher {
     }
 }
 
+/// Set `RUNTIME_MATCHER` on first call; update its contents on subsequent calls.
+fn set_or_update_matcher(matcher: DomainMatcher) {
+    if let Some(rw) = RUNTIME_MATCHER.get() {
+        *rw.write().unwrap() = matcher;
+    } else {
+        let _ = RUNTIME_MATCHER.set(std::sync::RwLock::new(matcher));
+    }
+}
+
 pub async fn initialize_runtime_blocklist(cfg: &BlocklistConfig) -> Result<RuntimeBlocklistStats> {
     if !cfg.enabled {
-        let _ = RUNTIME_MATCHER.set(DomainMatcher::default());
+        set_or_update_matcher(DomainMatcher::default());
         return Ok(RuntimeBlocklistStats {
             enabled: false,
             source: cfg.source.clone(),
@@ -150,7 +159,7 @@ pub async fn initialize_runtime_blocklist(cfg: &BlocklistConfig) -> Result<Runti
     }
     let _ = prime_net_engine_core::pt::socks5_server::BLOCKLIST_DOMAINS.set(global_bloom);
 
-    let _ = RUNTIME_MATCHER.set(matcher);
+    set_or_update_matcher(matcher);
 
     let pt_tools_path = if domains.is_empty() {
         None
@@ -184,7 +193,7 @@ pub fn is_bypass_domain_runtime(host: &str) -> bool {
     }
     RUNTIME_MATCHER
         .get()
-        .is_some_and(|matcher| matcher.contains_host_or_suffix(host))
+        .is_some_and(|rw| rw.read().unwrap().contains_host_or_suffix(host))
 }
 
 pub fn sync_domains_to_pt_tools(domains: &[String]) -> Result<Option<PathBuf>> {
@@ -269,6 +278,13 @@ pub fn log_runtime_blocklist_stats(stats: &RuntimeBlocklistStats) {
         pt_tools = stats.pt_tools_path.as_ref().map(|p| p.display().to_string()),
         "runtime blocklist feed loaded"
     );
+}
+
+/// Hot-reload the runtime blocklist from config without restarting the engine.
+///
+/// Called by the config watcher when the config file changes on disk.
+pub async fn reload_blocklist(cfg: &BlocklistConfig) -> Result<RuntimeBlocklistStats> {
+    initialize_runtime_blocklist(cfg).await
 }
 
 #[cfg(test)]

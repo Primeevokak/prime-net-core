@@ -737,3 +737,76 @@ mod shadow_bandit_tests {
         }
     }
 }
+
+// ── Stats snapshot ────────────────────────────────────────────────────────────
+
+/// Point-in-time snapshot of a single ML bandit arm for the stats file.
+#[derive(Debug, Clone, Serialize)]
+pub struct BucketArmSnapshot {
+    /// Composite key: `"<bucket>|<route_arm>"`.
+    pub key: String,
+    /// Total number of times this arm was selected.
+    pub pulls: u64,
+    /// Sum of all rewards received (range: pulls × [−100, +70]).
+    pub reward_sum: i64,
+    /// Mean reward per pull; 0.0 when pulls == 0.
+    pub mean_reward: f64,
+}
+
+/// Point-in-time snapshot of ML state for the stats writer.
+#[derive(Debug, Clone, Serialize)]
+pub struct MlStateSnapshot {
+    /// Number of pending (unresolved) route decisions.
+    pub pending_decisions: usize,
+    /// Number of completed outcome events kept in memory.
+    pub outcome_events: usize,
+    /// Total number of active bandit arms across all buckets.
+    pub bandit_arms: usize,
+    /// Top-10 arms by pull count (most-used routes first).
+    pub top_arms: Vec<BucketArmSnapshot>,
+}
+
+/// Collect a point-in-time snapshot of ML state.
+///
+/// Reads the three process-global DashMaps under shared locks; does not block
+/// the writer.
+pub fn ml_state_snapshot() -> MlStateSnapshot {
+    let pending_decisions = ROUTE_DECISION_EVENTS_PENDING
+        .get()
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let outcome_events = ROUTE_OUTCOME_EVENTS.get().map(|m| m.len()).unwrap_or(0);
+
+    let (bandit_arms, top_arms) = if let Some(arms) = SHADOW_BANDIT_ARMS.get() {
+        let count = arms.len();
+        let mut entries: Vec<BucketArmSnapshot> = arms
+            .iter()
+            .map(|e| {
+                let s = e.value();
+                let mean = if s.pulls > 0 {
+                    s.reward_sum as f64 / s.pulls as f64
+                } else {
+                    0.0
+                };
+                BucketArmSnapshot {
+                    key: e.key().clone(),
+                    pulls: s.pulls,
+                    reward_sum: s.reward_sum,
+                    mean_reward: mean,
+                }
+            })
+            .collect();
+        entries.sort_unstable_by(|a, b| b.pulls.cmp(&a.pulls));
+        entries.truncate(10);
+        (count, entries)
+    } else {
+        (0, Vec::new())
+    };
+
+    MlStateSnapshot {
+        pending_decisions,
+        outcome_events,
+        bandit_arms,
+        top_arms,
+    }
+}

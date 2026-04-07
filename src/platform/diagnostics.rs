@@ -8,14 +8,14 @@ use crate::error::{EngineError, Result};
 
 pub struct ProxyDiagnostics;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiagnosticResult {
     pub level: DiagnosticLevel,
     pub message: String,
     pub suggestion: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiagnosticLevel {
     Ok,
     Info,
@@ -176,6 +176,178 @@ impl ProxyDiagnostics {
             Self::check_socks5_listening(socks_endpoint),
             Self::check_system_proxy_config(),
         ])
+    }
+
+    /// Run ISP/ТСПУ analysis: detect censorship mechanism, test DNS ports, and
+    /// recommend the best evasion approach for the user's ISP.
+    ///
+    /// All probes use direct TCP/HTTP (no system proxy) to test from the
+    /// user's real network perspective.
+    pub async fn run_isp_analysis() -> IspAnalysisReport {
+        let mut findings = Vec::new();
+
+        // 1. Basic internet connectivity (sync, run on blocking thread)
+        let connectivity = tokio::task::spawn_blocking(Self::check_network_connectivity)
+            .await
+            .unwrap_or_else(|_| DiagnosticResult::error("Thread panic in connectivity check", ""));
+        let has_internet = connectivity.level == DiagnosticLevel::Ok;
+        findings.push(connectivity);
+
+        if !has_internet {
+            return IspAnalysisReport {
+                findings,
+                tspu_detected: None,
+                dot_port_blocked: true,
+                doh_reachable: false,
+                recommended_action: "No internet connection detected. Check your network."
+                    .to_owned(),
+            };
+        }
+
+        // 2. ТСПУ probe — try TCP to known censored IPs with short timeout
+        //    Quick RST/refused (<350 ms) → RST injection by ТСПУ
+        //    Timeout → IP/range blocking
+        //    Success → bypass active or IP not blocked for this user
+        let tspu_detected = tokio::task::spawn_blocking(|| {
+            // YouTube backend IPs commonly blocked by ТСПУ in Russia
+            let probe_targets: &[std::net::SocketAddr] = &[
+                std::net::SocketAddr::from(([142, 250, 185, 78], 443)),
+                std::net::SocketAddr::from(([142, 250, 74, 46], 443)),
+            ];
+            let timeout = Duration::from_millis(350);
+            for &addr in probe_targets {
+                match std::net::TcpStream::connect_timeout(&addr, timeout) {
+                    Ok(_) => return None, // Connected — not blocked (bypass may be active)
+                    Err(e) => {
+                        use std::io::ErrorKind;
+                        match e.kind() {
+                            // RST injection: connection actively refused — ТСПУ signature
+                            ErrorKind::ConnectionRefused => return Some(true),
+                            // Timeout: IP-range drop — also a censorship signal
+                            ErrorKind::TimedOut | ErrorKind::WouldBlock => return Some(true),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            None
+        })
+        .await
+        .unwrap_or(None);
+
+        match tspu_detected {
+            Some(true) => findings.push(DiagnosticResult::warn(
+                "ТСПУ censorship detected",
+                "Native desync bypass (prime-mode) is recommended. Enable it in Settings → DPI Evasion.",
+            )),
+            Some(false) => findings.push(DiagnosticResult::ok(
+                "No active ТСПУ censorship detected for tested IPs",
+            )),
+            None => findings.push(DiagnosticResult::info(
+                "ТСПУ probe inconclusive — bypass may already be active",
+                "If you see connection issues, enable prime-mode in Settings.",
+            )),
+        }
+
+        // 3. DNS over TLS port 853 check
+        let dot_port_blocked = tokio::task::spawn_blocking(|| {
+            let targets: &[std::net::SocketAddr] = &[
+                std::net::SocketAddr::from(([8, 8, 8, 8], 853)),
+                std::net::SocketAddr::from(([1, 1, 1, 1], 853)),
+            ];
+            let timeout = Duration::from_secs(2);
+            targets
+                .iter()
+                .all(|&addr| std::net::TcpStream::connect_timeout(&addr, timeout).is_err())
+        })
+        .await
+        .unwrap_or(true);
+
+        if dot_port_blocked {
+            findings.push(DiagnosticResult::warn(
+                "DNS over TLS (port 853) is blocked",
+                "Use DNS over HTTPS instead. Enable DoH in Settings → DNS.",
+            ));
+        } else {
+            findings.push(DiagnosticResult::ok("DNS over TLS (port 853) reachable"));
+        }
+
+        // 4. DNS over HTTPS reachability check
+        let doh_reachable = async {
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .ok()?;
+            let resp = client
+                .get("https://1.1.1.1/dns-query?name=example.com&type=A")
+                .header("accept", "application/dns-json")
+                .send()
+                .await
+                .ok()?;
+            Some(resp.status().is_success())
+        }
+        .await
+        .unwrap_or(false);
+
+        if doh_reachable {
+            findings.push(DiagnosticResult::ok(
+                "DNS over HTTPS reachable (Cloudflare 1.1.1.1)",
+            ));
+        } else {
+            findings.push(DiagnosticResult::warn(
+                "DNS over HTTPS not reachable",
+                "Your ISP may be blocking DoH. Try alternative providers in Settings → DNS.",
+            ));
+        }
+
+        // 5. Recommendation
+        let recommended_action =
+            build_recommendation(tspu_detected, dot_port_blocked, doh_reachable);
+
+        IspAnalysisReport {
+            findings,
+            tspu_detected,
+            dot_port_blocked,
+            doh_reachable,
+            recommended_action,
+        }
+    }
+}
+
+/// ISP analysis report with ТСПУ detection results and recommended action.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IspAnalysisReport {
+    /// Diagnostic findings, one per probe.
+    pub findings: Vec<DiagnosticResult>,
+    /// Whether ТСПУ censorship was detected. `None` means probe was inconclusive.
+    pub tspu_detected: Option<bool>,
+    /// Whether DNS port 853 (DoT) is blocked.
+    pub dot_port_blocked: bool,
+    /// Whether DNS over HTTPS is reachable.
+    pub doh_reachable: bool,
+    /// Human-readable recommended action for the user.
+    pub recommended_action: String,
+}
+
+fn build_recommendation(
+    tspu_detected: Option<bool>,
+    dot_blocked: bool,
+    doh_reachable: bool,
+) -> String {
+    let mut parts = Vec::new();
+    if tspu_detected == Some(true) {
+        parts.push("Enable prime-mode (DPI evasion) in Settings → DPI Evasion.");
+    }
+    if dot_blocked && doh_reachable {
+        parts.push("Switch from DoT to DoH in Settings → DNS.");
+    } else if dot_blocked && !doh_reachable {
+        parts.push("Both DoT and DoH are blocked — use system DNS or try alternative providers.");
+    }
+    if parts.is_empty() {
+        "No action required — your connection looks healthy.".to_owned()
+    } else {
+        parts.join(" ")
     }
 }
 

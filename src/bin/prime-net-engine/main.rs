@@ -1,13 +1,17 @@
+#[cfg(feature = "tun")]
+mod auto_route;
 mod blocklist_builtin;
 mod blocklist_cmd;
 mod blocklist_runtime;
 mod config_check;
+mod config_watcher;
 mod http_cmd;
 mod logging;
 mod packet_bypass;
 mod preset;
 mod proxy_cmd;
 mod socks_cmd;
+mod stats_writer;
 mod test_cmd;
 mod tui_cmd;
 #[cfg(feature = "tun")]
@@ -152,7 +156,10 @@ async fn real_main() -> Result<()> {
     match parsed.cmd {
         Some(Cmd::Fetch(opts)) => run_fetch(cfg, &opts).await?,
         Some(Cmd::Download(opts)) => run_download(cfg, &opts).await?,
-        Some(Cmd::Socks(opts)) => run_socks(cfg, &opts).await?,
+        Some(Cmd::Socks(mut opts)) => {
+            opts.config_path = parsed.config_path.clone();
+            run_socks(cfg, &opts).await?
+        }
         Some(Cmd::Wizard(opts)) => run_wizard(&opts).await?,
         Some(Cmd::Tui(mut opts)) => {
             if opts.config.is_none() {
@@ -407,6 +414,7 @@ fn parse_wizard(args: &[String]) -> Result<WizardOpts> {
 fn parse_socks(args: &[String]) -> Result<SocksOpts> {
     let mut bind = "127.0.0.1:1080".to_owned();
     let mut silent_drop = false;
+    let mut stats_file: Option<PathBuf> = None;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -416,6 +424,10 @@ fn parse_socks(args: &[String]) -> Result<SocksOpts> {
                 bind = arg_value(args, i, "--bind")?.to_owned();
             }
             "--silent-drop" => silent_drop = true,
+            "--stats-file" => {
+                i += 1;
+                stats_file = Some(PathBuf::from(arg_value(args, i, "--stats-file")?));
+            }
             v => {
                 return Err(EngineError::InvalidInput(format!(
                     "socks: unknown arg: {v}"
@@ -425,7 +437,12 @@ fn parse_socks(args: &[String]) -> Result<SocksOpts> {
         i += 1;
     }
 
-    Ok(SocksOpts { bind, silent_drop })
+    Ok(SocksOpts {
+        bind,
+        silent_drop,
+        config_path: None,
+        stats_file,
+    })
 }
 
 fn parse_tui(args: &[String]) -> Result<TuiOpts> {
@@ -827,6 +844,23 @@ fn parse_tun(args: &[String]) -> Result<crate::tun_cmd::TunOpts> {
                     .map_err(|_| EngineError::InvalidInput("tun: invalid --mtu".to_owned()))?;
             }
             "--print-routes" => opts.print_routes_only = true,
+            "--auto-route" => opts.auto_route = true,
+            "--exclude" => {
+                i += 1;
+                let s = arg_value(args, i, "--exclude")?;
+                match crate::auto_route::parse_cidr(s) {
+                    Some(cidr) => opts.exclude.push(cidr),
+                    None => {
+                        return Err(EngineError::InvalidInput(format!(
+                            "tun: invalid CIDR for --exclude: {s}"
+                        )))
+                    }
+                }
+            }
+            "--stats-file" => {
+                i += 1;
+                opts.stats_file = Some(PathBuf::from(arg_value(args, i, "--stats-file")?));
+            }
             v => {
                 return Err(EngineError::InvalidInput(format!("tun: unknown arg: {v}")));
             }

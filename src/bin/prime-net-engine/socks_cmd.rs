@@ -14,11 +14,16 @@ use tracing::{info, warn};
 use crate::blocklist_runtime::{
     initialize_runtime_blocklist, is_bypass_domain_runtime, log_runtime_blocklist_stats,
 };
+use crate::config_watcher::spawn_config_watcher;
+use crate::stats_writer::spawn_stats_writer;
 
 #[derive(Debug, Clone)]
 pub struct SocksOpts {
     pub bind: String,
     pub silent_drop: bool,
+    pub config_path: Option<std::path::PathBuf>,
+    /// If set, a JSON stats snapshot is written to this path every 5 seconds.
+    pub stats_file: Option<std::path::PathBuf>,
 }
 
 struct SystemProxyCleanupGuard {
@@ -100,6 +105,9 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
         );
     }
 
+    let mut native_profiles_count: usize = 0;
+    let engine_start = std::time::Instant::now();
+
     // Initialize in-process TcpDesyncEngine (native bypass) — no binary required.
     // Enabled alongside packet bypass or whenever evasion is active.
     if cfg.evasion.packet_bypass_enabled || relay_opts.fragment_client_hello {
@@ -137,11 +145,11 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
             }
         }
 
-        let profiles = engine.profile_count();
+        native_profiles_count = engine.profile_count();
         relay_opts.native_bypass = Some(Arc::new(engine));
         info!(
             target: "socks_cmd",
-            profiles,
+            profiles = native_profiles_count,
             "native TLS/TCP desync engine active"
         );
     }
@@ -174,6 +182,19 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
         listen_addr,
         cfg.evasion.kill_switch_enabled,
     );
+
+    // Spawn config file watcher for hot reload.
+    let _config_watcher = opts.config_path.clone().map(spawn_config_watcher);
+
+    // Spawn stats file writer so the GUI can poll real-time engine metrics.
+    let _stats_writer = opts.stats_file.clone().map(|path| {
+        spawn_stats_writer(
+            path,
+            listen_addr.to_string(),
+            native_profiles_count,
+            engine_start,
+        )
+    });
 
     let _keep = guard;
     wait_for_shutdown().await;
