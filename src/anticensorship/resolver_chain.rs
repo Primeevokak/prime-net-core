@@ -469,9 +469,7 @@ impl ResolverChain {
         for server in &self.cfg.dot_servers {
             let sa = parse_socket_addr(server, 853)?;
             let mut ns = NameServerConfig::new(sa, Protocol::Tls);
-            ns.tls_dns_name = sni_override
-                .clone()
-                .or_else(|| dot_sni_for_ip(sa.ip()));
+            ns.tls_dns_name = sni_override.clone().or_else(|| dot_sni_for_ip(sa.ip()));
             group.push(ns);
         }
         if group.is_empty() {
@@ -722,7 +720,9 @@ fn dot_sni_for_ip(ip: std::net::IpAddr) -> Option<String> {
             [1, 1, 1, 1] | [1, 0, 0, 1] => Some("cloudflare-dns.com".to_owned()),
             [9, 9, 9, 9] | [149, 112, 112, 112] => Some("dns.quad9.net".to_owned()),
             [94, 140, 14, 14] | [94, 140, 15, 15] => Some("dns.adguard-dns.com".to_owned()),
-            [185, 228, 168, 9] | [185, 228, 169, 9] => Some("security-filter-dns.cleanbrowsing.org".to_owned()),
+            [185, 228, 168, 9] | [185, 228, 169, 9] => {
+                Some("security-filter-dns.cleanbrowsing.org".to_owned())
+            }
             _ => None,
         },
         _ => None,

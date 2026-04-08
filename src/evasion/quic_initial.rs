@@ -36,7 +36,29 @@ use cipher::{generic_array::GenericArray, BlockEncrypt};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use tokio::net::UdpSocket;
+use rand::seq::SliceRandom;
+use rand::{thread_rng, Rng};
 use tracing::debug;
+
+/// Whitelisted SNIs used in fake QUIC Initials.
+///
+/// DPI sees one of these popular domains and passes the connection through.
+const WHITELISTED_SNIS: &[&str] = &[
+    "www.google.com",
+    "cloudflare.com",
+    "facebook.com",
+    "microsoft.com",
+    "apple.com",
+    "amazon.com",
+];
+
+/// Pick a random whitelisted SNI for fake QUIC Initial packets.
+pub fn random_whitelisted_sni() -> &'static str {
+    WHITELISTED_SNIS
+        .choose(&mut thread_rng())
+        .copied()
+        .unwrap_or("www.google.com")
+}
 
 // ── QUIC v1 constants ─────────────────────────────────────────────────────────
 
@@ -353,7 +375,9 @@ fn build_fake_client_hello(sni: &str) -> Vec<u8> {
     ]);
 
     buf.extend_from_slice(&[0x03, 0x03]); // legacy_version TLS 1.2
-    buf.extend_from_slice(&[0u8; 32]); // random (zeroed for probe)
+    let mut random = [0u8; 32];
+    thread_rng().fill(&mut random);
+    buf.extend_from_slice(&random); // random (randomized per fake)
     buf.push(0x00); // session_id_len
     buf.extend_from_slice(&[0x00, 0x04, 0x13, 0x01, 0x13, 0x02]); // cipher_suites
     buf.extend_from_slice(&[0x01, 0x00]); // compression_methods
@@ -398,7 +422,8 @@ fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
 }
 
 /// Bind a UDP socket appropriate for sending to `target` (IPv4 or IPv6).
-async fn bind_udp_for_target(target: SocketAddr) -> std::io::Result<UdpSocket> {
+/// Bind a UDP socket suitable for sending to `target` (IPv4 or IPv6).
+pub(crate) async fn bind_udp_for_target(target: SocketAddr) -> std::io::Result<UdpSocket> {
     let bind_addr = if target.is_ipv6() {
         "[::]:0"
     } else {

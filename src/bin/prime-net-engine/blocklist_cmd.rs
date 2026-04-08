@@ -25,7 +25,10 @@ pub async fn run_blocklist(opts: &BlocklistOpts, cfg: &BlocklistConfig) -> Resul
             let source = opts.source_override.as_deref().unwrap_or(&cfg.source);
             let path = cache_path(&cfg.cache_path);
             let cache = update_blocklist(source, &path).await?;
-            let pt_sync = sync_domains_to_pt_tools(&cache.domains).ok().flatten();
+            let pt_sync = sync_domains_to_pt_tools(&cache.domains)
+                .await
+                .ok()
+                .flatten();
             println!(
                 "blocklist updated: {} domains cached at {}",
                 cache.domains.len(),

@@ -339,9 +339,22 @@ pub struct EvasionConfig {
     /// Таймаут ожидания первого UDP-ответа при QUIC-соединении на порт 443 (мс).
     /// При истечении домен помечается как "QUIC silent drop" на 1800 секунд.
     /// При следующем подключении UDP блокируется → приложение переходит на TCP.
-    /// 0 = отключено (текущее поведение, обратная совместимость).
+    /// 0 = отключено. Default: 3000 (3 секунды).
     #[serde(default = "default_quic_probe_timeout_ms")]
     pub quic_probe_timeout_ms: u64,
+    /// Number of fake QUIC Initial packets to inject before the real one.
+    ///
+    /// Higher values improve bypass reliability against stateful DPI.
+    /// Inspired by zapret's `--dpi-desync-repeats` (6-11).
+    /// Default: 8.
+    #[serde(default = "default_quic_fake_repeat_count")]
+    pub quic_fake_repeat_count: u8,
+    /// Trailing zero-byte padding added to outgoing QUIC (UDP port 443) packets.
+    ///
+    /// Defeats DPI that fingerprints by packet size.  QUIC ignores trailing
+    /// bytes after the protected payload.  0 = disabled (default).
+    #[serde(default)]
+    pub quic_udp_padding_bytes: u16,
     /// Additional native desync profiles defined in user config.
     ///
     /// These are appended to the built-in profile list. Set
@@ -390,6 +403,8 @@ impl Default for EvasionConfig {
             stage_cache_ttl_secs: default_stage_cache_ttl_secs(),
             winner_cache_ttl_secs: default_winner_cache_ttl_secs(),
             quic_probe_timeout_ms: default_quic_probe_timeout_ms(),
+            quic_fake_repeat_count: default_quic_fake_repeat_count(),
+            quic_udp_padding_bytes: 0,
             native_profiles: Vec::new(),
             disable_default_native_profiles: false,
             kill_switch_enabled: false,
@@ -814,4 +829,5 @@ fn default_aggressive_fragment_domains() -> Vec<String> {
 }
 fn default_stage_cache_ttl_secs() -> u64 { 172800 }
 fn default_winner_cache_ttl_secs() -> u64 { 86400 }
-fn default_quic_probe_timeout_ms() -> u64 { 0 }
+fn default_quic_probe_timeout_ms() -> u64 { 3000 }
+fn default_quic_fake_repeat_count() -> u8 { 8 }

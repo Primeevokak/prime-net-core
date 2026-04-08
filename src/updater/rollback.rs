@@ -98,13 +98,16 @@ impl RollbackManager {
             // Remove any stale .old left by a previous failed update before we move the
             // current binary there. Without this, fs::rename would fail on Windows if the
             // file already exists.
-            if dest_backup.exists() {
-                fs::remove_file(&dest_backup).map_err(|e| {
-                    EngineError::Internal(format!(
-                        "failed to remove stale binary backup ({}): {e}",
+            // Avoid TOCTOU: attempt remove directly, ignore NotFound.
+            match fs::remove_file(&dest_backup) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(EngineError::Internal(format!(
+                        "cannot remove stale backup {}: {e}",
                         dest_backup.display()
-                    ))
-                })?;
+                    )));
+                }
             }
 
             fs::rename(dest, &dest_backup).map_err(|e| {

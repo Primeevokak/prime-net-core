@@ -267,9 +267,7 @@ pub async fn handle_socks5_connection(
 
         let target = read_socks5_target_endpoint_with_atyp(&mut tcp, req[3]).await?;
         if req[1] == 0x03 {
-            let resolver = outbound.resolver().ok_or_else(|| {
-                EngineError::Internal("resolver missing for UDP associate".to_owned())
-            })?;
+            let resolver = outbound.resolver().ok_or(EngineError::ResolverMissing)?;
             return handle_udp_associate(conn_id, tcp, peer, resolver, cfg, relay_opts).await;
         }
 

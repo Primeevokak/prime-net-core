@@ -43,9 +43,9 @@ impl TrojanOutbound {
         } else {
             let ips = self.resolver.resolve(&server_host).await?;
             if ips.is_empty() {
-                return Err(EngineError::Internal(format!(
-                    "dns resolver returned no IPs for '{}'",
-                    server_host
+                return Err(EngineError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    format!("dns resolver returned no IPs for '{server_host}'"),
                 )));
             }
             let out: Vec<std::net::SocketAddr> = ips
@@ -71,13 +71,19 @@ impl TrojanOutbound {
                 }
                 Err(_) => {
                     warn!(target: "outbound.trojan", server = %server_addr, destination = %target_label, timeout_ms = Self::CONNECT_TIMEOUT.as_millis(), "Trojan outbound TCP connect timeout");
-                    last_err = Some(EngineError::Internal("trojan connect timeout".to_owned()));
+                    last_err = Some(EngineError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("trojan connect timeout to {server_addr}"),
+                    )));
                 }
             }
         }
         let (server_addr, tcp) = tcp_opt.ok_or_else(|| {
             last_err.unwrap_or_else(|| {
-                EngineError::Internal("trojan connect failed for all resolved IPs".to_owned())
+                EngineError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "trojan connect failed for all resolved IPs",
+                ))
             })
         })?;
         let _ = tcp.set_nodelay(true);
@@ -96,11 +102,16 @@ impl TrojanOutbound {
 
         let mut tls = timeout(Self::HANDSHAKE_TIMEOUT, connector.connect(server_name, tcp))
             .await
-            .map_err(|_| EngineError::Internal("trojan TLS handshake timeout".to_owned()))?
+            .map_err(|_| {
+                EngineError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("trojan TLS handshake timeout to {server_addr}"),
+                ))
+            })?
             .map_err(|e| {
-            warn!(target: "outbound.trojan", server = %server_addr, destination = %target_label, error = %e, "Trojan TLS handshake failed");
-            e
-        })?;
+                warn!(target: "outbound.trojan", server = %server_addr, destination = %target_label, error = %e, "Trojan TLS handshake failed");
+                e
+            })?;
         info!(target: "outbound.trojan", server = %server_addr, destination = %target_label, "Trojan TLS connected");
 
         // Trojan header: SHA224(password) hex + CRLF + SOCKS5 request + CRLF
@@ -108,12 +119,19 @@ impl TrojanOutbound {
         // Standard Trojan doesn't, but enhanced versions do. We'll include it as an optional suffix.
         let pass = sha224_hex(self.cfg.password.as_bytes());
 
+        let io_timeout_err = || {
+            EngineError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("trojan I/O timeout to {server_addr}"),
+            ))
+        };
+
         timeout(Self::IO_TIMEOUT, tls.write_all(pass.as_bytes()))
             .await
-            .map_err(|_| EngineError::Internal("trojan write timeout".to_owned()))??;
+            .map_err(|_| io_timeout_err())??;
         timeout(Self::IO_TIMEOUT, tls.write_all(b"\r\n"))
             .await
-            .map_err(|_| EngineError::Internal("trojan write timeout".to_owned()))??;
+            .map_err(|_| io_timeout_err())??;
 
         let req = build_trojan_connect_request(target)?;
         // NOTE: Appending custom metadata here (like a timestamp for replay protection)
@@ -122,13 +140,13 @@ impl TrojanOutbound {
 
         timeout(Self::IO_TIMEOUT, tls.write_all(&req))
             .await
-            .map_err(|_| EngineError::Internal("trojan write timeout".to_owned()))??;
+            .map_err(|_| io_timeout_err())??;
         timeout(Self::IO_TIMEOUT, tls.write_all(b"\r\n"))
             .await
-            .map_err(|_| EngineError::Internal("trojan write timeout".to_owned()))??;
+            .map_err(|_| io_timeout_err())??;
         timeout(Self::IO_TIMEOUT, tls.flush())
             .await
-            .map_err(|_| EngineError::Internal("trojan flush timeout".to_owned()))??;
+            .map_err(|_| io_timeout_err())??;
 
         info!(target: "outbound.trojan", server = %server_addr, destination = %target_label, "Trojan CONNECT request sent");
         Ok(Box::new(tls))

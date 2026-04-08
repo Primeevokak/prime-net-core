@@ -32,7 +32,9 @@ pub async fn handle_http_proxy(
             break;
         }
         if buf.len() >= MAX_HTTP_HEADER_BYTES {
-            return Err(EngineError::Internal("HTTP header too large".to_owned()));
+            return Err(EngineError::InvalidInput(
+                "HTTP header too large".to_owned(),
+            ));
         }
         let n = tcp.read(&mut tmp).await?;
         if n == 0 {
@@ -42,24 +44,24 @@ pub async fn handle_http_proxy(
     }
 
     let header_end = find_http_header_end(&buf)
-        .ok_or_else(|| EngineError::Internal("malformed http header".to_owned()))?;
+        .ok_or_else(|| EngineError::InvalidInput("malformed HTTP header".to_owned()))?;
     let header_bytes = &buf[..header_end];
     let request = String::from_utf8_lossy(header_bytes);
     let first_line = request
         .lines()
         .next()
-        .ok_or_else(|| EngineError::Internal("empty http request".to_owned()))?;
+        .ok_or_else(|| EngineError::InvalidInput("empty HTTP request".to_owned()))?;
     let mut parts = first_line.split_whitespace();
     let method = parts
         .next()
-        .ok_or_else(|| EngineError::Internal("invalid http method".to_owned()))?;
+        .ok_or_else(|| EngineError::InvalidInput("invalid HTTP method".to_owned()))?;
     let target = parts
         .next()
-        .ok_or_else(|| EngineError::Internal("invalid http target".to_owned()))?;
+        .ok_or_else(|| EngineError::InvalidInput("invalid HTTP target".to_owned()))?;
 
     if method == "CONNECT" {
         let (host, port) = split_host_port_for_connect(target)
-            .ok_or_else(|| EngineError::Internal("invalid http connect target".to_owned()))?;
+            .ok_or_else(|| EngineError::InvalidInput("invalid HTTP CONNECT target".to_owned()))?;
         let target_addr = if let Some(ip) = parse_ip_literal(&host) {
             TargetAddr::Ip(ip)
         } else {

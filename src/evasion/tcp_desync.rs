@@ -495,6 +495,15 @@ async fn tls_record_split<W: AsyncWriteExt + Unpin>(
         return Ok(());
     }
 
+    // TLS record lengths are u16; if either fragment exceeds u16::MAX the cast
+    // would silently wrap, producing a malformed record.  In practice TLS caps
+    // records at 16 384 bytes, but coalesced buffers can be larger.
+    let rem = payload.len() - payload_split;
+    if payload_split > u16::MAX as usize || rem > u16::MAX as usize {
+        writer.write_all(record).await?;
+        return Ok(());
+    }
+
     // Fragment 1: TLS record header + first part of payload.
     let len1 = (payload_split as u16).to_be_bytes();
     writer
@@ -508,7 +517,6 @@ async fn tls_record_split<W: AsyncWriteExt + Unpin>(
     }
 
     // Fragment 2: TLS record header + remainder of payload.
-    let rem = payload.len() - payload_split;
     let len2 = (rem as u16).to_be_bytes();
     writer
         .write_all(&[content_type, version[0], version[1], len2[0], len2[1]])

@@ -527,37 +527,50 @@ pub fn route_family_for_target(target: &crate::pt::TargetAddr) -> RouteIpFamily 
 }
 
 pub fn mark_route_capability_healthy(kind: RouteKind, family: RouteIpFamily) {
-    if family == RouteIpFamily::Any {
-        return;
-    }
     let map = &routing_state().route_capabilities;
     if let Ok(mut g) = map.write() {
         match (kind, family) {
             (RouteKind::Direct, RouteIpFamily::V4) => g.direct_v4_weak_until = 0,
             (RouteKind::Direct, RouteIpFamily::V6) => g.direct_v6_weak_until = 0,
+            (RouteKind::Direct, RouteIpFamily::Any) => {
+                g.direct_v4_weak_until = 0;
+                g.direct_v6_weak_until = 0;
+            }
             (RouteKind::Bypass, RouteIpFamily::V4) => g.bypass_v4_weak_until = 0,
             (RouteKind::Bypass, RouteIpFamily::V6) => g.bypass_v6_weak_until = 0,
+            (RouteKind::Bypass, RouteIpFamily::Any) => {
+                g.bypass_v4_weak_until = 0;
+                g.bypass_v6_weak_until = 0;
+            }
             (RouteKind::Native, RouteIpFamily::V4) => g.native_v4_weak_until = 0,
             (RouteKind::Native, RouteIpFamily::V6) => g.native_v6_weak_until = 0,
-            _ => {}
+            (RouteKind::Native, RouteIpFamily::Any) => {
+                g.native_v4_weak_until = 0;
+                g.native_v6_weak_until = 0;
+            }
         }
     }
 }
 
 pub fn route_capability_is_available(kind: RouteKind, family: RouteIpFamily, now: u64) -> bool {
-    if family == RouteIpFamily::Any {
-        return true;
-    }
     let map = &routing_state().route_capabilities;
     if let Ok(g) = map.read() {
         let until = match (kind, family) {
             (RouteKind::Direct, RouteIpFamily::V4) => g.direct_v4_weak_until,
             (RouteKind::Direct, RouteIpFamily::V6) => g.direct_v6_weak_until,
+            (RouteKind::Direct, RouteIpFamily::Any) => {
+                g.direct_v4_weak_until.max(g.direct_v6_weak_until)
+            }
             (RouteKind::Bypass, RouteIpFamily::V4) => g.bypass_v4_weak_until,
             (RouteKind::Bypass, RouteIpFamily::V6) => g.bypass_v6_weak_until,
+            (RouteKind::Bypass, RouteIpFamily::Any) => {
+                g.bypass_v4_weak_until.max(g.bypass_v6_weak_until)
+            }
             (RouteKind::Native, RouteIpFamily::V4) => g.native_v4_weak_until,
             (RouteKind::Native, RouteIpFamily::V6) => g.native_v6_weak_until,
-            _ => 0,
+            (RouteKind::Native, RouteIpFamily::Any) => {
+                g.native_v4_weak_until.max(g.native_v6_weak_until)
+            }
         };
         now >= until
     } else {

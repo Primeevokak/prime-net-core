@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -141,7 +140,7 @@ pub async fn initialize_runtime_blocklist(cfg: &BlocklistConfig) -> Result<Runti
         .unwrap_or_default();
 
     if domains.is_empty() && ips.is_empty() {
-        domains = load_domains_from_pt_tools().unwrap_or_default();
+        domains = load_domains_from_pt_tools().await.unwrap_or_default();
     }
     domains.sort();
     domains.dedup();
@@ -167,7 +166,7 @@ pub async fn initialize_runtime_blocklist(cfg: &BlocklistConfig) -> Result<Runti
     let pt_tools_path = if domains.is_empty() {
         None
     } else {
-        match sync_domains_to_pt_tools(&domains) {
+        match sync_domains_to_pt_tools(&domains).await {
             Ok(path) => path,
             Err(e) => {
                 warn!(
@@ -201,12 +200,12 @@ pub fn is_bypass_domain_runtime(host: &str) -> bool {
     })
 }
 
-pub fn sync_domains_to_pt_tools(domains: &[String]) -> Result<Option<PathBuf>> {
+pub async fn sync_domains_to_pt_tools(domains: &[String]) -> Result<Option<PathBuf>> {
     let Some(path) = pt_tools_blocked_domains_path() else {
         return Ok(None);
     };
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        tokio::fs::create_dir_all(parent).await?;
     }
     let mut out = String::new();
     for domain in domains {
@@ -216,13 +215,13 @@ pub fn sync_domains_to_pt_tools(domains: &[String]) -> Result<Option<PathBuf>> {
             out.push('\n');
         }
     }
-    fs::write(&path, out)?;
+    tokio::fs::write(&path, out).await?;
     Ok(Some(path))
 }
 
-fn load_domains_from_pt_tools() -> Option<Vec<String>> {
+async fn load_domains_from_pt_tools() -> Option<Vec<String>> {
     let path = pt_tools_blocked_domains_path()?;
-    let body = fs::read_to_string(path).ok()?;
+    let body = tokio::fs::read_to_string(path).await.ok()?;
     let mut out = Vec::new();
     for line in body.lines() {
         let domain = normalize_domain(line);

@@ -8,7 +8,9 @@ use tracing::debug;
 use crate::anticensorship::ResolverChain;
 use crate::config::EngineConfig;
 use crate::error::Result;
-use crate::evasion::quic_initial::{parse_quic_initial_header, send_fake_quic_initial};
+use crate::evasion::quic_initial::{
+    parse_quic_initial_header, random_whitelisted_sni, send_fake_quic_initial,
+};
 use crate::pt::socks5_server::route_scoring::{
     is_censored_domain, is_quic_silent_drop_cached, record_quic_silent_drop,
 };
@@ -16,6 +18,14 @@ use crate::pt::socks5_server::state_and_startup::RelayOptions;
 
 /// IP TTL for fake QUIC Initial probes (should expire before reaching the server).
 const FAKE_QUIC_TTL: u8 = 3;
+
+/// Number of fake UDP packets to send before real Discord voice data.
+const DISCORD_FAKE_COUNT: u8 = 6;
+
+/// Check if a UDP port is in the Discord voice/STUN range.
+fn is_discord_voice_port(port: u16) -> bool {
+    (19294..=19344).contains(&port) || (50000..=50100).contains(&port)
+}
 
 pub async fn handle_udp_associate(
     conn_id: u64,
@@ -281,6 +291,37 @@ async fn handle_client_to_remote(
 
     let payload = &data[header_len..];
 
+    // Discord voice/STUN: inject fake UDP packets before the real data.
+    // Discord uses ports 19294-19344 and 50000-50100 for voice.  DPI that
+    // fingerprints Discord voice traffic by port range and packet structure
+    // gets confused by the fakes.
+    if is_discord_voice_port(target_addr.port()) && relay_opts.native_bypass.is_some() {
+        let target = target_addr;
+        let pkt_len = payload.len();
+        // Pre-generate all fakes to avoid holding non-Send ThreadRng across await.
+        let fakes: Vec<Vec<u8>> = {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            (0..DISCORD_FAKE_COUNT)
+                .map(|_| {
+                    let mut fake = vec![0u8; pkt_len];
+                    rng.fill(&mut fake[..]);
+                    fake
+                })
+                .collect()
+        };
+        tokio::spawn(async move {
+            for fake in &fakes {
+                if let Ok(sock) =
+                    crate::evasion::quic_initial::bind_udp_for_target(target).await
+                {
+                    let _ = sock.set_ttl(3);
+                    let _ = sock.send_to(fake, target).await;
+                }
+            }
+        });
+    }
+
     // QUIC Initial desync: for port-443 UDP, inject a fake Initial with a
     // decoy SNI before forwarding the real packet.  The fake uses the same DCID
     // so DPI derives the same keys and parses the fake's CRYPTO frame, recording
@@ -288,20 +329,34 @@ async fn handle_client_to_remote(
     // This replaces the hard block for censored domains with an active bypass.
     if target_addr.port() == 443 && relay_opts.native_bypass.is_some() {
         if let Some(hdr) = parse_quic_initial_header(payload) {
-            // Fire-and-forget: fake arrives slightly before real due to async scheduling.
+            // Inject multiple fake QUIC Initials with diverse whitelisted SNIs.
+            // zapret sends 6-11 copies; we use the configured repeat count (default 8).
+            let repeat = cfg.evasion.quic_fake_repeat_count.max(1);
             let target = target_addr;
             let dcid = hdr.dcid.clone();
             tokio::spawn(async move {
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    send_fake_quic_initial(target, &dcid, "www.google.com", FAKE_QUIC_TTL),
-                )
-                .await;
+                for _ in 0..repeat {
+                    let sni = random_whitelisted_sni();
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        send_fake_quic_initial(target, &dcid, sni, FAKE_QUIC_TTL),
+                    )
+                    .await;
+                }
             });
         }
     }
 
-    socket.send_to(payload, target_addr).await?;
+    // Optional UDP padding for QUIC packets (defeats size-based DPI fingerprinting).
+    let padding = cfg.evasion.quic_udp_padding_bytes;
+    if target_addr.port() == 443 && padding > 0 {
+        let mut padded = Vec::with_capacity(payload.len() + padding as usize);
+        padded.extend_from_slice(payload);
+        padded.resize(padded.len() + padding as usize, 0);
+        socket.send_to(&padded, target_addr).await?;
+    } else {
+        socket.send_to(payload, target_addr).await?;
+    }
 
     // Register the probe only after a successful send — avoids false silent-drop
     // classification if the local send itself fails.

@@ -158,9 +158,10 @@ fn release_asset_version(tag: &str) -> String {
 
 pub fn release_asset_sha256_hex(url: &str) -> Option<String> {
     let mutex = RELEASE_ASSET_SHA256_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let Ok(cache) = mutex.lock() else {
-        return None;
-    };
+    let cache = mutex.lock().unwrap_or_else(|e| {
+        warn!(target: "packet_bypass", "SHA256 cache mutex was poisoned, recovering");
+        e.into_inner()
+    });
     cache.get(url).cloned().flatten()
 }
 

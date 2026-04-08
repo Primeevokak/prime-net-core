@@ -12,6 +12,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE};
 use winreg::RegKey;
 
+use tracing::warn;
+
 use crate::error::{EngineError, Result};
 use crate::platform::{ProxyManager, ProxyMode, ProxyStatus};
 
@@ -160,37 +162,34 @@ impl WindowsProxyManager {
         Ok(())
     }
 
+    /// List names of network adapters currently in the "Up" state.
+    ///
+    /// Uses PowerShell `Get-NetAdapter` rather than `netsh` because `netsh`
+    /// output is locale-dependent (e.g. "Connected" vs "Подключен" on Russian
+    /// Windows), while PowerShell property values are invariant.
     pub fn get_active_adapters(&self) -> Result<Vec<String>> {
-        let out = Command::new("netsh")
-            .args(["interface", "show", "interface"])
-            .output()?;
+        let out = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-NetAdapter | Where-Object Status -eq 'Up' \
+                 | Select-Object -ExpandProperty Name",
+            ])
+            .output()
+            .map_err(|e| EngineError::Internal(format!("failed to run PowerShell: {e}")))?;
+
         if !out.status.success() {
             return Err(EngineError::Internal(
                 String::from_utf8_lossy(&out.stderr).to_string(),
             ));
         }
-        let mut adapters = Vec::new();
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty()
-                || trimmed.starts_with("Admin State")
-                || trimmed.starts_with("---")
-            {
-                continue;
-            }
-            let cols = trimmed.split_whitespace().collect::<Vec<_>>();
-            if cols.len() < 4 {
-                continue;
-            }
-            let state = cols[1].to_ascii_lowercase();
-            if state != "connected" {
-                continue;
-            }
-            let name = cols[3..].join(" ");
-            if !name.is_empty() {
-                adapters.push(name);
-            }
-        }
+
+        let adapters = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_owned())
+            .filter(|l| !l.is_empty())
+            .collect();
         Ok(adapters)
     }
 
@@ -254,40 +253,60 @@ impl WindowsProxyManager {
     fn patch_binary_connection_settings(
         &self,
         flags: u8,
-        _proxy_server: Option<&str>,
-        _pac_url: Option<&str>,
-        _bypass: Option<&str>,
+        proxy_server: Option<&str>,
+        pac_url: Option<&str>,
+        bypass: Option<&str>,
     ) -> Result<()> {
         let key = Self::open_connections_write()?;
-        let mut data: Vec<u8> = key
+        let existing: Vec<u8> = key
             .get_raw_value("DefaultConnectionSettings")
             .map(|v| v.bytes)
             .unwrap_or_else(|_| {
                 vec![
-                    0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00,
+                    0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 ]
             });
 
-        if data.len() < 12 {
-            // Re-initialize with minimal valid header if corrupted
-            data = vec![
-                0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x00,
-            ];
-        }
+        // Keep the first 12 bytes as header, re-initialize if corrupted.
+        let header: &[u8] = if existing.len() >= 12 {
+            &existing[..12]
+        } else {
+            &[
+                0x46, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ]
+        };
 
-        // Flags byte is usually at offset 8
+        let proxy_bytes = proxy_server.unwrap_or("").as_bytes();
+        let bypass_bytes = bypass.unwrap_or("").as_bytes();
+        let pac_bytes = pac_url.unwrap_or("").as_bytes();
+
+        // 12-byte header + 3 length-prefixed strings (4-byte LE length each)
+        let total = 12 + 4 + proxy_bytes.len() + 4 + bypass_bytes.len() + 4 + pac_bytes.len();
+        let mut data = Vec::with_capacity(total);
+        data.extend_from_slice(header);
+
+        // Increment the version counter at offset 0..4
+        let counter = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let new_counter = counter.wrapping_add(1);
+        data[..4].copy_from_slice(&new_counter.to_le_bytes());
+
+        // Set the flags byte at offset 8
         data[8] = flags;
 
-        // Structured binary format requires careful length-prefixed strings.
-        // For now, we only patch the flags and clear strings to be safe,
-        // as InternetSetOption handles strings in registry keys well enough
-        // if flags in binary blob are synced.
+        // Truncate to header — rebuild the string section from scratch.
+        data.truncate(12);
 
-        // Offset 12: Proxy server string
-        // Offset 12 + len: Bypass string
-        // Offset 12 + len + len: PAC URL string
+        // Proxy server (4-byte LE length + bytes, no null terminator)
+        data.extend_from_slice(&(proxy_bytes.len() as u32).to_le_bytes());
+        data.extend_from_slice(proxy_bytes);
+
+        // Bypass list
+        data.extend_from_slice(&(bypass_bytes.len() as u32).to_le_bytes());
+        data.extend_from_slice(bypass_bytes);
+
+        // PAC URL
+        data.extend_from_slice(&(pac_bytes.len() as u32).to_le_bytes());
+        data.extend_from_slice(pac_bytes);
 
         let _ = key.set_raw_value(
             "DefaultConnectionSettings",
@@ -620,18 +639,34 @@ impl ProxyManager for WindowsProxyManager {
     fn set_dns(&self, dns_server: &str) -> Result<()> {
         if let Ok(adapters) = self.get_active_adapters() {
             for adapter in adapters {
-                // netsh interface ipv4 set dns name="Adapter Name" static 127.0.0.1
-                let _ = Command::new("netsh")
+                match Command::new("netsh")
                     .args([
                         "interface",
                         "ipv4",
                         "set",
                         "dns",
-                        &format!("name=\"{}\"", adapter),
+                        &format!("name={}", adapter),
                         "static",
                         dns_server,
                     ])
-                    .status();
+                    .status()
+                {
+                    Ok(s) if !s.success() => {
+                        warn!(
+                            adapter = %adapter,
+                            code = ?s.code(),
+                            "netsh set dns returned non-zero exit status"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            adapter = %adapter,
+                            error = %e,
+                            "netsh set dns spawn failed"
+                        );
+                    }
+                    _ => {}
+                }
             }
         }
         Ok(())
@@ -640,17 +675,33 @@ impl ProxyManager for WindowsProxyManager {
     fn reset_dns(&self) -> Result<()> {
         if let Ok(adapters) = self.get_active_adapters() {
             for adapter in adapters {
-                // netsh interface ipv4 set dns name="Adapter Name" source=dhcp
-                let _ = Command::new("netsh")
+                match Command::new("netsh")
                     .args([
                         "interface",
                         "ipv4",
                         "set",
                         "dns",
-                        &format!("name=\"{}\"", adapter),
+                        &format!("name={}", adapter),
                         "source=dhcp",
                     ])
-                    .status();
+                    .status()
+                {
+                    Ok(s) if !s.success() => {
+                        warn!(
+                            adapter = %adapter,
+                            code = ?s.code(),
+                            "netsh reset dns returned non-zero exit status"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            adapter = %adapter,
+                            error = %e,
+                            "netsh reset dns spawn failed"
+                        );
+                    }
+                    _ => {}
+                }
             }
         }
         Ok(())

@@ -73,21 +73,22 @@ pub struct ProfileDiscoveryCache {
 
 impl ProfileDiscoveryCache {
     /// Load the cache from `path`, returning an empty cache on error.
-    pub fn load(path: &PathBuf) -> Self {
-        std::fs::read_to_string(path)
+    pub async fn load(path: &PathBuf) -> Self {
+        tokio::fs::read_to_string(path)
+            .await
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
     }
 
     /// Persist the cache to `path`.
-    pub fn save(&self, path: &PathBuf) {
+    pub async fn save(&self, path: &PathBuf) {
         if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            let _ = tokio::fs::create_dir_all(dir).await;
         }
         match serde_json::to_string_pretty(self) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
+                if let Err(e) = tokio::fs::write(path, json).await {
                     warn!(
                         "profile discovery: could not save cache to {}: {e}",
                         path.display()
@@ -375,17 +376,17 @@ mod profile_discovery_tests {
         assert_eq!(cache.wins("nonexistent"), 0);
     }
 
-    #[test]
-    fn cache_round_trip_json() {
+    #[tokio::test]
+    async fn cache_round_trip_json() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
 
         let mut cache = ProfileDiscoveryCache::default();
         cache.record("split-into-sni", 3, 3);
         cache.record("tlsrec-into-sni", 1, 3);
-        cache.save(&path);
+        cache.save(&path).await;
 
-        let loaded = ProfileDiscoveryCache::load(&path);
+        let loaded = ProfileDiscoveryCache::load(&path).await;
         assert_eq!(loaded.wins("split-into-sni"), 3);
         assert_eq!(loaded.wins("tlsrec-into-sni"), 1);
     }

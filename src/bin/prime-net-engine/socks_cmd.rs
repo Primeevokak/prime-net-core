@@ -129,7 +129,8 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
         // Run profile discovery synchronously (with 10 s timeout) so that the ML scorer
         // encounters the most effective profiles first from the very first connection.
         let cache_path = prime_net_engine_core::evasion::profile_discovery::cache_path();
-        let mut cache = prime_net_engine_core::evasion::ProfileDiscoveryCache::load(&cache_path);
+        let mut cache =
+            prime_net_engine_core::evasion::ProfileDiscoveryCache::load(&cache_path).await;
         if !cache.all_fresh((0..engine.profile_count()).map(|i| engine.profile_name(i))) {
             info!(target: "socks_cmd", "running profile discovery (first run or stale cache)");
             let discovery_result = tokio::time::timeout(
@@ -149,7 +150,7 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
                     engine.set_profiles(reordered);
                     let cache_snap = cache.clone();
                     let save_path = cache_path.clone();
-                    tokio::task::spawn_blocking(move || cache_snap.save(&save_path));
+                    tokio::spawn(async move { cache_snap.save(&save_path).await });
                 }
                 Ok(_) => {
                     info!(target: "socks_cmd", "profile discovery returned no results");

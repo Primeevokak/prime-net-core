@@ -94,7 +94,7 @@ async fn write_loop(
 
         // Atomic write: write to .tmp then rename so the reader never sees a partial file.
         let tmp = path.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp, json.as_bytes()) {
+        if let Err(e) = tokio::fs::write(&tmp, json.as_bytes()).await {
             warn!(
                 target: "stats_writer",
                 error = %e,
@@ -103,7 +103,7 @@ async fn write_loop(
             );
             continue;
         }
-        if let Err(e) = std::fs::rename(&tmp, &path) {
+        if let Err(e) = tokio::fs::rename(&tmp, &path).await {
             warn!(
                 target: "stats_writer",
                 error = %e,

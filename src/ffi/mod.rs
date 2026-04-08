@@ -491,7 +491,10 @@ pub unsafe extern "C" fn prime_request_wait(
                     .recv_timeout(Duration::from_millis(timeout_ms))
                     .map_err(|e| match e {
                         std::sync::mpsc::RecvTimeoutError::Timeout => {
-                            EngineError::Internal("timeout".to_owned())
+                            EngineError::Io(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!("FFI request wait timed out after {timeout_ms}ms"),
+                            ))
                         }
                         std::sync::mpsc::RecvTimeoutError::Disconnected => EngineError::Internal(
                             "request was cancelled (engine dropped)".to_owned(),
@@ -522,7 +525,7 @@ pub unsafe extern "C" fn prime_request_wait(
                     mark_request_freed(handle);
                     pack_error(error_code_from(&err), &err.to_string())
                 }
-                Err(EngineError::Internal(msg)) if msg == "timeout" => {
+                Err(EngineError::Io(ref e)) if e.kind() == std::io::ErrorKind::TimedOut => {
                     pack_error(PRIME_ERR_RUNTIME, "timeout")
                 }
                 Err(err) => {
