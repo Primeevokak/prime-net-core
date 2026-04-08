@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::warn;
@@ -94,6 +95,38 @@ pub enum DesyncTechnique {
         /// Milliseconds between forwarding segment 2 and forwarding segment 1.
         delay_ms: u64,
     },
+    /// Send a fake TLS ClientHello with a whitelisted SNI using decremented TCP
+    /// sequence numbers before the real ClientHello.
+    ///
+    /// Inspired by zapret's `--dpi-desync-split-seqovl`.  The server's TCP stack
+    /// discards the out-of-window overlap data, but DPI sees the fake SNI first.
+    /// Requires raw packet injection (WinDivert).  Falls back to
+    /// [`TlsRecordSplit`] when no packet injector is available.
+    ///
+    /// **Not compatible with `TcpDisorder`** on Windows servers.
+    SeqOverlap {
+        /// Number of overlap bytes prepended with decremented sequence numbers.
+        overlap_size: usize,
+    },
+}
+
+/// Strategy to make fake probe packets visible to DPI but rejected by the server.
+///
+/// Different ISPs and DPI appliances are susceptible to different methods.
+/// Inspired by zapret's `--dpi-desync-fooling` flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FakeProbeStrategy {
+    /// Low TTL — packet expires in transit (existing default).
+    Ttl,
+    /// Corrupted TCP timestamp — server PAWS rejects, DPI processes.
+    ///
+    /// Sets TSval to 0 in the TCP timestamp option.  Most reliable through NAT.
+    BadTimestamp,
+    /// Bad TCP checksum — some DPI ignores checksums, server drops.
+    BadChecksum,
+    /// Out-of-window TCP sequence number — server drops, DPI may process.
+    BadSeq,
 }
 
 /// Optional low-TTL probe sent to the target before the real TCP connection.
@@ -113,6 +146,11 @@ pub struct FakeProbe {
     /// actually extract the fake SNI and create state for a connection that then
     /// expires (TTL exhausted), leaving the DPI confused before the real ClientHello.
     pub fake_sni: Option<String>,
+    /// How to prevent the fake probe from reaching the server.
+    ///
+    /// `None` = use TTL only (existing behaviour, equivalent to `Some(Ttl)`).
+    /// Inspired by zapret's `--dpi-desync-fooling`.
+    pub fooling: Option<FakeProbeStrategy>,
 }
 
 /// A named native desync profile.
@@ -388,6 +426,9 @@ impl TcpDesyncEngine {
             DesyncTechnique::TcpDisorder { delay_ms } => {
                 apply_tcp_disorder(self, stream, data, parsed.as_ref(), *delay_ms).await?;
             }
+            DesyncTechnique::SeqOverlap { overlap_size } => {
+                apply_seq_overlap(stream, data, parsed.as_ref(), *overlap_size, delay).await?;
+            }
             other => {
                 // Non-OOB techniques behave the same on TcpStream as on generic writers.
                 apply_technique(stream, data, other, parsed.as_ref(), delay).await?;
@@ -442,6 +483,11 @@ async fn apply_technique<W: AsyncWriteExt + Unpin>(
         DesyncTechnique::TcpDisorder { .. } => {
             let split = split_offset_in_record(data, SplitAt::IntoSni, parsed);
             tcp_segment_split(writer, data, split, delay_ms).await
+        }
+        // SeqOverlap fallback: plain TLS record split when no raw injector.
+        DesyncTechnique::SeqOverlap { .. } => {
+            let payload_split = split_offset_in_payload(data, SplitAt::IntoSni, parsed);
+            tls_record_split(writer, data, payload_split, delay_ms).await
         }
     }
 }
@@ -743,6 +789,70 @@ async fn apply_tcp_disorder(
     Ok(())
 }
 
+// ── Sequence overlap ─────────────────────────────────────────────────────────
+
+/// Apply TCP sequence overlap: inject a fake TLS ClientHello with decremented
+/// sequence numbers via WinDivert, then send the real data normally.
+///
+/// The server's TCP stack discards the out-of-window overlap data while DPI
+/// sees the fake SNI and associates the connection with a whitelisted domain.
+async fn apply_seq_overlap(
+    stream: &mut TcpStream,
+    data: &[u8],
+    parsed: Option<&ParsedClientHello>,
+    overlap_size: usize,
+    delay_ms: Option<u64>,
+) -> io::Result<()> {
+    use crate::evasion::packet_intercept::raw_inject;
+
+    if !raw_inject::is_injector_available() {
+        warn!(
+            "SeqOverlap: no raw packet injector available; \
+             falling back to plain TLS record split"
+        );
+        let payload_split = split_offset_in_payload(data, SplitAt::IntoSni, parsed);
+        return tls_record_split(stream, data, payload_split, delay_ms).await;
+    }
+
+    let local_addr = stream.local_addr()?;
+    let peer_addr = stream.peer_addr()?;
+
+    // Build a fake TLS ClientHello with a whitelisted SNI.
+    let fake_payload = crate::evasion::dpi_bypass::build_fake_client_hello("www.google.com");
+
+    // Truncate or pad to overlap_size.
+    let overlap_data = if fake_payload.len() >= overlap_size {
+        &fake_payload[..overlap_size]
+    } else {
+        &fake_payload
+    };
+
+    // Inject the overlap packet with a decremented sequence number.
+    // We use seq = 1 (a deliberately old/wrong sequence number that the
+    // server will discard).  DPI sees it as legitimate data.
+    let pkt = raw_inject::build_tcp_packet(&raw_inject::TcpPacketParams {
+        src: local_addr,
+        dst: peer_addr,
+        seq: 1, // out-of-window seq — server drops, DPI processes
+        ack: 0,
+        flags: 0x10 | 0x08, // ACK + PSH
+        ttl: 64,            // normal TTL — must reach DPI
+        payload: overlap_data,
+        corrupt_timestamp: false,
+        corrupt_checksum: false,
+    });
+
+    if !pkt.is_empty() {
+        let _ = raw_inject::inject_raw_packet(pkt, false);
+        // Small delay to ensure the fake arrives before real data.
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    // Send the real data normally through the TCP stream.
+    stream.write_all(data).await?;
+    Ok(())
+}
+
 // ── SNI case randomization ────────────────────────────────────────────────────
 
 /// Randomize the ASCII case of the SNI hostname bytes in place.
@@ -901,12 +1011,16 @@ fn native_profile_from_config(
         NativeTechniqueConfig::TcpDisorder { delay_ms } => DesyncTechnique::TcpDisorder {
             delay_ms: *delay_ms,
         },
+        NativeTechniqueConfig::SeqOverlap { overlap_size } => DesyncTechnique::SeqOverlap {
+            overlap_size: *overlap_size,
+        },
     };
 
     let fake_probe = cfg.fake_probe.as_ref().map(|p| FakeProbe {
         ttl: p.ttl,
         data_size: p.data_size,
         fake_sni: p.fake_sni.clone(),
+        fooling: p.fooling,
     });
 
     Ok(NativeDesyncProfile {
@@ -1047,6 +1161,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
                 ttl: 3,
                 data_size: 0,
                 fake_sni: None,
+                fooling: None,
             }),
             randomize_sni_case: false,
             inter_fragment_delay_ms: None,
@@ -1062,6 +1177,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
                 ttl: 3,
                 data_size: 0,
                 fake_sni: None,
+                fooling: None,
             }),
             randomize_sni_case: false,
             inter_fragment_delay_ms: None,
@@ -1178,6 +1294,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
                 ttl: 3,
                 data_size: 0,
                 fake_sni: Some("www.google.com".to_owned()),
+                fooling: None,
             }),
             randomize_sni_case: false,
             inter_fragment_delay_ms: None,
@@ -1193,6 +1310,60 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
                 ttl: 3,
                 data_size: 0,
                 fake_sni: Some("www.google.com".to_owned()),
+                fooling: None,
+            }),
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
+        },
+        // 22. SeqOverlap with 681-byte overlap (zapret's recommended value).
+        NativeDesyncProfile {
+            name: "seqovl-681".to_owned(),
+            technique: DesyncTechnique::SeqOverlap { overlap_size: 681 },
+            cloudflare_safe: false,
+            fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
+        },
+        // 23. SeqOverlap with 256-byte overlap.
+        NativeDesyncProfile {
+            name: "seqovl-256".to_owned(),
+            technique: DesyncTechnique::SeqOverlap { overlap_size: 256 },
+            cloudflare_safe: false,
+            fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
+        },
+        // 24. TLS record split + fake ClientHello with BadTimestamp fooling.
+        //     Uses corrupted TCP timestamp instead of TTL to prevent server
+        //     from processing the fake.  More reliable through NAT gateways.
+        //     Inspired by zapret --dpi-desync-fooling=ts.
+        NativeDesyncProfile {
+            name: "tlsrec-sni-fake-ts-fool".to_owned(),
+            technique: DesyncTechnique::TlsRecordSplit {
+                at: SplitAt::IntoSni,
+            },
+            cloudflare_safe: true,
+            fake_probe: Some(FakeProbe {
+                ttl: 8,
+                data_size: 0,
+                fake_sni: Some("www.google.com".to_owned()),
+                fooling: Some(FakeProbeStrategy::BadTimestamp),
+            }),
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
+        },
+        // 23. TCP segment split + fake ClientHello with BadTimestamp fooling.
+        NativeDesyncProfile {
+            name: "split-sni-fake-ts-fool".to_owned(),
+            technique: DesyncTechnique::TcpSegmentSplit {
+                at: SplitAt::IntoSni,
+            },
+            cloudflare_safe: true,
+            fake_probe: Some(FakeProbe {
+                ttl: 8,
+                data_size: 0,
+                fake_sni: Some("www.google.com".to_owned()),
+                fooling: Some(FakeProbeStrategy::BadTimestamp),
             }),
             randomize_sni_case: false,
             inter_fragment_delay_ms: None,
@@ -1589,6 +1760,7 @@ mod config_conversion_tests {
                 ttl: 4,
                 data_size: 16,
                 fake_sni: Some("www.bing.com".to_owned()),
+                fooling: None,
             }),
             randomize_sni_case: true,
             inter_fragment_delay_ms: Some(50),

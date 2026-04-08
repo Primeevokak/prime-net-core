@@ -312,9 +312,7 @@ async fn handle_client_to_remote(
         };
         tokio::spawn(async move {
             for fake in &fakes {
-                if let Ok(sock) =
-                    crate::evasion::quic_initial::bind_udp_for_target(target).await
-                {
+                if let Ok(sock) = crate::evasion::quic_initial::bind_udp_for_target(target).await {
                     let _ = sock.set_ttl(3);
                     let _ = sock.send_to(fake, target).await;
                 }

@@ -16,6 +16,8 @@ use std::sync::Arc;
 pub use disorder::TcpDisorderHandle;
 
 mod disorder;
+pub mod quic_bypass;
+pub mod raw_inject;
 
 #[cfg(windows)]
 mod windivert;

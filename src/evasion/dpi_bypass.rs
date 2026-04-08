@@ -346,7 +346,8 @@ pub(crate) async fn send_fake_sni_probe(
 /// The resulting bytes form a complete TLS record that DPI can parse as a real ClientHello.
 /// Fields: version=TLS 1.2 compat, random=zeroed (probe only), one cipher suite
 /// (TLS_AES_128_GCM_SHA256), null compression, and a single SNI extension.
-fn build_fake_client_hello(sni: &str) -> Vec<u8> {
+/// Build a minimal TLS 1.3 ClientHello with the given SNI for fake probe packets.
+pub(crate) fn build_fake_client_hello(sni: &str) -> Vec<u8> {
     let sni_bytes = sni.as_bytes();
     let sni_len = sni_bytes.len();
 

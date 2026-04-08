@@ -1,3 +1,5 @@
+use rand::Rng;
+
 use crate::config::EngineConfig;
 use crate::error::{EngineError, Result};
 use crate::pt::socks5_server::ml_shadow::{complete_route_outcome_event, next_route_decision_id};
@@ -114,28 +116,84 @@ pub async fn connect_via_best_route(
                         let resolver = out.resolver().ok_or(EngineError::ResolverMissing)?;
                         let direct = crate::pt::direct::DirectOutbound::new(resolver);
 
-                        // Send a fake low-TTL probe to desync the DPI's TCP state table.
+                        // Send a fake probe to desync the DPI's TCP state table.
+                        // Strategy depends on `probe.fooling`:
+                        //   None / Ttl → low-TTL TCP connection (existing behaviour)
+                        //   BadTimestamp/BadChecksum/BadSeq → raw packet injection via WinDivert
                         if let Some(probe) = engine.profile_fake_probe(profile_idx) {
                             if let Ok(addr) = direct.resolve_target_ip(&t).await {
-                                if let Some(sni) = probe.fake_sni.as_deref() {
-                                    // Crafted TLS ClientHello probe — DPI parses the fake SNI
-                                    // then loses state when the probe expires (low TTL).
-                                    let _ = crate::evasion::dpi_bypass::send_fake_sni_probe(
-                                        addr, probe.ttl, sni,
-                                    )
-                                    .await;
-                                } else if probe.data_size == 0 {
-                                    let _ = crate::evasion::dpi_bypass::send_tcb_desync_probe(
-                                        addr, probe.ttl,
-                                    )
-                                    .await;
-                                } else {
-                                    let _ = crate::evasion::dpi_bypass::send_fake_payload_probe(
-                                        addr,
-                                        probe.ttl,
-                                        probe.data_size,
-                                    )
-                                    .await;
+                                use crate::evasion::tcp_desync::FakeProbeStrategy;
+                                match probe.fooling {
+                                    Some(FakeProbeStrategy::BadTimestamp)
+                                    | Some(FakeProbeStrategy::BadChecksum)
+                                    | Some(FakeProbeStrategy::BadSeq) => {
+                                        // Raw packet injection — build fake TCP SYN+data
+                                        // with corrupted fields that DPI processes but
+                                        // the server drops.
+                                        let payload =
+                                            crate::evasion::dpi_bypass::build_fake_client_hello(
+                                                probe
+                                                    .fake_sni
+                                                    .as_deref()
+                                                    .unwrap_or("www.google.com"),
+                                            );
+                                        let corrupt_ts = probe.fooling
+                                            == Some(FakeProbeStrategy::BadTimestamp);
+                                        let corrupt_cksum = probe.fooling
+                                            == Some(FakeProbeStrategy::BadChecksum);
+                                        // Use a random ephemeral src port for the fake.
+                                        let fake_src = SocketAddr::new(
+                                            "0.0.0.0".parse().unwrap_or(
+                                                std::net::Ipv4Addr::UNSPECIFIED.into(),
+                                            ),
+                                            rand::thread_rng().gen_range(49152..65535u16),
+                                        );
+                                        let bad_seq = probe.fooling
+                                            == Some(FakeProbeStrategy::BadSeq);
+                                        let seq = if bad_seq { 0xDEAD_0000 } else { 1000 };
+                                        use crate::evasion::packet_intercept::raw_inject::TcpPacketParams;
+                                        let pkt =
+                                            crate::evasion::packet_intercept::raw_inject::build_tcp_packet(
+                                                &TcpPacketParams {
+                                                    src: fake_src,
+                                                    dst: addr,
+                                                    seq,
+                                                    ack: 0,
+                                                    flags: 0x02 | 0x10, // SYN+ACK
+                                                    ttl: probe.ttl,
+                                                    payload: &payload,
+                                                    corrupt_timestamp: corrupt_ts,
+                                                    corrupt_checksum: corrupt_cksum,
+                                                },
+                                            );
+                                        if !pkt.is_empty() {
+                                            let _ = crate::evasion::packet_intercept::raw_inject::inject_raw_packet(
+                                                pkt,
+                                                corrupt_cksum, // skip checksum recalc if intentionally bad
+                                            );
+                                        }
+                                    }
+                                    _ => {
+                                        // TTL-based probe (original behaviour).
+                                        if let Some(sni) = probe.fake_sni.as_deref() {
+                                            let _ = crate::evasion::dpi_bypass::send_fake_sni_probe(
+                                                addr, probe.ttl, sni,
+                                            )
+                                            .await;
+                                        } else if probe.data_size == 0 {
+                                            let _ = crate::evasion::dpi_bypass::send_tcb_desync_probe(
+                                                addr, probe.ttl,
+                                            )
+                                            .await;
+                                        } else {
+                                            let _ = crate::evasion::dpi_bypass::send_fake_payload_probe(
+                                                addr,
+                                                probe.ttl,
+                                                probe.data_size,
+                                            )
+                                            .await;
+                                        }
+                                    }
                                 }
                             }
                         }

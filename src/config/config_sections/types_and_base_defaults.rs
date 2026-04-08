@@ -227,6 +227,8 @@ pub enum NativeTechniqueConfig {
     TlsRecordPadding { split_at: SplitAtConfig },
     /// Send TCP segment 2 before segment 1 (requires WinDivert/NFQueue).
     TcpDisorder { delay_ms: u64 },
+    /// Inject fake ClientHello with decremented TCP seq (zapret seqovl).
+    SeqOverlap { overlap_size: usize },
 }
 
 /// Configuration for a low-TTL fake probe sent before the real TCP connection.
@@ -240,6 +242,11 @@ pub struct FakeProbeConfig {
     /// If set, send a crafted TLS ClientHello with this SNI instead of random bytes.
     #[serde(default)]
     pub fake_sni: Option<String>,
+    /// How to prevent the probe from reaching the server.
+    ///
+    /// `None` = use TTL only.  Alternatives: `bad_timestamp`, `bad_checksum`, `bad_seq`.
+    #[serde(default)]
+    pub fooling: Option<crate::evasion::tcp_desync::FakeProbeStrategy>,
 }
 
 /// User-defined native desync profile loaded from config.

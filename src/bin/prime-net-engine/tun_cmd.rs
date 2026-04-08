@@ -562,6 +562,24 @@ pub async fn run_tun(cfg: EngineConfig, opts: &TunOpts) -> Result<()> {
     #[cfg(target_os = "windows")]
     ensure_wintun().await?;
 
+    // On Windows, start WinDivert-level QUIC bypass if evasion is enabled.
+    // This intercepts outgoing UDP:443 packets and injects fake QUIC Initials
+    // with whitelisted SNIs before the real packet.
+    #[cfg(target_os = "windows")]
+    let _quic_bypass_handle = if cfg.evasion.strategy.is_some() {
+        match prime_net_engine_core::evasion::packet_intercept::quic_bypass::start(
+            cfg.evasion.quic_fake_repeat_count.max(1),
+        ) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                warn!(target: "tun_cmd", error = %e, "QUIC WinDivert bypass unavailable — QUIC will use SOCKS5 relay fallback");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // 1. Start SOCKS5 in background.
     //    Detect the physical NIC IP before TUN routes are installed so outgoing
     //    relay sockets can be bound to it, preventing a TUN routing loop where

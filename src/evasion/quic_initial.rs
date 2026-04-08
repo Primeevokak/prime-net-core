@@ -34,10 +34,10 @@ use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes128Gcm, Nonce};
 use cipher::{generic_array::GenericArray, BlockEncrypt};
 use hkdf::Hkdf;
-use sha2::Sha256;
-use tokio::net::UdpSocket;
 use rand::seq::SliceRandom;
 use rand::{thread_rng, Rng};
+use sha2::Sha256;
+use tokio::net::UdpSocket;
 use tracing::debug;
 
 /// Whitelisted SNIs used in fake QUIC Initials.
@@ -228,7 +228,8 @@ fn hkdf_expand_label(hkdf: &Hkdf<Sha256>, label: &[u8], context: &[u8], out: &mu
 // ── Fake packet construction ──────────────────────────────────────────────────
 
 /// Build a fully encrypted QUIC v1 Initial packet with `fake_sni` in the CRYPTO frame.
-fn build_fake_quic_initial(dcid: &[u8], fake_sni: &str) -> Result<Vec<u8>, String> {
+/// Build a fully encrypted QUIC v1 Initial packet with a fake SNI.
+pub(crate) fn build_fake_quic_initial(dcid: &[u8], fake_sni: &str) -> Result<Vec<u8>, String> {
     let keys = derive_initial_keys(dcid);
 
     // Build the plaintext CRYPTO frame payload (TLS ClientHello).
