@@ -36,6 +36,7 @@ const TCP_BUF: usize = 64 * 1024;
 // smoltcp poll interval
 const POLL_INTERVAL_US: u64 = 500;
 
+/// Configuration for TUN/VPN mode.
 #[derive(Debug, Clone)]
 pub struct TunOpts {
     /// TUN interface name (e.g. "prime0")
@@ -542,6 +543,8 @@ fn is_running_as_admin() -> bool {
     unsafe { IsUserAnAdmin() != 0 }
 }
 
+/// Start the TUN/VPN mode: create a TUN device, launch a background SOCKS5
+/// server, and relay all captured TCP traffic through the engine's bypass stack.
 pub async fn run_tun(cfg: EngineConfig, opts: &TunOpts) -> Result<()> {
     if opts.print_routes_only {
         print_routing_instructions(opts);
@@ -569,6 +572,7 @@ pub async fn run_tun(cfg: EngineConfig, opts: &TunOpts) -> Result<()> {
     let _quic_bypass_handle = if cfg.evasion.strategy.is_some() {
         match prime_net_engine_core::evasion::packet_intercept::quic_bypass::start(
             cfg.evasion.quic_fake_repeat_count.max(1),
+            cfg.evasion.quic_udp_padding_bytes,
         ) {
             Ok(h) => Some(h),
             Err(e) => {

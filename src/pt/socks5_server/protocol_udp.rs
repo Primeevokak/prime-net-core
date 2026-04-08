@@ -27,6 +27,12 @@ fn is_discord_voice_port(port: u16) -> bool {
     (19294..=19344).contains(&port) || (50000..=50100).contains(&port)
 }
 
+/// Run a SOCKS5 UDP ASSOCIATE relay for a single client connection.
+///
+/// Binds a local UDP socket, replies with its address, and relays datagrams
+/// between the SOCKS5 client and remote targets.  Includes QUIC Initial
+/// desync injection, Discord voice fake-packet injection, QUIC silent-drop
+/// detection, and optional UDP padding.
 pub async fn handle_udp_associate(
     conn_id: u64,
     mut tcp: TcpStream,

@@ -55,9 +55,11 @@ impl Drop for QuicBypassHandle {
 /// Intercepts outgoing UDP port 443 packets and injects `fake_count` fake QUIC
 /// Initials before each real one.  Only available on Windows with WinDivert.
 ///
+/// `padding_bytes` adds trailing zero padding to real QUIC packets (0 = disabled).
+///
 /// Returns `Err` if WinDivert cannot be loaded.
 #[cfg(windows)]
-pub fn start(fake_count: u8) -> std::io::Result<QuicBypassHandle> {
+pub fn start(fake_count: u8, padding_bytes: u16) -> std::io::Result<QuicBypassHandle> {
     use std::io;
 
     let lib = unsafe { libloading::Library::new("WinDivert.dll") }
@@ -105,7 +107,7 @@ pub fn start(fake_count: u8) -> std::io::Result<QuicBypassHandle> {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_clone = Arc::clone(&stop_flag);
 
-    info!("QUIC bypass: WinDivert intercept started (fake_count={fake_count})");
+    info!("QUIC bypass: WinDivert intercept started (fake_count={fake_count}, padding={padding_bytes})");
 
     // Bundle everything the bypass thread needs into a Send-safe wrapper.
     struct BypassCtx {
@@ -139,6 +141,7 @@ pub fn start(fake_count: u8) -> std::io::Result<QuicBypassHandle> {
                     ctx.send,
                     ctx.calc_checksums,
                     fake_count,
+                    padding_bytes,
                     stop_clone,
                 );
             };
@@ -159,7 +162,7 @@ pub fn start(fake_count: u8) -> std::io::Result<QuicBypassHandle> {
 
 /// Not available on non-Windows.
 #[cfg(not(windows))]
-pub fn start(_fake_count: u8) -> std::io::Result<QuicBypassHandle> {
+pub fn start(_fake_count: u8, _padding_bytes: u16) -> std::io::Result<QuicBypassHandle> {
     Err(std::io::Error::other(
         "QUIC bypass requires WinDivert (Windows only)",
     ))
@@ -167,6 +170,7 @@ pub fn start(_fake_count: u8) -> std::io::Result<QuicBypassHandle> {
 
 /// Main loop: recv packets, detect QUIC Initials, inject fakes, re-inject real.
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn run_quic_bypass_loop(
     handle: *mut std::ffi::c_void,
     close: unsafe extern "C" fn(*mut std::ffi::c_void) -> bool,
@@ -186,6 +190,7 @@ fn run_quic_bypass_loop(
     ) -> bool,
     calc_checksums: unsafe extern "C" fn(*mut u8, u32, *mut [u8; 80], u64) -> bool,
     fake_count: u8,
+    padding_bytes: u16,
     stop_flag: Arc<AtomicBool>,
 ) {
     const BUF_LEN: usize = 65_535;
@@ -304,16 +309,45 @@ fn run_quic_bypass_loop(
             }
         }
 
-        // Re-inject the real packet.
-        // SAFETY: re-injecting the original captured packet.
-        unsafe {
-            (send)(
-                handle,
-                pkt_data.as_ptr(),
-                pkt_len,
-                std::ptr::null_mut(),
-                &addr,
-            );
+        // Re-inject the real packet, optionally with UDP padding.
+        if padding_bytes > 0 {
+            let mut padded = pkt_data.to_vec();
+            padded.resize(padded.len() + padding_bytes as usize, 0);
+            // Update IP total length.
+            let new_total = padded.len() as u16;
+            padded[2..4].copy_from_slice(&new_total.to_be_bytes());
+            // Update UDP length.
+            let new_udp_len =
+                u16::from_be_bytes([padded[ihl + 4], padded[ihl + 5]]) + padding_bytes;
+            padded[ihl + 4..ihl + 6].copy_from_slice(&new_udp_len.to_be_bytes());
+            let mut padded_addr = addr;
+            // SAFETY: recalculate checksums for modified packet.
+            unsafe {
+                (calc_checksums)(
+                    padded.as_mut_ptr(),
+                    padded.len() as u32,
+                    &mut padded_addr,
+                    0,
+                );
+                (send)(
+                    handle,
+                    padded.as_ptr(),
+                    padded.len() as u32,
+                    std::ptr::null_mut(),
+                    &padded_addr,
+                );
+            }
+        } else {
+            // SAFETY: re-injecting the original captured packet unchanged.
+            unsafe {
+                (send)(
+                    handle,
+                    pkt_data.as_ptr(),
+                    pkt_len,
+                    std::ptr::null_mut(),
+                    &addr,
+                );
+            }
         }
 
         // Periodic cleanup of old flow entries (every 30 seconds).

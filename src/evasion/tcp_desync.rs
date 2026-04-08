@@ -1856,4 +1856,145 @@ mod config_conversion_tests {
         assert_eq!(engine.profile_count(), 1);
         assert_eq!(engine.profile_name(0), "only-this");
     }
+
+    #[test]
+    fn default_profiles_include_seqoverlap_and_badtimestamp() {
+        let profiles = default_native_profiles();
+        let names: Vec<&str> = profiles.iter().map(|p| p.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"seqovl-681"),
+            "missing SeqOverlap 681 profile"
+        );
+        assert!(
+            names.contains(&"seqovl-256"),
+            "missing SeqOverlap 256 profile"
+        );
+        assert!(
+            names.contains(&"tlsrec-sni-fake-ts-fool"),
+            "missing BadTimestamp TLS profile"
+        );
+        assert!(
+            names.contains(&"split-sni-fake-ts-fool"),
+            "missing BadTimestamp TCP profile"
+        );
+
+        // SeqOverlap profiles must NOT be cloudflare_safe.
+        for p in &profiles {
+            if p.name.starts_with("seqovl") {
+                assert!(!p.cloudflare_safe, "{} must not be cloudflare_safe", p.name);
+            }
+        }
+
+        // BadTimestamp profiles should have fooling field set.
+        for p in &profiles {
+            if p.name.contains("ts-fool") {
+                let probe = p.fake_probe.as_ref().expect("ts-fool must have fake_probe");
+                assert_eq!(
+                    probe.fooling,
+                    Some(FakeProbeStrategy::BadTimestamp),
+                    "{} must use BadTimestamp",
+                    p.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn raw_tcp_packet_badtimestamp_has_tsval_zero() {
+        use crate::evasion::packet_intercept::raw_inject::{build_tcp_packet, TcpPacketParams};
+
+        let pkt = build_tcp_packet(&TcpPacketParams {
+            src: "1.2.3.4:12345".parse().unwrap(),
+            dst: "5.6.7.8:443".parse().unwrap(),
+            seq: 1000,
+            ack: 0,
+            flags: 0x02,
+            ttl: 3,
+            payload: b"hello",
+            corrupt_timestamp: true,
+            corrupt_checksum: false,
+        });
+
+        assert!(!pkt.is_empty());
+        // IP header = 20 bytes, TCP header with timestamp = 32 bytes.
+        assert_eq!(pkt.len(), 20 + 32 + 5);
+        // TCP data offset should be 8 (32/4).
+        assert_eq!(pkt[20 + 12] >> 4, 8);
+        // Timestamp option: NOP NOP kind=8 len=10 TSval=0(4 bytes) TSecr=0(4 bytes)
+        assert_eq!(pkt[20 + 20], 0x01); // NOP
+        assert_eq!(pkt[20 + 21], 0x01); // NOP
+        assert_eq!(pkt[20 + 22], 0x08); // Timestamp kind
+        assert_eq!(pkt[20 + 23], 0x0A); // Timestamp len
+                                        // TSval = 0 at bytes 24..28.
+        assert_eq!(&pkt[20 + 24..20 + 28], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn raw_tcp_packet_badchecksum_has_wrong_checksum() {
+        use crate::evasion::packet_intercept::raw_inject::{build_tcp_packet, TcpPacketParams};
+
+        let pkt = build_tcp_packet(&TcpPacketParams {
+            src: "1.2.3.4:12345".parse().unwrap(),
+            dst: "5.6.7.8:443".parse().unwrap(),
+            seq: 1000,
+            ack: 0,
+            flags: 0x02,
+            ttl: 3,
+            payload: b"test",
+            corrupt_timestamp: false,
+            corrupt_checksum: true,
+        });
+
+        // TCP checksum at offset 20+16..20+18 should be 0xDEAD.
+        assert_eq!(pkt[20 + 16], 0xDE);
+        assert_eq!(pkt[20 + 17], 0xAD);
+    }
+
+    #[test]
+    fn seqoverlap_technique_in_config_roundtrip() {
+        use crate::config::{NativeProfileConfig, NativeTechniqueConfig};
+        let cfg = NativeProfileConfig {
+            name: "test-seqovl".to_owned(),
+            technique: NativeTechniqueConfig::SeqOverlap { overlap_size: 681 },
+            cloudflare_safe: false,
+            fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
+        };
+
+        let profile = native_profile_from_config(&cfg).unwrap();
+        assert_eq!(profile.name, "test-seqovl");
+        assert!(matches!(
+            profile.technique,
+            DesyncTechnique::SeqOverlap { overlap_size: 681 }
+        ));
+    }
+
+    #[test]
+    fn fake_probe_strategy_config_roundtrip() {
+        use crate::config::{
+            FakeProbeConfig, NativeProfileConfig, NativeTechniqueConfig, SplitAtConfig,
+        };
+        let cfg = NativeProfileConfig {
+            name: "test-ts".to_owned(),
+            technique: NativeTechniqueConfig::TlsRecordSplit {
+                split_at: SplitAtConfig::IntoSni,
+            },
+            cloudflare_safe: true,
+            fake_probe: Some(FakeProbeConfig {
+                ttl: 8,
+                data_size: 0,
+                fake_sni: Some("google.com".to_owned()),
+                fooling: Some(FakeProbeStrategy::BadTimestamp),
+            }),
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
+        };
+
+        let profile = native_profile_from_config(&cfg).unwrap();
+        let probe = profile.fake_probe.unwrap();
+        assert_eq!(probe.fooling, Some(FakeProbeStrategy::BadTimestamp));
+        assert_eq!(probe.fake_sni.as_deref(), Some("google.com"));
+    }
 }

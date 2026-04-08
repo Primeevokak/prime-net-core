@@ -31,6 +31,10 @@ struct WindowsProxyBackup {
     connection_settings: Option<Vec<u8>>,
 }
 
+/// Windows system proxy manager using the WinInet registry settings.
+///
+/// Reads and writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
+/// to control the system-wide HTTP/SOCKS proxy, PAC URL, and DNS configuration.
 pub struct WindowsProxyManager;
 
 impl WindowsProxyManager {
@@ -121,6 +125,7 @@ impl WindowsProxyManager {
         }
     }
 
+    /// Return `true` if the current process lacks Administrator privileges.
     pub fn requires_elevation(&self) -> bool {
         Command::new("net")
             .args(["session"])
@@ -129,6 +134,7 @@ impl WindowsProxyManager {
             .unwrap_or(true)
     }
 
+    /// Return `Ok(())` when running elevated, or an error suggesting re-launch.
     pub fn request_elevation(&self) -> Result<()> {
         if self.requires_elevation() {
             return Err(EngineError::Internal(
@@ -138,6 +144,7 @@ impl WindowsProxyManager {
         Ok(())
     }
 
+    /// Flush the WinInet proxy cache and broadcast `WM_SETTINGCHANGE`.
     pub fn refresh_internet_settings(&self) -> Result<()> {
         unsafe {
             let ok_changed = InternetSetOptionW(
@@ -193,6 +200,7 @@ impl WindowsProxyManager {
         Ok(adapters)
     }
 
+    /// Configure a per-adapter proxy via `netsh winhttp set advproxy`.
     pub fn enable_per_adapter(&self, adapter: &str, endpoint: &str) -> Result<()> {
         let _ = self.request_elevation();
         let proxy_value = Self::composite_proxy_server(endpoint);
@@ -218,6 +226,7 @@ impl WindowsProxyManager {
         Ok(())
     }
 
+    /// Write the `ProxyOverride` registry value (semicolon-separated bypass list).
     pub fn set_proxy_bypass(&self, bypass: &str) -> Result<()> {
         let key_w = Self::open_settings_write()?;
         let value = if bypass.trim().is_empty() {
@@ -408,6 +417,7 @@ impl WindowsProxyManager {
     }
 }
 
+/// Look up the owning PID of a TCP connection by its local and remote socket addresses.
 pub fn get_process_id_by_connection(
     local: std::net::SocketAddr,
     remote: std::net::SocketAddr,
@@ -501,6 +511,7 @@ pub fn get_process_id_by_connection(
     None
 }
 
+/// Return the executable filename (e.g. `chrome.exe`) for a given process ID.
 pub fn get_process_name_by_pid(pid: u32) -> Option<String> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Threading::{
