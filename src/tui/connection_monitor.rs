@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use ratatui::prelude::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use tokio::sync::broadcast;
 
 use crate::telemetry::connection_tracker::{
@@ -14,6 +14,7 @@ pub struct ConnectionMonitor {
     rx: broadcast::Receiver<ConnectionInfo>,
     connections: BTreeMap<u64, ConnectionInfo>,
     pub selected_id: Option<u64>,
+    table_state: TableState,
 }
 
 impl ConnectionMonitor {
@@ -25,6 +26,7 @@ impl ConnectionMonitor {
             rx,
             connections: BTreeMap::new(),
             selected_id: None,
+            table_state: TableState::default(),
         }
     }
 
@@ -56,12 +58,19 @@ impl ConnectionMonitor {
                 self.selected_id = self.connections.keys().next().copied();
             }
         }
+        // Keep TableState index in sync with selected_id.
+        let ids: Vec<u64> = self.connections.keys().copied().collect();
+        let idx = self
+            .selected_id
+            .and_then(|id| ids.iter().position(|x| *x == id));
+        self.table_state.select(idx);
     }
 
     pub fn select_next(&mut self) {
         let ids: Vec<u64> = self.connections.keys().copied().collect();
         if ids.is_empty() {
             self.selected_id = None;
+            self.table_state.select(None);
             return;
         }
         let next = match self.selected_id {
@@ -73,12 +82,14 @@ impl ConnectionMonitor {
             None => 0,
         };
         self.selected_id = ids.get(next).copied();
+        self.table_state.select(Some(next));
     }
 
     pub fn select_prev(&mut self) {
         let ids: Vec<u64> = self.connections.keys().copied().collect();
         if ids.is_empty() {
             self.selected_id = None;
+            self.table_state.select(None);
             return;
         }
         let prev = match self.selected_id {
@@ -90,13 +101,14 @@ impl ConnectionMonitor {
             None => 0,
         };
         self.selected_id = ids.get(prev).copied();
+        self.table_state.select(Some(prev));
     }
 
     pub fn selected(&self) -> Option<&ConnectionInfo> {
         self.selected_id.and_then(|id| self.connections.get(&id))
     }
 
-    pub fn render(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+    pub fn render(&mut self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -186,7 +198,7 @@ impl ConnectionMonitor {
                 ))
                 .borders(Borders::ALL),
         );
-        frame.render_widget(table, chunks[0]);
+        frame.render_stateful_widget(table, chunks[0], &mut self.table_state);
 
         let summary = self
             .selected()

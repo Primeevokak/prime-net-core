@@ -513,10 +513,17 @@ pub fn is_bypassable_public_ip(ip: std::net::IpAddr) -> bool {
 }
 
 /// Fast non-cryptographic hash of a string; used for sharding and deduplication.
+///
+/// Uses FNV-1a 64-bit — deterministic across processes and Rust versions.
+/// `DefaultHasher` is intentionally avoided because it uses a random seed.
 pub fn stable_hash(s: &str) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    s.hash(&mut hasher);
-    hasher.finish()
+    // FNV-1a 64-bit constants.
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x00000100000001b3;
+    let mut hash = OFFSET;
+    for byte in s.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }

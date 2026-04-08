@@ -134,7 +134,9 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
                         "profile discovery complete — profiles reordered by effectiveness"
                     );
                     engine.set_profiles(reordered);
-                    cache.save(&cache_path);
+                    let cache_snap = cache.clone();
+                    let save_path = cache_path.clone();
+                    tokio::task::spawn_blocking(move || cache_snap.save(&save_path));
                 }
                 Ok(_) => {
                     info!(target: "socks_cmd", "profile discovery returned no results");

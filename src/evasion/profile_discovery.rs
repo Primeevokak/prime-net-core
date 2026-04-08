@@ -66,7 +66,7 @@ pub struct ProfileWinEntry {
 }
 
 /// Full discovery cache: profile name → win entry.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileDiscoveryCache {
     entries: HashMap<String, ProfileWinEntry>,
 }

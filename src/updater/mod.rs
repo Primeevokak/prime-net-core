@@ -259,18 +259,14 @@ impl AutoUpdater {
         let os = std::env::consts::OS;
         let arch = std::env::consts::ARCH;
         let wanted_bin = self.bin_name.to_ascii_lowercase();
+        // Both OS and arch must match — a name-only match risks installing a
+        // binary built for the wrong platform (e.g. x86_64 on aarch64).
         release
             .assets
             .iter()
             .find(|a| {
                 let n = a.name.to_ascii_lowercase();
                 n.contains(&wanted_bin) && n.contains(os) && n.contains(arch)
-            })
-            .or_else(|| {
-                release
-                    .assets
-                    .iter()
-                    .find(|a| a.name.to_ascii_lowercase().contains(&wanted_bin))
             })
             .map(|a| a.browser_download_url.clone())
     }

@@ -184,8 +184,10 @@ impl LinuxProxyManager {
         first && second
     }
 
-    fn configure_xfce(_endpoint: &str) -> bool {
-        true
+    fn configure_xfce(endpoint: &str) -> bool {
+        // XFCE uses GTK which reads the GNOME gsettings proxy schema, so the
+        // same gsettings commands that work for GNOME apply here.
+        Self::configure_gnome(endpoint)
     }
 
     fn configure_mate(endpoint: &str) -> bool {
@@ -350,10 +352,37 @@ impl ProxyManager for LinuxProxyManager {
     }
 
     fn disable(&self) -> Result<()> {
+        // Reset GNOME/GTK/XFCE proxy via gsettings.
         let _ = Self::run_ok(
             "gsettings",
             &["set", "org.gnome.system.proxy", "mode", "none"],
         );
+        // Reset KDE proxy via kwriteconfig5 (kioslaverc).
+        let _ = Self::run_ok(
+            "kwriteconfig5",
+            &[
+                "--file",
+                "kioslaverc",
+                "--group",
+                "Proxy Settings",
+                "--key",
+                "ProxyType",
+                "0",
+            ],
+        );
+        let _ = Self::run_ok(
+            "kwriteconfig5",
+            &[
+                "--file",
+                "kioslaverc",
+                "--group",
+                "Proxy Settings",
+                "--key",
+                "socksProxy",
+                "",
+            ],
+        );
+        // Remove the environment-variable proxy file.
         let path = Self::env_file();
         if path.exists() {
             let _ = fs::remove_file(path);

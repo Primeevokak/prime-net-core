@@ -76,12 +76,11 @@ pub async fn connect_via_best_route(
     candidates: Vec<RouteCandidate>,
     outbound: DynOutbound,
     relay_opts: &RelayOptions,
-    cfg: &EngineConfig,
+    cfg: Arc<EngineConfig>,
     initial_client_data: Option<Vec<u8>>,
 ) -> Result<ConnectedRoute> {
     let mut winners: JoinSet<Result<RaceTask>> = JoinSet::new();
     let cand_count = candidates.len();
-    let cfg_arc = Arc::new(cfg.clone());
 
     for (idx, cand) in candidates.into_iter().enumerate() {
         let c = cand.clone();
@@ -89,7 +88,7 @@ pub async fn connect_via_best_route(
         let tl = target_label.to_owned();
         let out = outbound.clone();
         let ro = relay_opts.clone();
-        let config = cfg_arc.clone();
+        let config = cfg.clone();
         let icd = initial_client_data.clone();
 
         winners.spawn(async move {
@@ -396,7 +395,7 @@ pub async fn handle_socks5_request_with_target(
         candidates,
         outbound,
         &relay_opts,
-        &cfg,
+        cfg.clone(),
         icd,
     )
     .await;
@@ -423,7 +422,7 @@ pub async fn handle_socks5_request_with_target(
                 retry_cands,
                 outbound_clone,
                 &relay_opts,
-                &cfg,
+                cfg.clone(),
                 icd_clone,
             )
             .await;

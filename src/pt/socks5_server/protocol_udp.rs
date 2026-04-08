@@ -102,7 +102,10 @@ pub async fn handle_udp_associate(
                                 &mut addr_to_domain,
                             ).await {
                                 Ok(Some(target_addr)) => {
-                                    remote_to_target.insert(target_addr, target_addr);
+                                    // Cap the map to prevent memory growth during long UDP sessions.
+                                    if remote_to_target.len() < 1024 {
+                                        remote_to_target.insert(target_addr, target_addr);
+                                    }
                                 }
                                 Err(e) => {
                                     debug!(conn_id, error = %e, "UDP client->remote relay failed");

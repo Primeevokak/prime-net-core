@@ -28,7 +28,7 @@ pub async fn relay_bidirectional(
         client.flush().await?;
     }
 
-    let (c2u, u2c) = tokio::io::copy_bidirectional(client, upstream).await?;
+    let (c2u, u2c) = copy_half_close(client, upstream).await?;
 
     Ok((c2u + initial_c2u_len, u2c + initial_u2c_len))
 }
@@ -65,7 +65,7 @@ pub async fn relay_bidirectional_with_first_byte_timeout(
             Ok(Ok(n)) => {
                 client.write_all(&buf[..n]).await?;
                 client.flush().await?;
-                let (c2u, u2c) = tokio::io::copy_bidirectional(client, upstream).await?;
+                let (c2u, u2c) = copy_half_close(client, upstream).await?;
                 return Ok((c2u + initial_c2u_len, u2c + n as u64));
             }
             Ok(Err(e)) => return Err(e),
@@ -78,8 +78,87 @@ pub async fn relay_bidirectional_with_first_byte_timeout(
         }
     }
 
-    let (c2u, u2c) = tokio::io::copy_bidirectional(client, upstream).await?;
+    let (c2u, u2c) = copy_half_close(client, upstream).await?;
     Ok((c2u + initial_c2u_len, u2c + initial_u2c_len))
+}
+
+/// Half-close-aware bidirectional relay.
+///
+/// Unlike `tokio::io::copy_bidirectional`, correctly propagates TCP/TLS half-close
+/// (RFC 5246 `close_notify`): when one peer closes its write, the other peer's write
+/// is shut down while reading continues until both directions reach EOF.
+async fn copy_half_close(
+    client: &mut TcpStream,
+    upstream: &mut BoxStream,
+) -> std::io::Result<(u64, u64)> {
+    let mut c2u_buf = vec![0u8; 16 * 1024];
+    let mut u2c_buf = vec![0u8; 16 * 1024];
+    let mut c2u_total: u64 = 0;
+    let mut u2c_total: u64 = 0;
+    let mut c2u_done = false;
+    let mut u2c_done = false;
+
+    loop {
+        match (c2u_done, u2c_done) {
+            (true, true) => break,
+
+            // Both directions still open — race them.
+            (false, false) => {
+                tokio::select! {
+                    res = client.read(&mut c2u_buf) => {
+                        match res? {
+                            0 => {
+                                c2u_done = true;
+                                let _ = upstream.shutdown().await;
+                            }
+                            n => {
+                                upstream.write_all(&c2u_buf[..n]).await?;
+                                c2u_total += n as u64;
+                            }
+                        }
+                    }
+                    res = upstream.read(&mut u2c_buf) => {
+                        match res? {
+                            0 => {
+                                u2c_done = true;
+                                let _ = client.shutdown().await;
+                            }
+                            n => {
+                                client.write_all(&u2c_buf[..n]).await?;
+                                u2c_total += n as u64;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Client closed its write — drain upstream → client.
+            (true, false) => match upstream.read(&mut u2c_buf).await? {
+                0 => {
+                    u2c_done = true;
+                    let _ = client.shutdown().await;
+                }
+                n => {
+                    client.write_all(&u2c_buf[..n]).await?;
+                    u2c_total += n as u64;
+                }
+            },
+
+            // Upstream closed its write — drain client → upstream.
+            (false, true) => match client.read(&mut c2u_buf).await? {
+                0 => {
+                    c2u_done = true;
+                    let _ = upstream.shutdown().await;
+                }
+                n => {
+                    upstream.write_all(&c2u_buf[..n]).await?;
+                    c2u_total += n as u64;
+                }
+            },
+        }
+    }
+
+    Ok((c2u_total, u2c_total))
 }
 
 pub fn is_tls_client_hello(data: &[u8]) -> bool {

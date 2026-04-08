@@ -111,13 +111,18 @@ impl Default for PrivacyDashboard {
     }
 }
 
+/// Cycle through referer modes in order: disabled → Strip → OriginOnly → PassThrough → disabled.
 pub fn cycle_referer_mode(cfg: &mut EngineConfig) {
-    cfg.privacy.referer.enabled = true;
-    cfg.privacy.referer.mode = match cfg.privacy.referer.mode {
-        RefererMode::Strip => RefererMode::OriginOnly,
-        RefererMode::OriginOnly => RefererMode::PassThrough,
-        RefererMode::PassThrough => RefererMode::Strip,
-    };
+    if cfg.privacy.referer.enabled {
+        match cfg.privacy.referer.mode {
+            RefererMode::Strip => cfg.privacy.referer.mode = RefererMode::OriginOnly,
+            RefererMode::OriginOnly => cfg.privacy.referer.mode = RefererMode::PassThrough,
+            RefererMode::PassThrough => cfg.privacy.referer.enabled = false,
+        }
+    } else {
+        cfg.privacy.referer.enabled = true;
+        cfg.privacy.referer.mode = RefererMode::Strip;
+    }
 }
 
 fn on_off(v: bool) -> &'static str {

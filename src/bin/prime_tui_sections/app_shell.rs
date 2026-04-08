@@ -105,6 +105,7 @@ pub(crate) struct App {
     proxy_managed_by_tui: bool,
     core_start_pending: Option<(String, Instant)>,
     network_mode: NetworkMode,
+    pending_diag_task: Option<tokio::sync::oneshot::Receiver<Vec<DiagnosticResult>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +130,60 @@ struct PacketBypassUnsafeConfirmPrompt {
 #[derive(Debug, Clone)]
 enum CoreUiEvent {
     PacketBypassIntegrityCheckFailed { source_url: Option<String> },
+}
+
+/// Run all proxy diagnostics checks and return results.
+///
+/// Designed to run inside a `tokio::spawn` task so the TUI event loop is never blocked.
+/// The PAC liveness check can take 20–120 seconds on some networks; running it in the
+/// background prevents the TUI from freezing during that window.
+async fn run_diagnostics(
+    endpoint: String,
+    packet_bypass_enabled: bool,
+    pt_is_none: bool,
+    pac_url: Option<String>,
+    core_running: bool,
+) -> Vec<DiagnosticResult> {
+    let mut out = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+
+        if pt_is_none {
+            if packet_bypass_enabled {
+                out.push(DiagnosticResult::info(
+                    "Активен обход через Packet Bypass (ciadpi)",
+                    "Движок использует внешний бэкенд для десинхронизации пакетов",
+                ));
+            } else {
+                out.push(DiagnosticResult::warn(
+                    "Транспорт обхода отключен (шаблон PT = direct)",
+                    "Установите шаблон trojan/shadowsocks в Конфиг -> Системный прокси",
+                ));
+            }
+        }
+
+        if let Ok(status) = system_proxy_manager().status() {
+            if status.enabled || core_running {
+                out.push(ProxyDiagnostics::check_socks5_listening(&endpoint));
+            } else {
+                out.push(DiagnosticResult::info(
+                    "SOCKS5-сервер остановлен",
+                    "Нажмите [a], чтобы запустить ядро и включить прокси",
+                ));
+            }
+            out.push(ProxyDiagnostics::check_system_proxy_config());
+        } else if let Ok(mut fallback) = ProxyDiagnostics::run_sync_basic(&endpoint) {
+            out.append(&mut fallback);
+        }
+        out
+    })
+    .await
+    .unwrap_or_default();
+
+    if let Some(url) = pac_url {
+        out.push(ProxyDiagnostics::check_pac_server(&url).await);
+    }
+
+    out
 }
 
 impl App {
@@ -168,10 +223,17 @@ impl App {
             proxy_managed_by_tui: false,
             core_start_pending: None,
             network_mode: NetworkMode::Proxy,
+            pending_diag_task: None,
         }
     }
 
-    async fn refresh_proxy_diagnostics(&mut self) {
+    /// Spawn a background task that runs proxy diagnostics without blocking the TUI event loop.
+    ///
+    /// Results arrive via `pending_diag_rx`. If a task is already in flight, this is a no-op.
+    fn spawn_diag_refresh(&mut self) {
+        if self.pending_diag_task.is_some() {
+            return;
+        }
         let endpoint = self.config_editor.config.system_proxy.socks_endpoint.clone();
         let packet_bypass_enabled = self.config_editor.config.evasion.packet_bypass_enabled;
         let pt_is_none = self.config_editor.config.pt.is_none();
@@ -181,49 +243,40 @@ impl App {
             .as_mut()
             .map(|c| c.try_wait().ok().flatten().is_none())
             .unwrap_or(false);
-
-        let diag_task = tokio::task::spawn_blocking(move || {
-            let mut out = Vec::new();
-            
-            if pt_is_none {
-                if packet_bypass_enabled {
-                    out.push(DiagnosticResult::info(
-                        "Активен обход через Packet Bypass (ciadpi)",
-                        "Движок использует внешний бэкенд для десинхронизации пакетов",
-                    ));
-                } else {
-                    out.push(DiagnosticResult::warn(
-                        "Транспорт обхода отключен (шаблон PT = direct)",
-                        "Установите шаблон trojan/shadowsocks в Конфиг -> Системный прокси",
-                    ));
-                }
-            }
-
-            if let Ok(status) = system_proxy_manager().status() {
-                if status.enabled || core_running {
-                    out.push(ProxyDiagnostics::check_socks5_listening(&endpoint));
-                } else {
-                    out.push(DiagnosticResult::info(
-                        "SOCKS5-сервер остановлен",
-                        "Нажмите [a], чтобы запустить ядро и включить прокси",
-                    ));
-                }
-                out.push(ProxyDiagnostics::check_system_proxy_config());
-            } else if let Ok(mut fallback) = ProxyDiagnostics::run_sync_basic(&endpoint) {
-                out.append(&mut fallback);
-            }
-            out
+        let (tx, rx) = tokio::sync::oneshot::channel::<Vec<DiagnosticResult>>();
+        tokio::spawn(async move {
+            let results =
+                run_diagnostics(endpoint, packet_bypass_enabled, pt_is_none, pac_url, core_running)
+                    .await;
+            let _ = tx.send(results);
         });
+        self.pending_diag_task = Some(rx);
+    }
 
-        let mut diagnostics = diag_task.await.unwrap_or_default();
-        
-        // PAC check is already async, keep it as is but after the blocking part
-        if let Some(url) = pac_url {
-            diagnostics.push(ProxyDiagnostics::check_pac_server(&url).await);
+    /// Non-blocking poll: apply diagnostics results if the background task has finished.
+    fn poll_diag_task(&mut self) {
+        if let Some(rx) = self.pending_diag_task.as_mut() {
+            match rx.try_recv() {
+                Ok(results) => {
+                    self.diagnostics = results;
+                    self.last_diag_refresh = Instant::now();
+                    self.pending_diag_task = None;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    self.pending_diag_task = None;
+                }
+            }
         }
+    }
 
-        self.diagnostics = diagnostics;
-        self.last_diag_refresh = Instant::now();
+    /// Run diagnostics to completion — used at startup before the event loop begins.
+    async fn refresh_proxy_diagnostics(&mut self) {
+        self.spawn_diag_refresh();
+        if let Some(rx) = self.pending_diag_task.take() {
+            self.diagnostics = rx.await.unwrap_or_default();
+            self.last_diag_refresh = Instant::now();
+        }
     }
 
     fn apply_log_level_filter(&mut self) {
@@ -339,6 +392,9 @@ async fn run_app(
                 if let Ok(Some(_)) = child.try_wait() {
                     app.core_process = None;
                     app.core_event_rx = None;
+                    if app.proxy_managed_by_tui {
+                        let _ = system_proxy_manager().disable();
+                    }
                     app.proxy_managed_by_tui = false;
                     app.status_line = "Ядро завершилось неожиданно".to_owned();
                 }
@@ -350,8 +406,11 @@ async fn run_app(
             app.log_viewer.jump_to_bottom();
             app.log_selected_line = app.log_viewer.selected_line();
         }
-        if app.last_diag_refresh.elapsed() >= Duration::from_secs(10) {
-            app.refresh_proxy_diagnostics().await;
+        app.poll_diag_task();
+        if app.pending_diag_task.is_none()
+            && app.last_diag_refresh.elapsed() >= Duration::from_secs(10)
+        {
+            app.spawn_diag_refresh();
         }
 
         terminal.draw(|f| render(f, app)).map_err(EngineError::Io)?;
@@ -739,6 +798,14 @@ fn render_proxy(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// Save config after a privacy toggle, updating the status line on error.
+fn save_privacy_config(app: &mut App) -> Result<()> {
+    app.config_editor.save_to_file(&app.config_path).map_err(|e| {
+        app.status_line = format!("Ошибка сохранения: {e}");
+        e
+    })
+}
+
 async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     if let Some(confirm) = app.packet_bypass_unsafe_confirm_prompt.clone() {
         match key.code {
@@ -913,7 +980,10 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                 app.status_line = "Конфигурация перезагружена".to_owned();
             }
             ConfigAction::SaveRequested => {}
-            ConfigAction::Back | ConfigAction::None => {}
+            ConfigAction::Back => {
+                app.tab = Tab::Proxy;
+            }
+            ConfigAction::None => {}
         },
         Tab::Monitor => match key.code {
             KeyCode::Up => app.conn_monitor.select_prev(),
@@ -924,26 +994,32 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         Tab::Privacy => match key.code {
             KeyCode::Char('v') => {
                 cycle_referer_mode(&mut app.config_editor.config);
-                app.status_line = format!(
-                    "Режим Referer: {:?}",
-                    app.config_editor.config.privacy.referer.mode
-                );
+                let label = if app.config_editor.config.privacy.referer.enabled {
+                    format!("{:?}", app.config_editor.config.privacy.referer.mode)
+                } else {
+                    "выкл".to_owned()
+                };
+                app.status_line = format!("Режим Referer: {label}");
+                save_privacy_config(app)?;
             }
             KeyCode::Char('b') => {
                 let v = &mut app.config_editor.config.privacy.tracker_blocker.enabled;
                 *v = !*v;
                 app.status_line =
                     format!("Блокировщик трекеров: {}", if *v { "вкл" } else { "выкл" });
+                save_privacy_config(app)?;
             }
             KeyCode::Char('n') => {
                 let v = &mut app.config_editor.config.privacy.signals.send_dnt;
                 *v = !*v;
                 app.status_line = format!("DNT: {}", if *v { "вкл" } else { "выкл" });
+                save_privacy_config(app)?;
             }
             KeyCode::Char('g') => {
                 let v = &mut app.config_editor.config.privacy.signals.send_gpc;
                 *v = !*v;
                 app.status_line = format!("GPC: {}", if *v { "вкл" } else { "выкл" });
+                save_privacy_config(app)?;
             }
             _ => {}
         },
@@ -955,8 +1031,9 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         Tab::Logs => handle_logs_key(app, key)?,
         Tab::Proxy => match key.code {
             KeyCode::Char('u') => {
-                app.refresh_proxy_diagnostics().await;
-                app.status_line = "Диагностика обновлена".to_owned();
+                app.pending_diag_task = None;
+                app.spawn_diag_refresh();
+                app.status_line = "Диагностика обновляется...".to_owned();
             }
             KeyCode::Char('d') => {
                 app.classifier_cache_clear_prompt =
@@ -974,7 +1051,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                     deactivate_tun(app)?;
                 } else {
                     deactivate_core(app)?;
-                    app.refresh_proxy_diagnostics().await;
+                    app.pending_diag_task = None;
+                    app.spawn_diag_refresh();
                 }
             }
             KeyCode::Char('v') => {
@@ -982,7 +1060,8 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                     NetworkMode::Proxy => activate_tun(app)?,
                     NetworkMode::Vpn   => {
                         deactivate_tun(app)?;
-                        app.refresh_proxy_diagnostics().await;
+                        app.pending_diag_task = None;
+                        app.spawn_diag_refresh();
                     }
                 }
             }
