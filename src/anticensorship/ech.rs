@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use crate::anticensorship::resolver_chain::ResolverChain;
 use crate::error::{EngineError, Result};
 
 #[cfg(feature = "hickory-dns")]
@@ -20,6 +22,10 @@ pub struct EchConfig {
 pub struct EchManager {
     pub enabled: bool,
     pub config_cache: HashMap<String, EchConfig>,
+    /// When set, ECH config discovery uses this chain (DoH/DoT/DoQ) instead of
+    /// the system resolver, which may return NXDOMAIN for HTTPS RRs on censored
+    /// networks.
+    pub resolver: Option<Arc<ResolverChain>>,
 }
 
 impl EchManager {
@@ -27,7 +33,19 @@ impl EchManager {
         Self {
             enabled,
             config_cache: HashMap::new(),
+            resolver: None,
         }
+    }
+
+    /// Attach a resolver chain so ECH discovery bypasses censored system DNS.
+    pub fn with_resolver(mut self, resolver: Arc<ResolverChain>) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    /// Attach a resolver chain so ECH discovery bypasses censored system DNS.
+    pub fn set_resolver(&mut self, resolver: Arc<ResolverChain>) {
+        self.resolver = Some(resolver);
     }
 
     pub async fn refresh_domain_config(&mut self, domain: &str) -> Result<()> {
@@ -35,17 +53,46 @@ impl EchManager {
             return Ok(());
         }
 
+        let domain = domain.trim().to_ascii_lowercase();
+        if domain.is_empty() {
+            return Err(EngineError::InvalidInput("domain is empty".to_owned()));
+        }
+
+        // Fast path: use the anti-censorship resolver chain when available.
+        // This works on networks where system DNS blocks HTTPS RR lookups.
+        if let Some(chain) = &self.resolver {
+            let chain = chain.clone();
+            match chain.lookup_ech_config_list(&domain).await {
+                Ok(Some(config_list)) => {
+                    // ResolverChain does not return target_name, so we use the
+                    // queried domain as the ECH outer SNI public_name.
+                    self.config_cache.insert(
+                        domain.clone(),
+                        EchConfig {
+                            public_name: domain.clone(),
+                            config_list,
+                            max_name_length: domain.len(),
+                        },
+                    );
+                    return Ok(());
+                }
+                Ok(None) => {
+                    self.config_cache.remove(&domain);
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        domain = %domain,
+                        "ResolverChain ECH lookup failed; falling back to system DNS"
+                    );
+                    // Fall through to system DNS path below.
+                }
+            }
+        }
+
         #[cfg(feature = "hickory-dns")]
         {
-            let domain = domain.trim().to_ascii_lowercase();
-            if domain.is_empty() {
-                return Err(EngineError::InvalidInput("domain is empty".to_owned()));
-            }
-
-            // TODO: pass a ResolverChain reference here instead of using the system DNS.
-            // On censored networks the system DNS returns NXDOMAIN for HTTPS RR lookups,
-            // so ECH config discovery silently fails.  The ResolverChain (DoH/DoT/DoQ) must
-            // be threaded through to this call site before ECH can work on blocked networks.
             let resolver = TokioResolver::builder_tokio()
                 .map_err(|e| EngineError::Internal(format!("system resolver build failed: {e}")))?
                 .build();
@@ -63,8 +110,6 @@ impl EchManager {
             for r in lookup.iter() {
                 let RData::HTTPS(https) = r else { continue };
 
-                // For ServiceMode records, svc_priority is > 0; we still accept 0 as "some record"
-                // but keep the selection logic simple.
                 let prio = https.svc_priority();
                 for (_, v) in https.svc_params() {
                     if let SvcParamValue::EchConfigList(ech) = v {
@@ -93,7 +138,6 @@ impl EchManager {
                     },
                 );
             } else {
-                // No ECH published for this domain; clear any stale entry.
                 self.config_cache.remove(&domain);
             }
 

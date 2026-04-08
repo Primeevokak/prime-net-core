@@ -396,9 +396,12 @@ impl ResolverChain {
                 continue;
             }
 
-            let mut provider_bootstrap_ips = self.cfg.bootstrap_ips.clone();
+            // Always prefer provider-specific well-known IPs to avoid cross-provider
+            // IP/TLS-name mismatches (e.g. using Google's IP with Cloudflare's TLS name).
+            // Only fall back to the global bootstrap_ips list for unknown providers.
+            let mut provider_bootstrap_ips = known_doh_provider_bootstrap_ips(&host);
             if provider_bootstrap_ips.is_empty() {
-                provider_bootstrap_ips.extend(known_doh_provider_bootstrap_ips(&host));
+                provider_bootstrap_ips = self.cfg.bootstrap_ips.clone();
             }
             if provider_bootstrap_ips.is_empty() {
                 if let Ok(ip) = host.parse::<IpAddr>() {
@@ -454,7 +457,10 @@ impl ResolverChain {
 
         let mut group = NameServerConfigGroup::new();
         let opts = self.base_opts();
-        let sni = if self.cfg.dot_sni.trim().is_empty() {
+        // A non-empty dot_sni acts as a global override for all servers.
+        // When empty (the common case), each server gets its correct SNI auto-detected
+        // from the IP so that TLS certificate validation succeeds.
+        let sni_override = if self.cfg.dot_sni.trim().is_empty() {
             None
         } else {
             Some(self.cfg.dot_sni.clone())
@@ -463,7 +469,9 @@ impl ResolverChain {
         for server in &self.cfg.dot_servers {
             let sa = parse_socket_addr(server, 853)?;
             let mut ns = NameServerConfig::new(sa, Protocol::Tls);
-            ns.tls_dns_name = sni.clone();
+            ns.tls_dns_name = sni_override
+                .clone()
+                .or_else(|| dot_sni_for_ip(sa.ip()));
             group.push(ns);
         }
         if group.is_empty() {
@@ -698,6 +706,26 @@ fn doh_host_for_provider(provider: &str) -> String {
         "mullvad" | "mullvaddns" | "mullvad-dns" | "mullvad_dns" => "doh.mullvad.net".to_owned(),
         "opendns" | "opendns-family" | "opendns_family" => "doh.opendns.com".to_owned(),
         _ => v.to_owned(),
+    }
+}
+
+/// Return the correct TLS SNI for well-known DoT/DoQ server IPs.
+///
+/// Used when `dot_sni` / `doq_sni` are empty so each server gets its own
+/// correct SNI rather than sharing one global override.
+#[cfg(feature = "hickory-dns")]
+fn dot_sni_for_ip(ip: std::net::IpAddr) -> Option<String> {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => match v4.octets() {
+            [8, 8, 8, 8] | [8, 8, 4, 4] => Some("dns.google".to_owned()),
+            [1, 1, 1, 1] | [1, 0, 0, 1] => Some("cloudflare-dns.com".to_owned()),
+            [9, 9, 9, 9] | [149, 112, 112, 112] => Some("dns.quad9.net".to_owned()),
+            [94, 140, 14, 14] | [94, 140, 15, 15] => Some("dns.adguard-dns.com".to_owned()),
+            [185, 228, 168, 9] | [185, 228, 169, 9] => Some("security-filter-dns.cleanbrowsing.org".to_owned()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

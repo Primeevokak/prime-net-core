@@ -106,6 +106,8 @@ pub(crate) struct App {
     core_start_pending: Option<(String, Instant)>,
     network_mode: NetworkMode,
     pending_diag_task: Option<tokio::sync::oneshot::Receiver<Vec<DiagnosticResult>>>,
+    /// Set when the user presses `r` once — a second `r` confirms the reload.
+    reload_confirm_pending: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +226,7 @@ impl App {
             core_start_pending: None,
             network_mode: NetworkMode::Proxy,
             pending_diag_task: None,
+            reload_confirm_pending: false,
         }
     }
 
@@ -316,7 +319,8 @@ impl Drop for App {
         }
         self.core_start_pending = None;
         if self.network_mode == NetworkMode::Vpn {
-            remove_tun_routes(TUN_NAME, TUN_ADDR);
+            let socks_ep = self.config_editor.config.system_proxy.socks_endpoint.clone();
+            remove_tun_routes(TUN_NAME, TUN_ADDR, &socks_ep);
         }
         if self.proxy_managed_by_tui {
             let _ = system_proxy_manager().disable();
@@ -976,14 +980,25 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                 app.status_line = format!("Сохранено {}", app.config_path.display());
             }
             ConfigAction::Reloaded => {
-                app.config_editor.reload_from_file(&app.config_path)?;
-                app.status_line = "Конфигурация перезагружена".to_owned();
+                if app.reload_confirm_pending {
+                    app.config_editor.reload_from_file(&app.config_path)?;
+                    app.status_line = "Конфигурация перезагружена (несохранённые изменения сброшены)".to_owned();
+                    app.reload_confirm_pending = false;
+                } else {
+                    app.reload_confirm_pending = true;
+                    app.status_line =
+                        "[r] ещё раз — сбросить изменения, любая другая клавиша — отмена"
+                            .to_owned();
+                }
             }
             ConfigAction::SaveRequested => {}
             ConfigAction::Back => {
+                app.reload_confirm_pending = false;
                 app.tab = Tab::Proxy;
             }
-            ConfigAction::None => {}
+            ConfigAction::None => {
+                app.reload_confirm_pending = false;
+            }
         },
         Tab::Monitor => match key.code {
             KeyCode::Up => app.conn_monitor.select_prev(),

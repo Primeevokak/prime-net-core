@@ -6,7 +6,92 @@ const TUN_PREFIX: &str = "16";
 
 // ─── TUN route management ─────────────────────────────────────────────────
 
-fn apply_tun_routes(_tun_name: &str, tun_addr: &str) {
+/// Detect the current default IPv4 gateway by parsing OS routing commands.
+fn detect_default_gateway() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let out = Command::new("route").args(["print", "0.0.0.0"]).output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() >= 3 && cols[0] == "0.0.0.0" && cols[1] == "0.0.0.0" {
+                return Some(cols[2].to_owned());
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let out = Command::new("ip").args(["route", "show", "default"]).output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let mut it = line.split_whitespace();
+            while let Some(tok) = it.next() {
+                if tok == "via" {
+                    return it.next().map(|s| s.to_owned());
+                }
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = Command::new("netstat").args(["-rn", "-f", "inet"]).output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.first().map_or(false, |c| *c == "default") && cols.len() >= 2 {
+                return Some(cols[1].to_owned());
+            }
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Extract the host IP from a `host:port` endpoint string.
+/// Returns `None` if the host is loopback, `0.0.0.0`, or cannot be parsed as IPv4.
+fn socks_exclude_host(endpoint: &str) -> Option<String> {
+    let host = endpoint.rsplit_once(':').map(|x| x.0).unwrap_or(endpoint).trim();
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let ip: std::net::Ipv4Addr = host.parse().ok()?;
+    if ip.is_loopback() || ip.is_unspecified() {
+        return None;
+    }
+    Some(ip.to_string())
+}
+
+fn apply_tun_routes(_tun_name: &str, tun_addr: &str, socks_endpoint: &str) {
+    // If the SOCKS5 endpoint is a non-loopback IP, add a host route via the original
+    // gateway so the TUN relay task can reach the SOCKS5 server without looping.
+    if let (Some(host), Some(gw)) =
+        (socks_exclude_host(socks_endpoint), detect_default_gateway())
+    {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = Command::new("route")
+                .args(["add", &host, "mask", "255.255.255.255", &gw])
+                .status();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = Command::new("ip")
+                .args(["route", "add", &format!("{host}/32"), "via", &gw])
+                .status();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = Command::new("route").args(["add", "-host", &host, &gw]).status();
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (&host, &gw);
+        }
+    }
+
     #[cfg(target_os = "windows")]
     {
         let _ = Command::new("route")
@@ -38,7 +123,7 @@ fn apply_tun_routes(_tun_name: &str, tun_addr: &str) {
     let _ = tun_addr;
 }
 
-fn remove_tun_routes(_tun_name: &str, _tun_addr: &str) {
+fn remove_tun_routes(_tun_name: &str, _tun_addr: &str, socks_endpoint: &str) {
     #[cfg(target_os = "windows")]
     {
         let _ = Command::new("route").args(["delete", "0.0.0.0", "mask", "128.0.0.0"]).status();
@@ -57,6 +142,29 @@ fn remove_tun_routes(_tun_name: &str, _tun_addr: &str) {
     {
         let _ = Command::new("route").args(["delete", "-net", "0.0.0.0/1"]).status();
         let _ = Command::new("route").args(["delete", "-net", "128.0.0.0/1"]).status();
+    }
+    // Remove host exclusion route if one was added for a non-loopback SOCKS5 endpoint.
+    if let Some(host) = socks_exclude_host(socks_endpoint) {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = Command::new("route")
+                .args(["delete", &host, "mask", "255.255.255.255"])
+                .status();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = Command::new("ip")
+                .args(["route", "del", &format!("{host}/32")])
+                .status();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = Command::new("route").args(["delete", "-host", &host]).status();
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+        {
+            let _ = &host;
+        }
     }
 }
 
@@ -127,7 +235,8 @@ fn activate_tun(app: &mut App) -> Result<()> {
 }
 
 fn deactivate_tun(app: &mut App) -> Result<()> {
-    remove_tun_routes(TUN_NAME, TUN_ADDR);
+    let socks_ep = app.config_editor.config.system_proxy.socks_endpoint.clone();
+    remove_tun_routes(TUN_NAME, TUN_ADDR, &socks_ep);
     if let Some(mut child) = app.core_process.take() {
         let _ = child.kill();
         let _ = child.wait();
@@ -392,7 +501,7 @@ fn poll_core_startup(app: &mut App) -> Result<()> {
     if matches!(socks_check.level, DiagnosticLevel::Ok) {
         app.core_start_pending = None;
         if app.network_mode == NetworkMode::Vpn {
-            apply_tun_routes(TUN_NAME, TUN_ADDR);
+            apply_tun_routes(TUN_NAME, TUN_ADDR, &endpoint);
             app.status_line = format!("TUN/VPN запущен ({TUN_NAME} {TUN_ADDR}), маршруты применены");
         } else {
             system_proxy_manager().enable(&endpoint)?;

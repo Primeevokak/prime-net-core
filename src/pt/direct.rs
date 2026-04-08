@@ -20,6 +20,12 @@ pub struct DirectOutbound {
     resolver: Arc<ResolverChain>,
     first_packet_ttl: u8,
     upstream_socks5: Option<SocketAddr>,
+    /// When set, outgoing TCP sockets are bound to this local IP before connecting.
+    ///
+    /// Used in TUN mode to prevent outgoing relay connections from being re-captured
+    /// by TUN routes: binding to the physical NIC IP forces the OS to route the
+    /// socket through the physical interface, bypassing TUN routing rules.
+    bypass_bind_ip: Option<std::net::IpAddr>,
 }
 
 impl DirectOutbound {
@@ -32,6 +38,7 @@ impl DirectOutbound {
             resolver,
             first_packet_ttl: 0,
             upstream_socks5: None,
+            bypass_bind_ip: None,
         }
     }
 
@@ -42,6 +49,12 @@ impl DirectOutbound {
 
     pub fn with_upstream_socks5(mut self, upstream: Option<SocketAddr>) -> Self {
         self.upstream_socks5 = upstream;
+        self
+    }
+
+    /// Bind outgoing sockets to this local IP to bypass TUN routing in VPN mode.
+    pub fn with_bypass_bind_ip(mut self, ip: Option<std::net::IpAddr>) -> Self {
+        self.bypass_bind_ip = ip;
         self
     }
 
@@ -111,8 +124,22 @@ impl DirectOutbound {
                 "native connect target is unspecified/sinkhole IP: {addr}"
             )));
         }
-        let connect = tokio::time::timeout(Self::CONNECT_TIMEOUT, TcpStream::connect(addr)).await;
-        let tcp = match connect {
+        let connect_fut = async {
+            if let Some(local_ip) = self.bypass_bind_ip {
+                // Bind to the physical NIC IP so the OS routes this socket through
+                // the real interface, not the TUN device (prevents VPN routing loop).
+                let socket = if addr.is_ipv4() {
+                    tokio::net::TcpSocket::new_v4()?
+                } else {
+                    tokio::net::TcpSocket::new_v6()?
+                };
+                socket.bind(SocketAddr::new(local_ip, 0))?;
+                socket.connect(addr).await
+            } else {
+                TcpStream::connect(addr).await
+            }
+        };
+        let tcp = match tokio::time::timeout(Self::CONNECT_TIMEOUT, connect_fut).await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => {
@@ -304,7 +331,20 @@ impl DirectOutbound {
             )));
         }
         debug!(target: "outbound.direct", destination = %target_label, upstream = %addr, "Direct outbound connect");
-        let connect = tokio::time::timeout(Self::CONNECT_TIMEOUT, TcpStream::connect(addr)).await;
+        let connect_fut = async {
+            if let Some(local_ip) = self.bypass_bind_ip {
+                let socket = if addr.is_ipv4() {
+                    tokio::net::TcpSocket::new_v4()?
+                } else {
+                    tokio::net::TcpSocket::new_v6()?
+                };
+                socket.bind(SocketAddr::new(local_ip, 0))?;
+                socket.connect(addr).await
+            } else {
+                TcpStream::connect(addr).await
+            }
+        };
+        let connect = tokio::time::timeout(Self::CONNECT_TIMEOUT, connect_fut).await;
         let tcp = match connect {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(e.into()),

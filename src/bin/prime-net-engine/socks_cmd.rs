@@ -24,6 +24,9 @@ pub struct SocksOpts {
     pub config_path: Option<std::path::PathBuf>,
     /// If set, a JSON stats snapshot is written to this path every 5 seconds.
     pub stats_file: Option<std::path::PathBuf>,
+    /// When running in TUN/VPN mode, bind outgoing sockets to this local IP so
+    /// they are routed through the physical NIC and not re-captured by TUN routes.
+    pub bypass_bind_ip: Option<std::net::IpAddr>,
 }
 
 struct SystemProxyCleanupGuard {
@@ -78,6 +81,16 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
             Err(e) => {
                 warn!(target: "socks_cmd", error = %e, "failed to start pluggable transport; falling back to internal relay mode");
             }
+        }
+    }
+
+    // Start the built-in MTProto WS proxy for Telegram (if enabled).
+    if cfg.mtproto_ws.enabled {
+        match prime_net_engine_core::pt::mtproto_ws::start_mtproto_ws_proxy(&cfg.mtproto_ws).await {
+            Ok(link) => {
+                info!(target: "socks_cmd", "MTProto WS proxy started. Telegram link: {link}")
+            }
+            Err(e) => warn!(target: "socks_cmd", error = %e, "MTProto WS proxy failed to start"),
         }
     }
 
@@ -157,8 +170,11 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
     }
 
     let resolver = Arc::new(ResolverChain::from_config(&cfg.anticensorship)?);
-    let outbound =
-        Arc::new(DirectOutbound::new(resolver).with_first_packet_ttl(cfg.evasion.first_packet_ttl));
+    let outbound = Arc::new(
+        DirectOutbound::new(resolver)
+            .with_first_packet_ttl(cfg.evasion.first_packet_ttl)
+            .with_bypass_bind_ip(opts.bypass_bind_ip),
+    );
 
     let bind_addr: std::net::SocketAddr = opts
         .bind

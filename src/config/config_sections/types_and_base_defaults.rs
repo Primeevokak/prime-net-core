@@ -32,6 +32,8 @@ pub struct EngineConfig {
     pub tls: TlsConfig,
     #[serde(default)]
     pub routing: RoutingConfig,
+    #[serde(default)]
+    pub mtproto_ws: MtprotoWsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,7 +152,7 @@ impl Default for AntiCensorshipConfig {
             dns_attempts: 2,
             dot_enabled: false,
             dot_servers: vec!["94.140.14.14:853".to_owned()],
-            dot_sni: "dns.adguard-dns.com".to_owned(),
+            dot_sni: String::new(), // auto-detected per server IP via dot_sni_for_ip()
             doq_enabled: false,
             doq_servers: vec!["94.140.14.14:784".to_owned()],
             doq_sni: "dns.adguard-dns.com".to_owned(),
@@ -720,6 +722,42 @@ pub enum FrontingProvider { #[default] Cloudflare, Fastly, GoogleCdn, AzureCdn }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum EvasionStrategy { Fragment, Desync, Auto }
 
+/// Configuration for the built-in MTProto-over-WebSocket proxy for Telegram.
+///
+/// When enabled, the engine listens on `listen_addr` and accepts plain MTProto
+/// obfuscated connections from Telegram Desktop.  Traffic is tunnelled to
+/// `kws{N}.web.telegram.org` (or the CF proxy domain) over WSS, bypassing
+/// ISP-level IP blocks on Telegram's native address ranges.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MtprotoWsConfig {
+    /// Enable the built-in MTProto WebSocket proxy for Telegram.
+    pub enabled: bool,
+    /// Local listen address for Telegram Desktop connections.
+    pub listen_addr: String,
+    /// Proxy secret — 16 random bytes as lowercase hex (32 chars).
+    ///
+    /// Generate with `openssl rand -hex 16`.  An empty string causes the engine
+    /// to auto-generate a random secret on first start (not persisted).
+    pub secret_hex: String,
+    /// Use Cloudflare proxy domain to avoid Telegram IP blocks (recommended).
+    pub cf_proxy_enabled: bool,
+    /// Cloudflare proxy domain — must have `kws{N}.{domain}` DNS records pointing
+    /// to Telegram DCs via CF.
+    pub cf_proxy_domain: String,
+}
+
+impl Default for MtprotoWsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_addr: "127.0.0.1:1443".to_owned(),
+            secret_hex: String::new(),
+            cf_proxy_enabled: true,
+            cf_proxy_domain: "pclead.co.uk".to_owned(),
+        }
+    }
+}
+
 // Helpers
 fn default_prime_mode() -> bool { true }
 fn default_classifier_cache_path() -> String {
@@ -749,7 +787,7 @@ fn default_dns_cache_size() -> usize { 4096 }
 fn default_dns_timeout_secs() -> u64 { 5 }
 fn default_dns_attempts() -> usize { 2 }
 fn default_dns_parallel_racing() -> bool { true }
-fn default_dot_sni() -> String { "dns.adguard-dns.com".to_owned() }
+fn default_dot_sni() -> String { String::new() }
 fn default_doq_sni() -> String { "dns.adguard-dns.com".to_owned() }
 fn default_fronting_probe_ttl_secs() -> u64 { 600 }
 fn default_fronting_probe_timeout_secs() -> u64 { 5 }

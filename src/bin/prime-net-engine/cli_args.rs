@@ -247,7 +247,13 @@ fn parse_socks(args: &[String]) -> Result<SocksOpts> {
         i += 1;
     }
 
-    Ok(SocksOpts { bind, silent_drop })
+    Ok(SocksOpts {
+        bind,
+        silent_drop,
+        config_path: None,
+        stats_file: None,
+        bypass_bind_ip: None,
+    })
 }
 
 fn parse_tui(args: &[String]) -> Result<TuiOpts> {

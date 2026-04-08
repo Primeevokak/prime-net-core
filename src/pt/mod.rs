@@ -8,6 +8,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::error::Result;
 
 pub mod direct;
+pub mod mtproto_ws;
 pub mod shadowsocks;
 pub mod socks5_server;
 pub mod tor_client;

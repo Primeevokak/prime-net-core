@@ -442,6 +442,7 @@ fn parse_socks(args: &[String]) -> Result<SocksOpts> {
         silent_drop,
         config_path: None,
         stats_file,
+        bypass_bind_ip: None,
     })
 }
 

@@ -562,7 +562,22 @@ pub async fn run_tun(cfg: EngineConfig, opts: &TunOpts) -> Result<()> {
     #[cfg(target_os = "windows")]
     ensure_wintun().await?;
 
-    // 1. Start SOCKS5 in background
+    // 1. Start SOCKS5 in background.
+    //    Detect the physical NIC IP before TUN routes are installed so outgoing
+    //    relay sockets can be bound to it, preventing a TUN routing loop where
+    //    outbound SOCKS5 connections get re-captured by the 0/1+128/1 TUN routes.
+    let bypass_bind_ip = crate::auto_route::get_local_ip_for_default_route()
+        .map(std::net::IpAddr::V4)
+        .inspect(|ip| {
+            info!(target: "tun_cmd", %ip, "physical NIC IP detected — relay sockets will bypass TUN");
+        });
+    if bypass_bind_ip.is_none() {
+        warn!(
+            target: "tun_cmd",
+            "could not detect physical NIC IP; TUN routing loop prevention disabled"
+        );
+    }
+
     let socks_cfg = cfg.clone();
     let socks_bind = opts.socks_addr.to_string();
     let stats_file = opts.stats_file.clone();
@@ -572,16 +587,19 @@ pub async fn run_tun(cfg: EngineConfig, opts: &TunOpts) -> Result<()> {
             silent_drop: true,
             config_path: None,
             stats_file,
+            bypass_bind_ip,
         };
         if let Err(e) = crate::socks_cmd::run_socks(socks_cfg, &socks_opts).await {
             error!("TUN background SOCKS5 error: {e}");
         }
     });
-    // Wait until SOCKS5 is actually accepting connections (up to 5 s)
+    // Wait until SOCKS5 is actually accepting connections (up to 20 s).
+    // On first run, profile discovery runs for up to 10 s before SOCKS5 binds,
+    // so the timeout must exceed the discovery window.
     let socks_ready = {
         let addr = opts.socks_addr;
         async move {
-            for _ in 0..50u32 {
+            for _ in 0..200u32 {
                 if tokio::net::TcpStream::connect(addr).await.is_ok() {
                     return true;
                 }
@@ -590,12 +608,12 @@ pub async fn run_tun(cfg: EngineConfig, opts: &TunOpts) -> Result<()> {
             false
         }
     };
-    if !tokio::time::timeout(Duration::from_secs(5), socks_ready)
+    if !tokio::time::timeout(Duration::from_secs(20), socks_ready)
         .await
         .unwrap_or(false)
     {
         return Err(EngineError::Internal(
-            "SOCKS5 did not become ready within 5 s".to_owned(),
+            "SOCKS5 did not become ready within 20 s".to_owned(),
         ));
     }
 

@@ -58,6 +58,20 @@ pub fn get_default_gateway() -> Option<Ipv4Addr> {
     return None;
 }
 
+/// Return the local interface IP that the default route is associated with.
+///
+/// Used to bind outgoing sockets to the physical NIC so they bypass TUN routing.
+pub fn get_local_ip_for_default_route() -> Option<Ipv4Addr> {
+    #[cfg(target_os = "windows")]
+    return local_ip_windows();
+    #[cfg(target_os = "linux")]
+    return local_ip_linux();
+    #[cfg(target_os = "macos")]
+    return local_ip_macos();
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    return None;
+}
+
 #[cfg(target_os = "windows")]
 fn gateway_windows() -> Option<Ipv4Addr> {
     // `route print 0.0.0.0` output contains a line like:
@@ -71,6 +85,24 @@ fn gateway_windows() -> Option<Ipv4Addr> {
         let cols: Vec<&str> = line.split_whitespace().collect();
         if cols.len() >= 3 && cols[0] == "0.0.0.0" && cols[1] == "0.0.0.0" {
             return cols[2].parse().ok();
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn local_ip_windows() -> Option<Ipv4Addr> {
+    // Same output as gateway_windows(); column 4 is the interface (local) IP.
+    //   0.0.0.0  0.0.0.0  192.168.1.1  192.168.1.100  25
+    let out = Command::new("route")
+        .args(["print", "0.0.0.0"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 4 && cols[0] == "0.0.0.0" && cols[1] == "0.0.0.0" {
+            return cols[3].parse().ok();
         }
     }
     None
@@ -97,6 +129,27 @@ fn gateway_linux() -> Option<Ipv4Addr> {
     None
 }
 
+#[cfg(target_os = "linux")]
+fn local_ip_linux() -> Option<Ipv4Addr> {
+    // `ip route get 1.1.1.1` → "1.1.1.1 via 192.168.1.1 dev eth0 src 192.168.1.100 …"
+    let out = Command::new("ip")
+        .args(["route", "get", "1.1.1.1"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        while let Some(tok) = it.next() {
+            if tok == "src" {
+                if let Some(ip) = it.next() {
+                    return ip.parse().ok();
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(target_os = "macos")]
 fn gateway_macos() -> Option<Ipv4Addr> {
     // `netstat -rn -f inet` → "default  192.168.1.1  UGSc  …"
@@ -109,6 +162,25 @@ fn gateway_macos() -> Option<Ipv4Addr> {
         let cols: Vec<&str> = line.split_whitespace().collect();
         if cols.first().map_or(false, |c| *c == "default") && cols.len() >= 2 {
             return cols[1].parse().ok();
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn local_ip_macos() -> Option<Ipv4Addr> {
+    // `route get default` → line containing "interface:" and then a name, then
+    // `ifconfig <iface>` for the inet address.  Simpler: use `route get 1.1.1.1`.
+    //   route to: 1.1.1.1  …  interface: en0  …  if address: 192.168.1.100
+    let out = Command::new("route")
+        .args(["get", "1.1.1.1"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("if address:") {
+            return rest.trim().parse().ok();
         }
     }
     None
