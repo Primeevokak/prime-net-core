@@ -453,6 +453,7 @@ pub fn set_blocklist_domains(bloom: crate::blocklist::DomainBloom) {
 // ── Submodules ────────────────────────────────────────────────────────────────
 
 pub mod classifier_and_persistence;
+pub mod isp_profiler;
 pub mod ml_shadow;
 pub mod protocol_handlers;
 pub mod protocol_socks4;
@@ -461,7 +462,9 @@ pub mod relay_and_io_helpers;
 pub mod route_connection;
 pub mod route_scoring;
 pub mod state_and_startup;
+pub mod telemetry_aggregator;
 pub mod telemetry_bus;
+pub mod thompson_sampling;
 
 pub use state_and_startup::{
     start_socks5_server, RelayOptions, Socks5ServerGuard, WARNED_SOCKS4_LIMITATIONS,

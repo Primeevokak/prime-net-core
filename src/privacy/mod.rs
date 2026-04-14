@@ -1,4 +1,8 @@
+pub mod cname_uncloaking;
+pub mod cookie_policy;
 pub mod dnt;
+pub mod header_normalizer;
+pub mod https_upgrade;
 pub mod referer_policy;
 pub mod tracker_blocker;
 

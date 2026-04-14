@@ -1,6 +1,7 @@
 // Enforce "no unwrap/expect in production code" via clippy, while keeping tests ergonomic.
 #![cfg_attr(all(not(test), clippy), deny(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod adblock;
 pub mod anticensorship;
 pub mod blocklist;
 pub mod config;

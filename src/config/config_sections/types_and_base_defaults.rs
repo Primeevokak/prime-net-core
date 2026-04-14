@@ -5,6 +5,11 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{EngineError, Result};
+use crate::adblock::AdblockConfig;
+use crate::privacy::cname_uncloaking::CnameUncloakingConfig;
+use crate::privacy::cookie_policy::CookiePolicyConfig;
+use crate::privacy::header_normalizer::HeaderNormalizerConfig;
+use crate::privacy::https_upgrade::HttpsUpgradeConfig;
 use crate::tls::TlsConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -34,6 +39,9 @@ pub struct EngineConfig {
     pub routing: RoutingConfig,
     #[serde(default)]
     pub mtproto_ws: MtprotoWsConfig,
+    /// Ad-blocking engine configuration (EasyList/AdGuard filter syntax).
+    #[serde(default)]
+    pub adblock: AdblockConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,6 +237,24 @@ pub enum NativeTechniqueConfig {
     TcpDisorder { delay_ms: u64 },
     /// Inject fake ClientHello with decremented TCP seq (zapret seqovl).
     SeqOverlap { overlap_size: usize },
+    /// Chain of multiple techniques applied sequentially to one connection.
+    Chain { steps: Vec<ChainStepConfig> },
+}
+
+/// A single step in a multi-technique desync chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChainStepConfig {
+    /// Apply a TLS record split.
+    TlsRecordSplit { split_at: SplitAtConfig },
+    /// Apply a TCP segment split.
+    TcpSegmentSplit { split_at: SplitAtConfig },
+    /// Send an OOB (URG) byte at the split point.
+    OobByte,
+    /// Insert a dummy TLS ApplicationData record.
+    TlsPadding,
+    /// Wait N milliseconds between segments.
+    Delay { ms: u64 },
 }
 
 /// Configuration for a low-TTL fake probe sent before the real TCP connection.
@@ -464,14 +490,30 @@ fn default_censored_groups() -> std::collections::HashMap<String, Vec<String>> {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PrivacyConfig {
+    /// DNT / GPC signal injection settings.
     pub signals: PrivacySignalsConfig,
+    /// User-Agent header override settings.
     pub user_agent: UserAgentConfig,
+    /// Referer header stripping / normalization settings.
     pub referer: RefererConfig,
+    /// Domain-level tracker blocking settings.
     pub tracker_blocker: TrackerBlockerConfig,
+    /// IP spoofing header injection settings.
     pub ip_spoof: IpSpoofConfig,
+    /// Referer header override settings.
     pub referer_override: RefererOverrideConfig,
+    /// WebRTC leak prevention settings.
     pub webrtc: WebRtcConfig,
+    /// Geolocation API blocking settings.
     pub location_api: LocationApiConfig,
+    /// HTTP header normalization to reduce fingerprinting surface.
+    pub header_normalizer: HeaderNormalizerConfig,
+    /// Third-party cookie blocking at the proxy level.
+    pub cookie_policy: CookiePolicyConfig,
+    /// Automatic HTTP-to-HTTPS upgrade settings.
+    pub https_upgrade: HttpsUpgradeConfig,
+    /// CNAME-based first-party tracker detection settings.
+    pub cname_uncloaking: CnameUncloakingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

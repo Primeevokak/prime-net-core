@@ -4,7 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use crate::config::EngineConfig;
+use crate::pt::socks5_server::isp_profiler;
+use crate::pt::socks5_server::telemetry_aggregator;
 use crate::pt::socks5_server::telemetry_bus::*;
+use crate::pt::socks5_server::thompson_sampling;
 use crate::pt::socks5_server::*;
 
 pub(super) static NEXT_ROUTE_DECISION_ID: AtomicU64 = AtomicU64::new(1);
@@ -323,6 +326,36 @@ pub fn complete_route_outcome_event_sync(
                 outcome.shadow_reward,
                 now,
             );
+
+            // Feed Thompson Sampling posterior with the same reward.
+            thompson_sampling::thompson_update(
+                &outcome.bucket,
+                &outcome.route_arm,
+                outcome.shadow_reward,
+            );
+
+            // Feed ISP profiler with per-connection metrics.
+            if connect_ok {
+                isp_profiler::record_isp_success(
+                    &outcome.bucket,
+                    &outcome.route_arm,
+                    lifetime_ms,
+                    bytes_u2c,
+                );
+            } else {
+                isp_profiler::record_isp_failure(&outcome.bucket, &outcome.route_arm);
+            }
+
+            // Feed telemetry aggregator.
+            if connect_ok {
+                telemetry_aggregator::record_connection_success(
+                    &outcome.bucket,
+                    lifetime_ms,
+                    bytes_u2c,
+                );
+            } else {
+                telemetry_aggregator::record_connection_failure(&outcome.bucket);
+            }
         }
     }
 }
@@ -367,9 +400,12 @@ pub fn shadow_reward_from_outcome(
     reward
 }
 
-/// Choose the best route arm using UCB1 exploration.
+/// Choose the best route arm using a hybrid UCB1 + Thompson Sampling strategy.
 ///
-/// UCB1 scores: `mean_reward + C * sqrt(ln(total_pulls) / pulls)`.
+/// Primary: UCB1 scores `mean_reward + C * sqrt(ln(total_pulls) / pulls)`.
+/// Secondary: Thompson Sampling provides a probabilistic tiebreaker.
+/// ISP-specific adjustments modify the final score when per-ISP data is available.
+///
 /// Arms with no prior observations get infinite exploration bonus and are
 /// always tried before exploiting known-good arms.
 pub fn shadow_choose_route_arm(
@@ -394,6 +430,9 @@ pub fn shadow_choose_route_arm(
         1.0
     };
 
+    // Get Thompson Sampling's pick as a tiebreaker signal.
+    let thompson_pick = thompson_sampling::thompson_choose_route_arm(bucket, candidates);
+
     let mut best_arm = candidates[0].route_id();
     let mut best_score = f64::NEG_INFINITY;
 
@@ -401,7 +440,7 @@ pub fn shadow_choose_route_arm(
         let arm_id = c.route_id();
         // Arms with no real observations always get infinite priority (UCB1 guarantee).
         let has_real_data = map.contains_key(&format!("{bucket}|{arm_id}"));
-        let score = if !has_real_data {
+        let mut score = if !has_real_data {
             f64::INFINITY
         } else {
             let (pulls, reward_sum) = shadow_effective_stats(bucket, &arm_id, map);
@@ -410,6 +449,16 @@ pub fn shadow_choose_route_arm(
             let exploration = SHADOW_UCB_EXPLORATION_SCALE * (ln_total / pulls_f).sqrt();
             mean_reward + exploration
         };
+
+        // Blend in ISP-specific adjustment (range [-50, +50]).
+        if score.is_finite() {
+            score += isp_profiler::isp_score_adjustment(bucket, &arm_id) as f64;
+        }
+
+        // Thompson tiebreaker: small bonus if Thompson agrees with this arm.
+        if score.is_finite() && arm_id == thompson_pick {
+            score += 5.0;
+        }
 
         if score > best_score {
             best_score = score;
@@ -552,6 +601,16 @@ pub fn prune_ml_state(now: u64) {
     if let Some(arms) = SHADOW_BANDIT_ARMS.get() {
         arms.retain(|_, stats| now.saturating_sub(stats.last_seen_unix) <= ARM_MAX_AGE_SECS);
     }
+
+    // Prune Thompson Sampling state on the same 7-day cadence.
+    thompson_sampling::prune_thompson_state(now, ARM_MAX_AGE_SECS);
+
+    // Prune ISP profiling state on 14-day cadence (ISPs change slowly).
+    const ISP_MAX_AGE_SECS: u64 = 14 * 24 * 3600;
+    isp_profiler::prune_isp_state(now, ISP_MAX_AGE_SECS);
+
+    // Prune telemetry aggregator on 7-day cadence.
+    telemetry_aggregator::prune_aggregator(now, ARM_MAX_AGE_SECS);
 }
 
 pub fn note_phase2_profile_rotation(_d: &str, _cfg: &EngineConfig) {}

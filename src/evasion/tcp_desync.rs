@@ -12,6 +12,16 @@ use crate::config::EvasionConfig;
 use crate::evasion::packet_intercept::PacketInterceptor;
 use crate::evasion::tls_parser::{parse_client_hello, ParsedClientHello};
 
+/// HTTP/2 connection preface bytes (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`).
+///
+/// Used for HTTP/2-aware splitting: when the first outbound data matches this
+/// 24-byte preface, the split point is placed at the SETTINGS frame boundary
+/// (byte 24) rather than at the Host: header.
+const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Length of the HTTP/2 connection preface in bytes.
+const HTTP2_PREFACE_LEN: usize = 24;
+
 /// Where to place the split point within the TLS ClientHello record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitAt {
@@ -25,18 +35,55 @@ pub enum SplitAt {
     MidSni,
 }
 
-/// Where to split an HTTP/1.x request.
+/// Where to split an HTTP request.
+///
+/// Now handles both HTTP/1.x and HTTP/2: when the data starts with the HTTP/2
+/// connection preface, the `BeforeHostHeader` variant splits at the SETTINGS
+/// frame boundary (byte 24) instead of scanning for the `Host:` header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpSplitAt {
     /// Split right before the `Host:` header line (second segment starts with `Host:`).
+    ///
+    /// For HTTP/2 data (detected by the 24-byte connection preface), splits at
+    /// the SETTINGS frame boundary after the preface instead.
     BeforeHostHeader,
     /// Split at a fixed byte offset within the request.
     Fixed(usize),
 }
 
+/// A single step in a multi-technique chain.
+///
+/// Chain steps are applied sequentially to the same data buffer.  Each step
+/// either splits, injects, or delays — enabling compound strategies that
+/// defeat stateful DPI adapting to single techniques.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainStep {
+    /// Apply a TLS record split at the given point.
+    ///
+    /// Rewrites the TLS record into two separate records, sends the first part,
+    /// and continues with the remainder.
+    TlsRecordSplit { at: SplitAt },
+    /// Apply a TCP segment split (flush between the two halves).
+    TcpSegmentSplit { at: SplitAt },
+    /// Insert an OOB byte at the current point in the stream.
+    ///
+    /// Uses real `MSG_OOB` on TcpStream; falls back to normal byte on
+    /// generic writers.
+    OobByte,
+    /// Insert a 5-byte dummy TLS ApplicationData record between fragments.
+    ///
+    /// Sends `0x17 0x03 0x01 0x00 0x00` — confuses stateful DPI that tracks
+    /// handshake context.
+    TlsPadding,
+    /// Wait `ms` milliseconds between the previous and next step.
+    ///
+    /// Defeats DPI with short reassembly timers that discard incomplete buffers.
+    Delay { ms: u64 },
+}
+
 /// Userspace TCP desync technique applied to TLS ClientHello or HTTP data.
 ///
-/// Note: not `Copy` because `MultiSplit` owns a `Vec`.
+/// Note: not `Copy` because `MultiSplit` and `Chain` own `Vec`s.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DesyncTechnique {
     /// Send two raw TCP segments with an explicit flush between them.
@@ -58,7 +105,10 @@ pub enum DesyncTechnique {
     /// Real `MSG_OOB` on Windows and Linux; falls back to plain split on other platforms.
     TcpSegmentSplitOob { at: SplitAt },
 
-    /// Split an HTTP/1.x request into two TCP segments for DPI evasion on port 80.
+    /// Split an HTTP request into two TCP segments for DPI evasion on port 80.
+    ///
+    /// HTTP/2-aware: detects the `PRI * HTTP/2.0` preface and splits at the
+    /// SETTINGS frame boundary rather than searching for `Host:`.
     HttpSplit { at: HttpSplitAt },
 
     /// Split data into N+1 TCP segments (one flush per split point).
@@ -107,6 +157,18 @@ pub enum DesyncTechnique {
     SeqOverlap {
         /// Number of overlap bytes prepended with decremented sequence numbers.
         overlap_size: usize,
+    },
+
+    /// Chain of techniques applied sequentially to the same data.
+    ///
+    /// More effective against stateful DPI that adapts to single techniques.
+    /// Example: FakeProbe(TTL=3) then TlsRecordSplit(IntoSni) then Delay(50ms).
+    ///
+    /// Each step operates on the data in order: splits send data to the writer
+    /// immediately; OOB and padding inject extra bytes; delays pause between steps.
+    Chain {
+        /// Ordered list of techniques to apply.
+        steps: Vec<ChainStep>,
     },
 }
 
@@ -215,7 +277,7 @@ impl TcpDesyncEngine {
     /// Build an engine with the platform-appropriate default profiles.
     ///
     /// On all platforms: TLS/TCP split, HTTP split, fake-probe, multi-split,
-    /// delayed-split, and SNI-case profiles.
+    /// delayed-split, SNI-case, and chain profiles.
     /// On Windows and Unix: additionally OOB/URG and TCP-disorder profiles.
     ///
     /// Automatically tries to load the best available [`PacketInterceptor`]
@@ -339,6 +401,30 @@ impl TcpDesyncEngine {
             return Ok(());
         }
 
+        // Chain technique: apply all steps in sequence.
+        if let DesyncTechnique::Chain { steps } = &profile.technique {
+            let parsed = if data.len() >= 5 && data[0] == 0x16 {
+                parse_client_hello(data)
+            } else {
+                None
+            };
+
+            // SNI case randomization for chain profiles.
+            let mut data_buf: Option<Vec<u8>> = None;
+            if profile.randomize_sni_case {
+                if let Some(ref p) = parsed {
+                    let mut buf = data.to_vec();
+                    randomize_sni_case_bytes(&mut buf, p);
+                    data_buf = Some(buf);
+                }
+            }
+            let data = data_buf.as_deref().unwrap_or(data);
+
+            apply_chain_generic(writer, data, steps, parsed.as_ref(), delay).await?;
+            writer.flush().await?;
+            return Ok(());
+        }
+
         // All TLS-based techniques: pass non-TLS data unchanged.
         if data.len() < 5 || data[0] != 0x16 {
             writer.write_all(data).await?;
@@ -390,6 +476,30 @@ impl TcpDesyncEngine {
         if let DesyncTechnique::HttpSplit { at } = &profile.technique {
             let split = http_split_offset(data, *at);
             tcp_segment_split(stream, data, split, delay).await?;
+            stream.flush().await?;
+            return Ok(());
+        }
+
+        // Chain technique: apply all steps with real OOB support.
+        if let DesyncTechnique::Chain { steps } = &profile.technique {
+            let parsed = if data.len() >= 5 && data[0] == 0x16 {
+                parse_client_hello(data)
+            } else {
+                None
+            };
+
+            // SNI case randomization for chain profiles.
+            let mut data_buf: Option<Vec<u8>> = None;
+            if profile.randomize_sni_case {
+                if let Some(ref p) = parsed {
+                    let mut buf = data.to_vec();
+                    randomize_sni_case_bytes(&mut buf, p);
+                    data_buf = Some(buf);
+                }
+            }
+            let data = data_buf.as_deref().unwrap_or(data);
+
+            apply_chain_tcp(stream, data, steps, parsed.as_ref(), delay).await?;
             stream.flush().await?;
             return Ok(());
         }
@@ -489,7 +599,166 @@ async fn apply_technique<W: AsyncWriteExt + Unpin>(
             let payload_split = split_offset_in_payload(data, SplitAt::IntoSni, parsed);
             tls_record_split(writer, data, payload_split, delay_ms).await
         }
+        // Chain handled in the apply() caller before reaching apply_technique.
+        DesyncTechnique::Chain { steps } => {
+            apply_chain_generic(writer, data, steps, parsed, delay_ms).await
+        }
     }
+}
+
+// ── Chain execution ──────────────────────────────────────────────────────────
+
+/// Apply a chain of techniques to a generic async writer.
+///
+/// OOB steps fall back to writing a normal byte since generic writers do not
+/// support `MSG_OOB`.  Use [`apply_chain_tcp`] for real OOB support.
+async fn apply_chain_generic<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+    steps: &[ChainStep],
+    parsed: Option<&ParsedClientHello>,
+    delay_ms: Option<u64>,
+) -> io::Result<()> {
+    if steps.is_empty() || data.is_empty() {
+        writer.write_all(data).await?;
+        return Ok(());
+    }
+
+    // Track how much of `data` has been sent so far.
+    let mut cursor: usize = 0;
+
+    for step in steps {
+        match step {
+            ChainStep::TlsRecordSplit { at } => {
+                let remaining = &data[cursor..];
+                if remaining.len() >= 5 && remaining[0] == 0x16 {
+                    let payload_split = split_offset_in_payload(remaining, *at, parsed);
+                    tls_record_split(writer, remaining, payload_split, delay_ms).await?;
+                    cursor = data.len();
+                } else {
+                    // Not TLS — send everything remaining as-is.
+                    writer.write_all(remaining).await?;
+                    cursor = data.len();
+                }
+            }
+            ChainStep::TcpSegmentSplit { at } => {
+                let remaining = &data[cursor..];
+                if remaining.is_empty() {
+                    continue;
+                }
+                let split = if remaining.len() >= 5 && remaining[0] == 0x16 {
+                    split_offset_in_record(remaining, *at, parsed)
+                } else {
+                    remaining.len() / 2
+                };
+                if split > 0 && split < remaining.len() {
+                    writer.write_all(&remaining[..split]).await?;
+                    writer.flush().await?;
+                    if let Some(ms) = delay_ms {
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                    }
+                    writer.write_all(&remaining[split..]).await?;
+                } else {
+                    writer.write_all(remaining).await?;
+                }
+                cursor = data.len();
+            }
+            ChainStep::OobByte => {
+                // Generic writer fallback: send a normal byte (no MSG_OOB).
+                writer.write_all(&[0x00]).await?;
+                writer.flush().await?;
+            }
+            ChainStep::TlsPadding => {
+                // Dummy ApplicationData record: content_type=0x17, TLS 1.0, length=0.
+                writer.write_all(&[0x17, 0x03, 0x01, 0x00, 0x00]).await?;
+                writer.flush().await?;
+            }
+            ChainStep::Delay { ms } => {
+                tokio::time::sleep(Duration::from_millis(*ms)).await;
+            }
+        }
+    }
+
+    // If no split step consumed the data, send the remainder.
+    if cursor < data.len() {
+        writer.write_all(&data[cursor..]).await?;
+    }
+
+    Ok(())
+}
+
+/// Apply a chain of techniques to a raw [`TcpStream`] with real OOB support.
+///
+/// Identical to [`apply_chain_generic`] except `OobByte` steps send an actual
+/// `MSG_OOB` byte via [`send_oob_byte`].
+async fn apply_chain_tcp(
+    stream: &mut TcpStream,
+    data: &[u8],
+    steps: &[ChainStep],
+    parsed: Option<&ParsedClientHello>,
+    delay_ms: Option<u64>,
+) -> io::Result<()> {
+    if steps.is_empty() || data.is_empty() {
+        stream.write_all(data).await?;
+        return Ok(());
+    }
+
+    let mut cursor: usize = 0;
+
+    for step in steps {
+        match step {
+            ChainStep::TlsRecordSplit { at } => {
+                let remaining = &data[cursor..];
+                if remaining.len() >= 5 && remaining[0] == 0x16 {
+                    let payload_split = split_offset_in_payload(remaining, *at, parsed);
+                    tls_record_split(stream, remaining, payload_split, delay_ms).await?;
+                    cursor = data.len();
+                } else {
+                    stream.write_all(remaining).await?;
+                    cursor = data.len();
+                }
+            }
+            ChainStep::TcpSegmentSplit { at } => {
+                let remaining = &data[cursor..];
+                if remaining.is_empty() {
+                    continue;
+                }
+                let split = if remaining.len() >= 5 && remaining[0] == 0x16 {
+                    split_offset_in_record(remaining, *at, parsed)
+                } else {
+                    remaining.len() / 2
+                };
+                if split > 0 && split < remaining.len() {
+                    stream.write_all(&remaining[..split]).await?;
+                    stream.flush().await?;
+                    if let Some(ms) = delay_ms {
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                    }
+                    stream.write_all(&remaining[split..]).await?;
+                } else {
+                    stream.write_all(remaining).await?;
+                }
+                cursor = data.len();
+            }
+            ChainStep::OobByte => {
+                // Real MSG_OOB injection on TcpStream.
+                crate::evasion::dpi_bypass::send_oob_byte(stream, 0x00).await?;
+            }
+            ChainStep::TlsPadding => {
+                stream.write_all(&[0x17, 0x03, 0x01, 0x00, 0x00]).await?;
+                stream.flush().await?;
+            }
+            ChainStep::Delay { ms } => {
+                tokio::time::sleep(Duration::from_millis(*ms)).await;
+            }
+        }
+    }
+
+    if cursor < data.len() {
+        stream.write_all(&data[cursor..]).await?;
+    }
+
+    Ok(())
 }
 
 // ── Core primitives ──────────────────────────────────────────────────────────
@@ -937,12 +1206,22 @@ fn split_offset_in_payload(data: &[u8], at: SplitAt, parsed: Option<&ParsedClien
 }
 
 /// Compute the split offset within an HTTP request for [`HttpSplitAt`].
+///
+/// HTTP/2-aware: when the data starts with the 24-byte HTTP/2 connection preface
+/// (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`), the `BeforeHostHeader` variant returns
+/// offset 24 (the SETTINGS frame boundary) instead of scanning for `Host:`.
 fn http_split_offset(data: &[u8], at: HttpSplitAt) -> usize {
     let max = data.len().saturating_sub(1).max(1);
     match at {
         HttpSplitAt::Fixed(n) => n.clamp(1, max),
         HttpSplitAt::BeforeHostHeader => {
-            // Find "\r\nHost:" (case-insensitive for the field name) and split
+            // HTTP/2 detection: if data starts with the connection preface,
+            // split at the SETTINGS frame boundary.
+            if data.len() >= HTTP2_PREFACE_LEN && data[..HTTP2_PREFACE_LEN] == *HTTP2_PREFACE {
+                return HTTP2_PREFACE_LEN.clamp(1, max);
+            }
+
+            // HTTP/1.x: find "\r\nHost:" (case-insensitive for the field name) and split
             // right after the "\r\n" so the second segment starts with "Host:".
             data.windows(7)
                 .position(|w| {
@@ -960,7 +1239,7 @@ fn http_split_offset(data: &[u8], at: HttpSplitAt) -> usize {
 fn native_profile_from_config(
     cfg: &crate::config::NativeProfileConfig,
 ) -> std::result::Result<NativeDesyncProfile, String> {
-    use crate::config::{HttpSplitAtConfig, NativeTechniqueConfig, SplitAtConfig};
+    use crate::config::{ChainStepConfig, HttpSplitAtConfig, NativeTechniqueConfig, SplitAtConfig};
 
     fn convert_split(s: &SplitAtConfig) -> SplitAt {
         match s {
@@ -975,6 +1254,20 @@ fn native_profile_from_config(
         match s {
             HttpSplitAtConfig::BeforeHostHeader => HttpSplitAt::BeforeHostHeader,
             HttpSplitAtConfig::Fixed(n) => HttpSplitAt::Fixed(*n),
+        }
+    }
+
+    fn convert_chain_step(s: &ChainStepConfig) -> ChainStep {
+        match s {
+            ChainStepConfig::TlsRecordSplit { split_at } => ChainStep::TlsRecordSplit {
+                at: convert_split(split_at),
+            },
+            ChainStepConfig::TcpSegmentSplit { split_at } => ChainStep::TcpSegmentSplit {
+                at: convert_split(split_at),
+            },
+            ChainStepConfig::OobByte => ChainStep::OobByte,
+            ChainStepConfig::TlsPadding => ChainStep::TlsPadding,
+            ChainStepConfig::Delay { ms } => ChainStep::Delay { ms: *ms },
         }
     }
 
@@ -1013,6 +1306,9 @@ fn native_profile_from_config(
         },
         NativeTechniqueConfig::SeqOverlap { overlap_size } => DesyncTechnique::SeqOverlap {
             overlap_size: *overlap_size,
+        },
+        NativeTechniqueConfig::Chain { steps } => DesyncTechnique::Chain {
+            steps: steps.iter().map(convert_chain_step).collect(),
         },
     };
 
@@ -1139,6 +1435,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             inter_fragment_delay_ms: None,
         },
         // 9. HTTP-level split before the Host: header — effective for port-80 DPI.
+        //    HTTP/2-aware: splits at SETTINGS frame boundary for h2 connections.
         NativeDesyncProfile {
             name: "http-before-host".to_owned(),
             technique: DesyncTechnique::HttpSplit {
@@ -1352,7 +1649,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             randomize_sni_case: false,
             inter_fragment_delay_ms: None,
         },
-        // 23. TCP segment split + fake ClientHello with BadTimestamp fooling.
+        // 25. TCP segment split + fake ClientHello with BadTimestamp fooling.
         NativeDesyncProfile {
             name: "split-sni-fake-ts-fool".to_owned(),
             technique: DesyncTechnique::TcpSegmentSplit {
@@ -1368,6 +1665,88 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             randomize_sni_case: false,
             inter_fragment_delay_ms: None,
         },
+        // ── Chain profiles ────────────────────────────────────────────────
+        // 26. Chain: FakeProbe(TTL=3) → TlsRecordSplit(IntoSni).
+        //     The probe desynchronises DPI state, then the TLS record split
+        //     hides the SNI from a DPI that already lost its TCP tracking.
+        NativeDesyncProfile {
+            name: "chain-fake-tlsrec-sni".to_owned(),
+            technique: DesyncTechnique::Chain {
+                steps: vec![ChainStep::TlsRecordSplit {
+                    at: SplitAt::IntoSni,
+                }],
+            },
+            cloudflare_safe: true,
+            fake_probe: Some(FakeProbe {
+                ttl: 3,
+                data_size: 0,
+                fake_sni: Some("www.google.com".to_owned()),
+                fooling: None,
+            }),
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
+        },
+        // 27. Chain: TcpSegmentSplit(IntoSni) → OOB byte → 50ms delay.
+        //     Multi-step disruption: split first, inject OOB to confuse
+        //     DPI reassembly, then delay to expire DPI reassembly timer.
+        NativeDesyncProfile {
+            name: "chain-split-oob-delay".to_owned(),
+            technique: DesyncTechnique::Chain {
+                steps: vec![
+                    ChainStep::TcpSegmentSplit {
+                        at: SplitAt::IntoSni,
+                    },
+                    ChainStep::OobByte,
+                    ChainStep::Delay { ms: 50 },
+                ],
+            },
+            cloudflare_safe: false, // OOB may confuse Cloudflare.
+            fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
+        },
+        // 28. Chain: TlsPadding → TlsRecordSplit(BeforeSni + MidSni via multi-split).
+        //     Inject a dummy AppData record first, then split the ClientHello at
+        //     two points — confuses DPI that relies on handshake state and fragment
+        //     count simultaneously.
+        NativeDesyncProfile {
+            name: "chain-pad-split-sni".to_owned(),
+            technique: DesyncTechnique::Chain {
+                steps: vec![
+                    ChainStep::TlsPadding,
+                    ChainStep::TlsRecordSplit {
+                        at: SplitAt::IntoSni,
+                    },
+                ],
+            },
+            cloudflare_safe: false, // Padding mid-handshake may confuse Cloudflare.
+            fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
+        },
+        // 29. Chain: FakeProbe(TTL=4) → TcpSegmentSplit(IntoSni) → Delay(30ms).
+        //     Aggressive three-step: pre-probe to poison DPI state, split the
+        //     ClientHello, then delay to expire any remaining DPI reassembly.
+        NativeDesyncProfile {
+            name: "chain-fake-split-delay".to_owned(),
+            technique: DesyncTechnique::Chain {
+                steps: vec![
+                    ChainStep::TcpSegmentSplit {
+                        at: SplitAt::IntoSni,
+                    },
+                    ChainStep::Delay { ms: 30 },
+                ],
+            },
+            cloudflare_safe: true,
+            fake_probe: Some(FakeProbe {
+                ttl: 4,
+                data_size: 0,
+                fake_sni: Some("www.google.com".to_owned()),
+                fooling: None,
+            }),
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
+        },
     ];
 
     // TCP disorder profiles — require WinDivert (Windows) or NFQueue (Linux).
@@ -1375,7 +1754,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
     // NOT safe for Cloudflare: their edges reject out-of-order TCP segments.
     #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
     profiles.extend([
-        // 22. TCP disorder with 15 ms delay — sends segment 2 before segment 1.
+        // TCP disorder with 15 ms delay — sends segment 2 before segment 1.
         NativeDesyncProfile {
             name: "tcp-disorder-15ms".to_owned(),
             technique: DesyncTechnique::TcpDisorder { delay_ms: 15 },
@@ -1384,7 +1763,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             randomize_sni_case: false,
             inter_fragment_delay_ms: None,
         },
-        // 23. TCP disorder with 40 ms delay — longer gap defeats eager reassemblers.
+        // TCP disorder with 40 ms delay — longer gap defeats eager reassemblers.
         NativeDesyncProfile {
             name: "tcp-disorder-40ms".to_owned(),
             technique: DesyncTechnique::TcpDisorder { delay_ms: 40 },
@@ -1400,7 +1779,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
     // On Unix (Linux, macOS): available via libc::send with MSG_OOB.
     #[cfg(any(windows, unix))]
     profiles.extend([
-        // 18. TLS record split + OOB byte between fragments.
+        // TLS record split + OOB byte between fragments.
         //     Equivalent: --tlsrec 1+s --oob
         NativeDesyncProfile {
             name: "tlsrec-into-sni-oob".to_owned(),
@@ -1412,7 +1791,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             randomize_sni_case: false,
             inter_fragment_delay_ms: None,
         },
-        // 19. TLS record split before SNI + OOB byte.
+        // TLS record split before SNI + OOB byte.
         NativeDesyncProfile {
             name: "tlsrec-before-sni-oob".to_owned(),
             technique: DesyncTechnique::TlsRecordSplitOob {
@@ -1423,7 +1802,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             randomize_sni_case: false,
             inter_fragment_delay_ms: None,
         },
-        // 20. TCP segment split into SNI + OOB byte.
+        // TCP segment split into SNI + OOB byte.
         //     Equivalent: --split 1+s --oob
         NativeDesyncProfile {
             name: "split-into-sni-oob".to_owned(),
@@ -1435,7 +1814,7 @@ pub fn default_native_profiles() -> Vec<NativeDesyncProfile> {
             randomize_sni_case: false,
             inter_fragment_delay_ms: None,
         },
-        // 21. TCP segment split before SNI + OOB byte.
+        // TCP segment split before SNI + OOB byte.
         NativeDesyncProfile {
             name: "split-before-sni-oob".to_owned(),
             technique: DesyncTechnique::TcpSegmentSplitOob {
@@ -1589,8 +1968,8 @@ mod tests {
         );
         for name in &probe_profiles {
             assert!(
-                name.contains("fake"),
-                "fake probe profile name should contain 'fake': {}",
+                name.contains("fake") || name.contains("chain"),
+                "fake probe profile name should contain 'fake' or 'chain': {}",
                 name
             );
         }
@@ -1670,13 +2049,172 @@ mod tests {
             "lowercased output must equal lowercased input"
         );
     }
+
+    // ── Chain profile tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn chain_tls_record_split_produces_output() {
+        let engine = TcpDesyncEngine::with_default_profiles();
+        let idx = (0..engine.profile_count())
+            .find(|&i| engine.profile_name(i) == "chain-fake-tlsrec-sni")
+            .expect("chain-fake-tlsrec-sni profile missing");
+
+        let record = build_tls_record("discord.com");
+        let mut buf = Vec::new();
+        engine.apply(idx, &mut buf, &record).await.unwrap();
+        // Chain with TlsRecordSplit should produce two TLS records (more bytes than original).
+        assert!(
+            buf.len() > record.len(),
+            "chain TLS record split should produce more bytes than original"
+        );
+        // Reassemble: first record payload + second record payload = original payload.
+        assert_eq!(buf[0], 0x16);
+        let len1 = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+        let f2_start = 5 + len1;
+        assert_eq!(buf[f2_start], 0x16);
+        let len2 = u16::from_be_bytes([buf[f2_start + 3], buf[f2_start + 4]]) as usize;
+        let reassembled: Vec<u8> =
+            [&buf[5..5 + len1], &buf[f2_start + 5..f2_start + 5 + len2]].concat();
+        assert_eq!(reassembled, &record[5..]);
+    }
+
+    #[tokio::test]
+    async fn chain_split_oob_delay_produces_output() {
+        let engine = TcpDesyncEngine::with_default_profiles();
+        let idx = (0..engine.profile_count())
+            .find(|&i| engine.profile_name(i) == "chain-split-oob-delay")
+            .expect("chain-split-oob-delay profile missing");
+
+        let record = build_tls_record("youtube.com");
+        let mut buf = Vec::new();
+        engine.apply(idx, &mut buf, &record).await.unwrap();
+        // Should contain the original data plus one OOB byte (0x00 fallback).
+        assert_eq!(
+            buf.len(),
+            record.len() + 1,
+            "chain with OOB should add one byte to output"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_pad_split_produces_output() {
+        let engine = TcpDesyncEngine::with_default_profiles();
+        let idx = (0..engine.profile_count())
+            .find(|&i| engine.profile_name(i) == "chain-pad-split-sni")
+            .expect("chain-pad-split-sni profile missing");
+
+        let record = build_tls_record("discord.com");
+        let mut buf = Vec::new();
+        engine.apply(idx, &mut buf, &record).await.unwrap();
+        // Should contain the padding (5 bytes) plus two TLS records.
+        assert!(
+            buf.len() > record.len() + 5,
+            "chain with padding should add at least 5+5 bytes"
+        );
+        // The padding record should appear in the output.
+        assert!(
+            buf.windows(5).any(|w| w == [0x17, 0x03, 0x01, 0x00, 0x00]),
+            "padding record should appear in output"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_empty_steps_passes_through() {
+        let steps: Vec<ChainStep> = vec![];
+        let record = build_tls_record("example.com");
+        let mut buf = Vec::new();
+        apply_chain_generic(&mut buf, &record, &steps, None, None)
+            .await
+            .unwrap();
+        assert_eq!(buf, record, "empty chain should pass data through");
+    }
+
+    #[tokio::test]
+    async fn chain_all_profiles_produce_non_empty_output() {
+        let engine = TcpDesyncEngine::with_default_profiles();
+        let record = build_tls_record("discord.com");
+        let chain_indices: Vec<usize> = (0..engine.profile_count())
+            .filter(|&i| engine.profile_name(i).starts_with("chain-"))
+            .collect();
+
+        assert!(
+            !chain_indices.is_empty(),
+            "expected at least one chain profile"
+        );
+
+        for i in chain_indices {
+            let mut buf = Vec::new();
+            engine.apply(i, &mut buf, &record).await.unwrap();
+            assert!(
+                !buf.is_empty(),
+                "chain profile {} produced empty output",
+                engine.profile_name(i)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_non_tls_data_passes_through() {
+        let steps = vec![ChainStep::TlsRecordSplit {
+            at: SplitAt::IntoSni,
+        }];
+        let data = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut buf = Vec::new();
+        apply_chain_generic(&mut buf, data.as_ref(), &steps, None, None)
+            .await
+            .unwrap();
+        // Non-TLS data should be passed through unchanged.
+        assert_eq!(buf.as_slice(), data.as_ref());
+    }
+
+    // ── HTTP/2 awareness tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn http2_preface_splits_at_settings_boundary() {
+        // Build data that starts with the HTTP/2 connection preface.
+        let mut data = Vec::new();
+        data.extend_from_slice(HTTP2_PREFACE);
+        // Append a fake SETTINGS frame (9-byte frame header + empty).
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00]);
+
+        let offset = http_split_offset(&data, HttpSplitAt::BeforeHostHeader);
+        assert_eq!(
+            offset, HTTP2_PREFACE_LEN,
+            "HTTP/2 split should be at byte 24 (after preface)"
+        );
+    }
+
+    #[tokio::test]
+    async fn http2_preface_split_works_with_engine() {
+        let engine = TcpDesyncEngine::with_default_profiles();
+        let idx = (0..engine.profile_count())
+            .find(|&i| engine.profile_name(i) == "http-before-host")
+            .expect("http-before-host profile missing");
+
+        let mut data = Vec::new();
+        data.extend_from_slice(HTTP2_PREFACE);
+        data.extend_from_slice(&[0x00, 0x00, 0x06, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        data.extend_from_slice(&[0x00, 0x03, 0x00, 0x00, 0x00, 0x64]);
+
+        let mut buf = Vec::new();
+        engine.apply(idx, &mut buf, &data).await.unwrap();
+        // Should reconstruct the full data (Vec<u8> writer collects both writes).
+        assert_eq!(buf, data);
+    }
+
+    #[tokio::test]
+    async fn http1_still_works_after_h2_awareness() {
+        let req = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let off = http_split_offset(req, HttpSplitAt::BeforeHostHeader);
+        assert_eq!(&req[off..off + 5], b"Host:");
+    }
 }
 
 #[cfg(test)]
 mod config_conversion_tests {
     use crate::config::{
-        FakeProbeConfig, HttpSplitAtConfig, NativeProfileConfig, NativeTechniqueConfig,
-        SplitAtConfig,
+        ChainStepConfig, FakeProbeConfig, HttpSplitAtConfig, NativeProfileConfig,
+        NativeTechniqueConfig, SplitAtConfig,
     };
 
     use super::*;
@@ -1996,5 +2534,85 @@ mod config_conversion_tests {
         let probe = profile.fake_probe.unwrap();
         assert_eq!(probe.fooling, Some(FakeProbeStrategy::BadTimestamp));
         assert_eq!(probe.fake_sni.as_deref(), Some("google.com"));
+    }
+
+    #[test]
+    fn chain_config_converts_correctly() {
+        let cfg = NativeProfileConfig {
+            name: "test-chain".to_owned(),
+            technique: NativeTechniqueConfig::Chain {
+                steps: vec![
+                    ChainStepConfig::TlsRecordSplit {
+                        split_at: SplitAtConfig::IntoSni,
+                    },
+                    ChainStepConfig::OobByte,
+                    ChainStepConfig::TlsPadding,
+                    ChainStepConfig::Delay { ms: 50 },
+                    ChainStepConfig::TcpSegmentSplit {
+                        split_at: SplitAtConfig::BeforeSni,
+                    },
+                ],
+            },
+            cloudflare_safe: false,
+            fake_probe: None,
+            randomize_sni_case: false,
+            inter_fragment_delay_ms: None,
+        };
+
+        let profile = native_profile_from_config(&cfg).expect("chain conversion should work");
+        assert_eq!(profile.name, "test-chain");
+        match &profile.technique {
+            DesyncTechnique::Chain { steps } => {
+                assert_eq!(steps.len(), 5);
+                assert!(matches!(
+                    steps[0],
+                    ChainStep::TlsRecordSplit {
+                        at: SplitAt::IntoSni
+                    }
+                ));
+                assert!(matches!(steps[1], ChainStep::OobByte));
+                assert!(matches!(steps[2], ChainStep::TlsPadding));
+                assert!(matches!(steps[3], ChainStep::Delay { ms: 50 }));
+                assert!(matches!(
+                    steps[4],
+                    ChainStep::TcpSegmentSplit {
+                        at: SplitAt::BeforeSni
+                    }
+                ));
+            }
+            other => panic!("expected Chain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_profiles_include_chain_profiles() {
+        let profiles = default_native_profiles();
+        let chain_names: Vec<&str> = profiles
+            .iter()
+            .filter(|p| p.name.starts_with("chain-"))
+            .map(|p| p.name.as_str())
+            .collect();
+
+        assert!(
+            chain_names.contains(&"chain-fake-tlsrec-sni"),
+            "missing chain-fake-tlsrec-sni"
+        );
+        assert!(
+            chain_names.contains(&"chain-split-oob-delay"),
+            "missing chain-split-oob-delay"
+        );
+        assert!(
+            chain_names.contains(&"chain-pad-split-sni"),
+            "missing chain-pad-split-sni"
+        );
+        assert!(
+            chain_names.contains(&"chain-fake-split-delay"),
+            "missing chain-fake-split-delay"
+        );
+        assert!(
+            chain_names.len() >= 4,
+            "expected at least 4 chain profiles, got {}",
+            chain_names.len()
+        );
     }
 }

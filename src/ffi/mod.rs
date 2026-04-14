@@ -1,10 +1,10 @@
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::Method;
 use tokio::task::AbortHandle;
@@ -17,6 +17,11 @@ use crate::error::EngineError;
 use crate::ffi::callbacks::{FfiProgressContext, ProgressCallback};
 
 pub mod callbacks;
+pub mod config_api;
+pub mod event_callback;
+pub mod header;
+pub mod metrics_api;
+pub mod socks5_control;
 
 thread_local! {
     static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
@@ -74,9 +79,79 @@ struct PrimeEngineHandle {
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
-struct PrimeEngineOpaque {
+/// Mutable state for the SOCKS5 proxy server managed via FFI.
+#[derive(Default)]
+pub(crate) struct Socks5FfiState {
+    /// Whether the SOCKS5 server is currently running.
+    pub running: bool,
+    /// Cached C-string of the bound address (owned by the engine, not freed by caller).
+    pub bound_addr_c: Option<CString>,
+}
+
+/// Atomic counters for engine-wide metrics.
+///
+/// All fields use relaxed ordering because they are advisory gauges/counters
+/// and do not synchronize other state.
+pub(crate) struct MetricsAccumulator {
+    /// Currently open relay connections (gauge).
+    pub active_connections: AtomicU32,
+    /// Total connections since engine start.
+    pub total_connections: AtomicU64,
+    /// Total bytes sent through the proxy.
+    pub bytes_sent: AtomicU64,
+    /// Total bytes received through the proxy.
+    pub bytes_received: AtomicU64,
+    /// Total requests blocked by privacy / blocklist rules.
+    pub blocked_requests: AtomicU64,
+    /// Subset of `blocked_requests` attributed to ad domains.
+    pub blocked_ads: AtomicU64,
+    /// Subset of `blocked_requests` attributed to tracker domains.
+    pub blocked_trackers: AtomicU64,
+    /// Connections where DPI evasion was applied.
+    pub dpi_bypassed: AtomicU64,
+    /// Connections that fell back to a VPN / PT tunnel.
+    pub vpn_fallback: AtomicU64,
+    /// Total DNS queries handled by the resolver chain.
+    pub dns_queries: AtomicU64,
+    /// Lifetime blocked count persisted across restarts.
+    pub total_blocked_persistent: AtomicU64,
+}
+
+impl Default for MetricsAccumulator {
+    fn default() -> Self {
+        Self {
+            active_connections: AtomicU32::new(0),
+            total_connections: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+            blocked_requests: AtomicU64::new(0),
+            blocked_ads: AtomicU64::new(0),
+            blocked_trackers: AtomicU64::new(0),
+            dpi_bypassed: AtomicU64::new(0),
+            vpn_fallback: AtomicU64::new(0),
+            dns_queries: AtomicU64::new(0),
+            total_blocked_persistent: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Internal opaque state behind every `PrimeEngine` FFI handle.
+///
+/// Holds the async runtime bridge, configuration, SOCKS5 state,
+/// metrics accumulators, and the event callback slot.
+pub(crate) struct PrimeEngineOpaque {
     magic: u64,
     handle: PrimeEngineHandle,
+    /// SOCKS5 server lifecycle state.
+    pub socks5_state: parking_lot::Mutex<Socks5FfiState>,
+    /// Live engine configuration (hot-reloadable).
+    pub config: parking_lot::Mutex<EngineConfig>,
+    /// Cumulative metrics counters.
+    pub metrics: MetricsAccumulator,
+    /// Monotonic instant captured at engine creation (for uptime).
+    pub start_instant: Instant,
+    /// Registered event callback (at most one).
+    pub event_cb: parking_lot::Mutex<Option<crate::ffi::event_callback::EventCallbackSlot>>,
 }
 
 impl Drop for PrimeEngineHandle {
@@ -112,7 +187,7 @@ pub struct PrimeResponse {
 }
 
 const PRIME_RESPONSE_MAGIC: u64 = 0x5052_494D_455F_5245; // "PRIME_RE"
-const PRIME_OK: i32 = 0;
+pub(crate) const PRIME_OK: i32 = 0;
 struct OwnedPrimeResponse {
     _headers: Vec<CString>,
     header_ptrs: Vec<*const c_char>,
@@ -120,10 +195,10 @@ struct OwnedPrimeResponse {
     error_message: Option<CString>,
 }
 
-const PRIME_ERR_NULL_PTR: i32 = 1;
-const PRIME_ERR_INVALID_UTF8: i32 = 2;
-const PRIME_ERR_INVALID_REQUEST: i32 = 3;
-const PRIME_ERR_RUNTIME: i32 = 4;
+pub(crate) const PRIME_ERR_NULL_PTR: i32 = 1;
+pub(crate) const PRIME_ERR_INVALID_UTF8: i32 = 2;
+pub(crate) const PRIME_ERR_INVALID_REQUEST: i32 = 3;
+pub(crate) const PRIME_ERR_RUNTIME: i32 = 4;
 const PRIME_ENGINE_MAGIC: u64 = 0x5052_494D_455F_454E; // "PRIME_EN"
 static REQUEST_LIFECYCLE: OnceLock<
     parking_lot::Mutex<std::collections::HashMap<usize, RequestLifecycle>>,
@@ -245,14 +320,60 @@ unsafe fn engine_from_ptr<'a>(engine: *mut PrimeEngine) -> Option<&'a PrimeEngin
     Some(&opaque.handle)
 }
 
+/// Cast the opaque FFI handle to the full `PrimeEngineOpaque` reference.
+///
+/// Used by submodules that need access to config, metrics, socks5 state,
+/// or the event callback slot.
+///
+/// # Safety
+///
+/// `engine` must be non-null and previously returned by `prime_engine_new`.
+pub(crate) unsafe fn engine_opaque_mut<'a>(
+    engine: *mut PrimeEngine,
+) -> Option<&'a PrimeEngineOpaque> {
+    if engine.is_null() {
+        return None;
+    }
+    // SAFETY: same provenance guarantee as engine_from_ptr — the caller
+    // obtained `engine` from prime_engine_new which allocated PrimeEngineOpaque.
+    let opaque = unsafe { &*(engine as *mut PrimeEngineOpaque) };
+    if opaque.magic != PRIME_ENGINE_MAGIC {
+        return None;
+    }
+    Some(opaque)
+}
+
 #[no_mangle]
 pub extern "C" fn prime_engine_new(config_path: *const c_char) -> *mut PrimeEngine {
     ffi_guard("prime_engine_new", ptr::null_mut, || {
-        let result = create_engine(config_path);
+        let init_config = if config_path.is_null() {
+            EngineConfig::default()
+        } else {
+            match parse_cstr(config_path, "config_path") {
+                Ok(path) => match EngineConfig::from_file(path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        set_last_error(e);
+                        return ptr::null_mut();
+                    }
+                },
+                Err(e) => {
+                    set_last_error(e);
+                    return ptr::null_mut();
+                }
+            }
+        };
+
+        let result = create_engine_from_config(init_config.clone());
         match result {
             Ok(handle) => Box::into_raw(Box::new(PrimeEngineOpaque {
                 magic: PRIME_ENGINE_MAGIC,
                 handle,
+                socks5_state: parking_lot::Mutex::new(Socks5FfiState::default()),
+                config: parking_lot::Mutex::new(init_config),
+                metrics: MetricsAccumulator::default(),
+                start_instant: Instant::now(),
+                event_cb: parking_lot::Mutex::new(None),
             })) as *mut PrimeEngine,
             Err(err) => {
                 set_last_error(err);
@@ -700,14 +821,7 @@ pub extern "C" fn prime_last_error_message() -> *const c_char {
     })
 }
 
-fn create_engine(config_path: *const c_char) -> Result<PrimeEngineHandle, EngineError> {
-    let config = if config_path.is_null() {
-        EngineConfig::default()
-    } else {
-        let path = parse_cstr(config_path, "config_path")?;
-        EngineConfig::from_file(path)?
-    };
-
+fn create_engine_from_config(config: EngineConfig) -> Result<PrimeEngineHandle, EngineError> {
     let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<EngineMsg>();
     let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), EngineError>>();
     let init_tx_panic = init_tx.clone();
@@ -845,7 +959,7 @@ fn parse_request(input: &PrimeRequest) -> Result<RequestData, EngineError> {
     })
 }
 
-fn parse_cstr(ptr: *const c_char, field: &'static str) -> Result<String, EngineError> {
+pub(crate) fn parse_cstr(ptr: *const c_char, field: &'static str) -> Result<String, EngineError> {
     if ptr.is_null() {
         return Err(EngineError::NullPointer(field));
     }
@@ -911,18 +1025,18 @@ fn pack_response(
     Box::into_raw(response)
 }
 
-fn set_last_error(err: EngineError) {
+pub(crate) fn set_last_error(err: EngineError) {
     set_last_error_text(&err.to_string());
 }
 
-fn set_last_error_text(message: &str) {
+pub(crate) fn set_last_error_text(message: &str) {
     let message = to_cstring(message);
     LAST_ERROR.with(|last| {
         *last.borrow_mut() = message;
     });
 }
 
-fn ffi_guard<T, F, P>(fn_name: &'static str, on_panic: P, f: F) -> T
+pub(crate) fn ffi_guard<T, F, P>(fn_name: &'static str, on_panic: P, f: F) -> T
 where
     P: FnOnce() -> T,
     F: FnOnce() -> T,
@@ -936,7 +1050,7 @@ where
     }
 }
 
-fn to_cstring(value: &str) -> Option<CString> {
+pub(crate) fn to_cstring(value: &str) -> Option<CString> {
     if !value.as_bytes().contains(&0) {
         return CString::new(value).ok();
     }

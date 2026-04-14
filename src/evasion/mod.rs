@@ -12,7 +12,8 @@ pub use fragmenting_io::{FragmentConfig, FragmentHandle, FragmentingIo};
 pub use packet_intercept::PacketInterceptor;
 pub use profile_discovery::ProfileDiscoveryCache;
 pub use tcp_desync::{
-    DesyncTechnique, FakeProbe, HttpSplitAt, NativeDesyncProfile, SplitAt, TcpDesyncEngine,
+    ChainStep, DesyncTechnique, FakeProbe, HttpSplitAt, NativeDesyncProfile, SplitAt,
+    TcpDesyncEngine,
 };
 pub use tls_parser::ParsedClientHello;
 pub use traffic_shaping::TrafficShaper;
