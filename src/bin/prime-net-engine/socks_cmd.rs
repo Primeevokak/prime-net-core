@@ -124,6 +124,21 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
     // Initialize in-process TcpDesyncEngine (native bypass) — no binary required.
     // Enabled alongside packet bypass or whenever evasion is active.
     if cfg.evasion.packet_bypass_enabled || relay_opts.fragment_client_hello {
+        // Auto-download WinDivert if it is not present next to the engine binary.
+        #[cfg(windows)]
+        {
+            match prime_net_engine_core::evasion::packet_intercept::windivert_bootstrap::ensure_windivert_available().await {
+                Ok(true) => info!(target: "socks_cmd", "WinDivert downloaded and installed successfully"),
+                Ok(false) => {} // already present
+                Err(e) => warn!(
+                    target: "socks_cmd",
+                    error = %e,
+                    "WinDivert auto-download failed — TCP disorder and raw injection \
+                     profiles will run in degraded mode"
+                ),
+            }
+        }
+
         let mut engine = TcpDesyncEngine::with_config(&cfg.evasion);
 
         // Run profile discovery synchronously (with 10 s timeout) so that the ML scorer
@@ -162,6 +177,11 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
         }
 
         native_profiles_count = engine.profile_count();
+
+        // Log detailed capability report before wrapping the engine in Arc.
+        let report = prime_net_engine_core::evasion::startup_report::analyze_engine(&engine);
+        prime_net_engine_core::evasion::startup_report::log_report(&report);
+
         relay_opts.native_bypass = Some(Arc::new(engine));
         info!(
             target: "socks_cmd",
