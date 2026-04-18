@@ -112,6 +112,43 @@ prime-net-engine --config prime-net-engine.toml update install
 
 Важно: `update install` требует рабочей цепочки signature verification и настроенного release signing key/fingerprint.
 
+## Kill switch (защита от утечек)
+
+При включении `evasion.kill_switch_enabled = true` движок мониторит SOCKS5 порт. Если движок падает — системный прокси перенаправляется на мёртвый порт, блокируя весь трафик вместо утечки.
+
+```toml
+[evasion]
+kill_switch_enabled = true
+```
+
+Для восстановления после аварии: `prime-net-engine proxy disable`.
+
+## GUI (графический интерфейс)
+
+Проект `prime-gui` (отдельный от движка) предоставляет Tauri-приложение:
+
+1. Скомпилируйте движок: `cargo build --release --bin prime-net-engine`
+2. Скопируйте бинарник в `prime-gui/src-tauri/bin/prime-net-engine-x86_64-pc-windows-msvc.exe`
+3. Соберите GUI: `cd prime-gui/src-tauri && npx tauri build`
+4. Или для разработки: `cd prime-gui && npm run tauri dev`
+
+GUI автоматически запускает движок, показывает логи, статистику, позволяет менять конфиг и применять пресеты.
+
+## Закрепление профилей для YouTube
+
+YouTube требует WinDivert для эффективного обхода. При первом запуске WinDivert скачается автоматически.
+
+Если ML-маршрутизатор не находит рабочий маршрут — закрепите профили:
+
+```toml
+[routing.domain_profiles]
+"youtube.com"      = "native:seqovl-681"
+"googlevideo.com"  = "native:seqovl-681"
+"ytimg.com"        = "native:seqovl-681"
+```
+
+Профили для YouTube: `seqovl-681`, `tcp-disorder-15ms`, `tlsrec-sni-fake-ts-fool`, `chain-fake-split-delay`.
+
 ## PT сценарий (Trojan/Shadowsocks/Obfs4/Snowflake)
 
 - заполните `[pt]` секцию в конфиге;

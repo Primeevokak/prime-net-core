@@ -79,7 +79,25 @@ prime-net-engine --config prime-net-engine.toml test --url https://example.com
 prime-net-engine --config prime-net-engine.toml tui
 ```
 
-## 9. Минимальный preflight перед коммитом
+## 9. GUI (графический интерфейс)
+
+Если собран GUI (отдельный проект `prime-gui`):
+
+```bash
+cd prime-gui/src-tauri && npx tauri dev
+```
+
+Или используйте скомпилированный installer: `Prime_0.1.0_x64-setup.exe`.
+
+## 10. WinDivert (Windows)
+
+На Windows при первом запуске WinDivert 2.2 автоматически скачивается и устанавливается рядом с движком. Это необходимо для полной работы DPI bypass (YouTube, Google).
+
+Если авто-загрузка не сработала — скачайте вручную с [reqrypt.org/windivert.html](https://reqrypt.org/windivert.html) и положите `WinDivert.dll` + `WinDivert64.sys` рядом с `prime-net-engine.exe`.
+
+Запускайте от администратора для работы WinDivert.
+
+## 11. Минимальный preflight перед коммитом
 
 ```bash
 cargo fmt --all -- --check

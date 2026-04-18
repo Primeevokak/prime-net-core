@@ -130,6 +130,15 @@
 - `classifier_cache_path = <platform cache dir>/prime-net-engine/relay-classifier.json`
 - `classifier_entry_ttl_secs = 604800`
 - `strategy_race_enabled = true`
+- `kill_switch_enabled = false` — перенаправляет системный прокси на мёртвый порт если SOCKS5 упал
+- `quic_probe_timeout_ms = 3000` — timeout для QUIC Initial зондирования
+- `quic_fake_repeat_count = 8` — количество fake QUIC Initial пакетов
+- `quic_udp_padding_bytes = 0` — дополнительный UDP padding
+- `aggressive_fragment_domains = []` — домены с принудительной агрессивной фрагментацией (например `"soundcloud.com"`)
+- `stage_cache_ttl_secs = 172800` — TTL кеша стадий классификатора (48 часов)
+- `winner_cache_ttl_secs = 86400` — TTL кеша победителей маршрутов (24 часа)
+- `native_profiles = []` — пользовательские нативные профили (дополняют или заменяют дефолтные)
+- `disable_default_native_profiles = false` — если `true`, используются только пользовательские профили
 
 `strategy`:
 
@@ -249,6 +258,28 @@
 
 - `crash_reports = false`
 - `endpoint = "https://crashes.example.com"`
+
+### `[mtproto_ws]`
+
+MTProto WebSocket прокси для Telegram.
+
+- `enabled = false`
+- `listen_addr = "127.0.0.1:1443"`
+- `secret_hex = ""` — 16 случайных байт в hex (секрет для MTProto obfuscation)
+- `cf_proxy_enabled = false` — проксирование через Cloudflare CDN
+- `cf_proxy_domain = ""` — домен для Cloudflare fronting
+
+### `[adblock]`
+
+DNS/URL-level блокировка рекламы и трекеров.
+
+- `enabled = false`
+- `lists = ["easylist"]` — builtin list aliases: `easylist`, `easyprivacy`, `ublock`, `ublock_origin`
+- `custom_lists = []` — пользовательские filter lists (файлы или URL)
+- `auto_update = true`
+- `update_interval_hours = 24`
+
+Поддерживает EasyList/AdGuard синтаксис, включая `||domain^`, `/regex/`, cosmetic `##` правила.
 
 ## Основные валидации
 

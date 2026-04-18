@@ -57,6 +57,7 @@ prime-net-engine [GLOBAL_OPTS] socks [SOCKS_OPTS]
 
 - `--bind <host:port>` (default: `127.0.0.1:1080`)
 - `--silent-drop`
+- `--stats-file <path>` — путь для записи JSON-снимков статистики (каждые 5 секунд)
 
 ### `wizard`
 

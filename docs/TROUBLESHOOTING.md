@@ -1,6 +1,44 @@
 # TROUBLESHOOTING
 
-## 1. `SOCKS5 connection refused`
+## 1. YouTube / Google сервисы не открываются
+
+YouTube — приоритетная цель DPI (ТСПУ). Простые техники (split, OOB) часто недостаточны.
+
+**Проверьте стартовый отчёт в логах:**
+
+```
+WARN  desync: 29/35 desync profiles operational, 6 degraded (install WinDivert)
+```
+
+Если видите это предупреждение — WinDivert не установлен, а именно он нужен для YouTube.
+
+**Шаги:**
+
+1. WinDivert должен автоматически скачаться при первом запуске. Если этого не произошло (ошибка сети, права доступа), скачайте вручную:
+   - [WinDivert 2.2.2](https://reqrypt.org/windivert.html)
+   - Положите `WinDivert.dll` + `WinDivert64.sys` (из `x64/`) рядом с `prime-net-engine.exe`
+
+2. Запускайте **от администратора** — WinDivert загружает kernel driver.
+
+3. После запуска проверьте логи:
+   ```
+   INFO  desync: packet interceptor loaded (TCP disorder available) backend="WinDivert"
+   INFO  desync: all 35 desync profiles fully operational
+   ```
+
+4. Если всё равно не работает — закрепите профиль:
+
+```toml
+[routing.domain_profiles]
+"youtube.com"      = "native:seqovl-681"
+"googlevideo.com"  = "native:seqovl-681"
+"ytimg.com"        = "native:seqovl-681"
+"ggpht.com"        = "native:seqovl-681"
+```
+
+5. Альтернативные профили для YouTube: `tcp-disorder-15ms`, `tlsrec-sni-fake-ts-fool`, `chain-fake-split-delay`.
+
+## 2. `SOCKS5 connection refused`
 
 Проверьте, что сервер реально запущен:
 
@@ -14,50 +52,59 @@ prime-net-engine --config prime-net-engine.toml socks --bind 127.0.0.1:1080
 prime-net-engine --config prime-net-engine.toml proxy status
 ```
 
-## 2. `--config-check` падает на DNS/DoH
+## 3. `--config-check` падает на DNS/DoH
 
-- выполните локальную валидацию без сети:
+- Выполните локальную валидацию без сети:
 
 ```bash
 prime-net-engine --config prime-net-engine.toml --config-check --offline
 ```
 
-- проверьте `anticensorship.doh_providers`, `bootstrap_ips`, `dns_fallback_chain`;
-- для диагностики сравните с пресетом `max-compatibility`.
-
-## 3. System proxy не включается
-
-Проверьте:
-
-- права/политики ОС;
-- формат `system_proxy.socks_endpoint` (`host:port`, для IPv6: `[::1]:port`);
-- что SOCKS endpoint действительно слушает.
+- Проверьте `anticensorship.doh_providers`, `bootstrap_ips`, `dns_fallback_chain`.
 
 ## 4. `update install` завершается ошибкой подписи
 
 Частые причины:
 
 - сборка без feature `signature-verification`;
-- не настроены release signing key/fingerprint в `src/updater/verification.rs`;
-- недоступны системные зависимости `gpgme/gpg-error` в окружении сборки.
+- не настроены release signing key/fingerprint;
+- недоступны системные зависимости `gpgme/gpg-error`.
 
 ## 5. Нативный bypass не работает / профили не применяются
 
-Нативный bypass встроен в процесс — внешние утилиты (byedpi/ciadpi) для него не нужны.
-
 Проверьте:
 
-- включение `evasion.packet_bypass_enabled = true` в конфиге;
+- `evasion.packet_bypass_enabled = true` в конфиге;
 - отсутствие `PRIME_PACKET_BYPASS=0` в окружении;
 - что в логах есть строки вида `native desync: applying profile 'tlsrec-into-sni'`.
 
+**Стартовый отчёт покажет деградированные профили:**
+
+```
+WARN  desync: packet interceptor unavailable — 2 profile(s) fall back to plain TCP split
+```
+
 Для TCP disorder (профили `tcp-disorder-*`) дополнительно требуется:
-- **Windows**: `WinDivert.dll` в той же директории, что и `prime-net-engine.exe`, или в `PATH`;
-- **Linux**: ядерный модуль `nfqueue` (`modprobe nfnetlink_queue`) и права на создание NFQueue правил.
+- **Windows**: `WinDivert.dll` (авто-загрузка при первом запуске, или вручную);
+- **Linux**: ядерный модуль `nfqueue` (`modprobe nfnetlink_queue`).
 
-При отсутствии WinDivert/NFQueue движок автоматически пропустит disorder-профили — остальные 20+ профилей работают без них.
+## 6. WinDivert авто-загрузка не работает
 
-## 6. PT (`obfs4`/`snowflake`) не стартует
+Возможные причины:
+
+- Нет доступа к GitHub (сеть заблокирована до старта прокси);
+- Нет прав на запись рядом с `prime-net-engine.exe` (`C:\Program Files\` защищён);
+- Антивирус блокирует загрузку `WinDivert64.sys`.
+
+**Решение:** скачайте вручную и положите файлы рядом с бинарником. См. п.1.
+
+В логах ошибка будет выглядеть так:
+
+```
+WARN  socks_cmd: WinDivert auto-download failed — TCP disorder and raw injection profiles will run in degraded mode error="download failed: ..."
+```
+
+## 7. PT (`obfs4`/`snowflake`) не стартует
 
 Проверьте наличие внешних инструментов:
 
@@ -65,21 +112,17 @@ prime-net-engine --config prime-net-engine.toml --config-check --offline
 - `obfs4proxy` (для obfs4)
 - `snowflake-client` (для snowflake)
 
-Убедитесь, что пути к бинарям указаны в `[pt.obfs4]` / `[pt.snowflake]` секциях конфига. Для obfs4 поле `cert` обязательно.
+Пути к бинарям указываются в `[pt.obfs4]` / `[pt.snowflake]`. Для obfs4 поле `cert` обязательно.
 
-## 7. Discord / мессенджеры не работают
+## 8. Discord / мессенджеры не работают
 
-Discord использует **QUIC (UDP)** и часто блокируется через RST-инъекцию после TCP-рукопожатия.
+Discord использует **QUIC (UDP)** и часто блокируется.
 
-**Шаги диагностики:**
+1. Движок автоматически применяет QUIC Initial десинхронизацию. Дайте 1–2 минуты на зондирование.
 
-1. Убедитесь, что движок запущен и принимает трафик (`proxy status`).
+2. Если QUIC в браузере — отключите: `chrome://flags/#enable-quic` → Disabled.
 
-2. Движок автоматически применяет QUIC Initial десинхронизацию — перед реальным QUIC пакетом отправляется ложный Initial с decoy SNI при низком TTL. Дайте ему 1–2 минуты на зондирование профилей.
-
-3. Если Discord зависает в браузере — проверьте, что QUIC отключён в настройках браузера (`chrome://flags/#enable-quic` → Disabled). Для Electron-клиента движок делает это автоматически через UDP ASSOCIATE.
-
-4. Явно задайте Discord маршрут через `routing.domain_profiles`:
+3. Закрепите маршрут:
 
 ```toml
 [routing.domain_profiles]
@@ -89,66 +132,62 @@ Discord использует **QUIC (UDP)** и часто блокируется
 "discord.gg"     = "native:tlsrec-into-sni"
 ```
 
-5. Запустите с `--log-level debug` и ищите в логах строки с `discord` — там будет видно, какой профиль выбирается и его результат.
+4. Альтернативные профили: `split-into-sni-oob`, `multi-split-sni-region`, `chain-split-oob-delay`.
 
-6. Если один профиль не помогает — попробуйте другие:
+## 9. Низкая скорость / нестабильный throughput
 
-```toml
-"discord.com" = "native:split-into-sni-oob"
-# или
-"discord.com" = "native:multi-split-sni-region"
-```
+- Проверьте `evasion.fragment_*` параметры;
+- Попробуйте пресет `max-compatibility`;
+- Отключите `traffic_shaping_enabled` если включён.
 
-## 8. Низкая скорость / нестабильный throughput
+## 10. Сайты не открываются, хотя раньше работали
 
-Проверьте:
-
-- `evasion.strategy` и `prime_mode`;
-- `evasion.fragment_*` параметры;
-- `download.*` таймауты/конкурентность;
-- влияние `traffic_shaping_enabled`.
-
-Для максимальной скорости попробуйте пресет `max-compatibility`:
+ML-маршрутизатор адаптируется автоматически (halflife 30 минут). Для немедленного сброса:
 
 ```bash
-prime-net-engine --preset max-compatibility --config prime-net-engine.toml socks
-```
+# Windows:
+del %LOCALAPPDATA%\prime-net-engine\relay-classifier.json
 
-## 9. Сайты не открываются, хотя раньше работали
-
-ML-маршрутизатор накапливает историю. Если ISP изменил политику блокировок, старые «победители» могут стать нерабочими.
-
-Статистика обновится автоматически (экспоненциальное затухание, halflife 30 минут). Для немедленного сброса:
-
-```bash
-# Удалить файл статистики (путь из evasion.classifier_cache_path):
+# Linux/macOS:
 rm ~/.cache/prime-net-engine/relay-classifier.json
 ```
 
-Также можно сбросить кеш автообнаружения профилей:
+Сброс кеша профилей:
 
 ```bash
+# Windows:
+del %LOCALAPPDATA%\prime-net\profile_wins.json
+
+# Linux/macOS:
 rm ~/.local/share/prime-net/profile_wins.json
 ```
 
-## 10. Профили зондируются слишком долго при запуске
+## 11. Профили зондируются слишком долго при запуске
 
-Profile discovery запускается в фоне и не блокирует старт прокси. Результаты предыдущего зондирования кешируются на 24 часа. Если прокси уже слушает — всё работает, discovery продолжается параллельно.
+Profile discovery не блокирует старт прокси (timeout 10 секунд). Результаты кешируются на 24 часа. Если discovery таймаутит — значит тестовые эндпоинты недоступны; движок работает с дефолтным порядком профилей.
 
-## 11. CI падает на `tempfile`/`fmt`
+## 12. Kill switch блокирует весь трафик
 
-Если ошибка вида `use of unresolved crate tempfile`:
+Если `evasion.kill_switch_enabled = true` и движок упал — kill switch перенаправляет системный прокси на мёртвый порт. Весь трафик блокируется.
 
-- проверьте, что dependency подключена в `[dependencies]` (не только `dev-dependencies`) для соответствующей feature.
+Для восстановления:
 
-Если падает `cargo fmt --all -- --check`:
+```bash
+prime-net-engine proxy disable
+```
 
-- выполните локально `cargo fmt --all` и перезапустите checks.
+Или вручную отключите системный прокси в настройках ОС.
 
-## 12. Что прикладывать к баг-репорту
+## 13. System proxy не включается
+
+- Проверьте права/политики ОС;
+- Формат `system_proxy.socks_endpoint` (`host:port`, для IPv6: `[::1]:port`);
+- Что SOCKS endpoint действительно слушает.
+
+## 14. Что прикладывать к баг-репорту
 
 - ОС и архитектуру;
-- команду запуска;
-- редактированный конфиг (без секретов — убрать пароли, cert, сервера PT);
-- логи с `--log-level debug --log-format json`;
-- при необходимости: browser/network консоль и таймштампы.
+- Вывод стартового отчёта (`INFO/WARN desync: ...`);
+- Команду запуска;
+- Редактированный конфиг (без секретов);
+- Логи с `--log-level debug --log-format json`.
