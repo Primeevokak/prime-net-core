@@ -3,6 +3,7 @@ pub mod fragmenting_io;
 pub mod packet_intercept;
 pub mod profile_discovery;
 pub mod quic_initial;
+pub mod startup_report;
 pub mod tcp_desync;
 pub mod tls_parser;
 pub mod traffic_shaping;

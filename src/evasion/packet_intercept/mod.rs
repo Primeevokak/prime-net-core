@@ -22,6 +22,9 @@ pub mod raw_inject;
 #[cfg(windows)]
 mod windivert;
 
+#[cfg(windows)]
+pub mod windivert_bootstrap;
+
 #[cfg(all(unix, not(target_os = "macos")))]
 mod nfqueue;
 
