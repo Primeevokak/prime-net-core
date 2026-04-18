@@ -75,7 +75,7 @@ pub fn spawn_kill_switch_monitor(socks_addr: SocketAddr, enabled: bool) -> KillS
                     addr = %socks_addr,
                     "SOCKS5 proxy restored — disengaging kill switch"
                 );
-                disengage_kill_switch().await;
+                disengage_kill_switch(socks_addr.port()).await;
             }
             was_alive = alive;
         }
@@ -111,20 +111,25 @@ async fn engage_kill_switch(_proxy_port: u16) {
     warn!(target: "kill_switch", "kill switch engaged");
 }
 
-/// Disengage the kill switch by disabling the dead-port proxy redirect.
-async fn disengage_kill_switch() {
+/// Disengage the kill switch by restoring the system proxy to the original
+/// SOCKS5 endpoint (not just disabling — that would leak traffic directly).
+async fn disengage_kill_switch(socks_port: u16) {
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     {
-        if let Err(e) = crate::platform::system_proxy_manager().disable() {
+        let endpoint = format!("127.0.0.1:{socks_port}");
+        if let Err(e) = crate::platform::system_proxy_manager().enable(&endpoint) {
             warn!(
                 target: "kill_switch",
                 error = %e,
-                "failed to restore system proxy after kill switch"
+                "failed to restore system proxy to {endpoint} after kill switch"
             );
         }
     }
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-    info!(target: "kill_switch", "kill switch disengaged");
+    {
+        let _ = socks_port;
+        info!(target: "kill_switch", "kill switch disengaged");
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

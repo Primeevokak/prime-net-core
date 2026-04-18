@@ -224,7 +224,7 @@ pub fn record_route_failure_sync(
         let per_route = map.entry(route_key.to_owned()).or_default();
         let mut health = per_route.entry(route_id.clone()).or_default();
         health.failures += 1;
-        health.consecutive_failures += 1;
+        health.consecutive_failures = health.consecutive_failures.saturating_add(1);
         health.last_failure_unix = now;
 
         if is_reset || is_dpi_signal || health.consecutive_failures >= ROUTE_FAILS_BEFORE_WEAK {

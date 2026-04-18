@@ -118,7 +118,7 @@ impl WinDivertLib {
 /// [`intercept_connection`]: PacketInterceptor::intercept_connection
 #[derive(Debug)]
 pub(super) struct WinDivertInterceptor {
-    #[allow(dead_code)] // held for lifetime
+    /// Held for the lifetime of the interceptor — dropping unloads the DLL.
     lib: Arc<WinDivertLib>,
 }
 

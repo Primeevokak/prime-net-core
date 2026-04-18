@@ -72,7 +72,7 @@ impl AutoUpdater {
     ) -> Result<Option<UpdateInfo>> {
         let release = self.get_latest_for_channel(channel).await?;
         let version = release.tag_name.trim_start_matches('v').to_owned();
-        if version.is_empty() || version == self.current_version {
+        if version.is_empty() || !is_newer_version(&version, &self.current_version) {
             return Ok(None);
         }
         Ok(Some(UpdateInfo {
@@ -164,7 +164,7 @@ impl AutoUpdater {
     async fn fetch_release(&self, url: &str) -> Result<ReleaseInfo> {
         validate_update_api_url(url)?;
         let client = reqwest::Client::builder()
-            .redirect(Policy::none())
+            .redirect(Policy::limited(10))
             .no_proxy()
             .build()
             .map_err(|e| EngineError::Internal(format!("failed to build updater client: {e}")))?;
@@ -187,7 +187,7 @@ impl AutoUpdater {
     async fn fetch_releases(&self, url: &str) -> Result<Vec<ReleaseInfo>> {
         validate_update_api_url(url)?;
         let client = reqwest::Client::builder()
-            .redirect(Policy::none())
+            .redirect(Policy::limited(10))
             .no_proxy()
             .build()
             .map_err(|e| EngineError::Internal(format!("failed to build updater client: {e}")))?;
@@ -274,7 +274,7 @@ impl AutoUpdater {
     async fn download_file(&self, url: &str) -> Result<Vec<u8>> {
         validate_update_download_url(url)?;
         let client = reqwest::Client::builder()
-            .redirect(Policy::none())
+            .redirect(Policy::limited(10))
             .no_proxy()
             .build()
             .map_err(|e| EngineError::Internal(format!("failed to build updater client: {e}")))?;
@@ -323,6 +323,18 @@ impl AutoUpdater {
 
         Ok(path)
     }
+}
+
+/// Returns `true` when `remote` is a strictly newer semver than `current`.
+///
+/// Both strings are split on `'.'` and compared component-by-component as
+/// integers.  Non-numeric segments are silently skipped, so pre-release
+/// suffixes like `1.0.0-beta` degrade to `[1, 0, 0]`.
+fn is_newer_version(remote: &str, current: &str) -> bool {
+    let parse = |v: &str| -> Vec<u64> { v.split('.').filter_map(|s| s.parse().ok()).collect() };
+    let r = parse(remote);
+    let c = parse(current);
+    r > c
 }
 
 fn validate_update_api_url(url: &str) -> Result<()> {
@@ -374,7 +386,7 @@ fn validate_update_download_url(url: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_update_api_url, validate_update_download_url};
+    use super::{is_newer_version, validate_update_api_url, validate_update_download_url};
 
     #[test]
     fn updater_api_url_must_be_https_and_github_api() {
@@ -393,5 +405,19 @@ mod tests {
             validate_update_download_url("https://objects.githubusercontent.com/asset").is_ok()
         );
         assert!(validate_update_download_url("https://downloads.evil.example/asset").is_err());
+    }
+
+    #[test]
+    fn semver_newer_version_detects_upgrade() {
+        assert!(is_newer_version("0.7.0", "0.6.0"));
+        assert!(is_newer_version("1.0.0", "0.9.9"));
+        assert!(is_newer_version("0.6.1", "0.6.0"));
+    }
+
+    #[test]
+    fn semver_newer_version_rejects_downgrade_and_equal() {
+        assert!(!is_newer_version("0.5.0", "0.6.0"));
+        assert!(!is_newer_version("0.6.0", "0.6.0"));
+        assert!(!is_newer_version("0.6.0", "1.0.0"));
     }
 }

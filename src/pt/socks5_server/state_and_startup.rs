@@ -105,6 +105,9 @@ pub struct RelayOptions {
     pub strategy_race_enabled: bool,
     /// In-process TLS/TCP desync engine (Native bypass). `None` = disabled.
     pub native_bypass: Option<Arc<crate::evasion::TcpDesyncEngine>>,
+    /// DNS-level ad/tracker blocking function. Called before upstream connect;
+    /// returns `true` if the domain should be blocked (connection dropped).
+    pub adblock_domain_check: Option<fn(&str) -> bool>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -119,9 +122,13 @@ pub async fn connect_bypass_upstream(
     cfg: Arc<EngineConfig>,
     _relay_opts: RelayOptions,
 ) -> Result<TcpStream> {
-    let mut bypass = TcpStream::connect(bypass_addr)
-        .await
-        .map_err(EngineError::Io)?;
+    let mut bypass = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        TcpStream::connect(bypass_addr),
+    )
+    .await
+    .map_err(|_| EngineError::Internal("bypass connect timed out".to_owned()))?
+    .map_err(EngineError::Io)?;
     bypass
         .write_all(&[0x05, 0x01, 0x00])
         .await

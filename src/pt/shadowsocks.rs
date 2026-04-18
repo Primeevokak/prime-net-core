@@ -1,5 +1,6 @@
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::anticensorship::ResolverChain;
 use crate::config::ShadowsocksPtConfig;
@@ -83,12 +84,21 @@ impl ShadowsocksOutbound {
         };
 
         info!(target: "outbound.shadowsocks", server = %server_endpoint, destination = %target_label, "Shadowsocks outbound connect");
-        let s = shadowsocks::relay::tcprelay::proxy_stream::client::ProxyClientStream::<
+        let connect_fut = shadowsocks::relay::tcprelay::proxy_stream::client::ProxyClientStream::<
             shadowsocks::net::tcp::TcpStream,
-        >::connect(self.context.clone(), &server_cfg, addr).await.map_err(|e| {
-            warn!(target: "outbound.shadowsocks", server = %server_endpoint, destination = %target_label, error = %e, "Shadowsocks outbound connect failed");
-            e
-        })?;
+        >::connect(self.context.clone(), &server_cfg, addr);
+        let s = tokio::time::timeout(Duration::from_secs(10), connect_fut)
+            .await
+            .map_err(|_| {
+                warn!(target: "outbound.shadowsocks", server = %server_endpoint, destination = %target_label, "Shadowsocks outbound connect timed out");
+                EngineError::Internal(format!(
+                    "shadowsocks connect to {server_endpoint} timed out (10s)"
+                ))
+            })?
+            .map_err(|e| {
+                warn!(target: "outbound.shadowsocks", server = %server_endpoint, destination = %target_label, error = %e, "Shadowsocks outbound connect failed");
+                e
+            })?;
 
         info!(target: "outbound.shadowsocks", server = %server_endpoint, destination = %target_label, "Shadowsocks outbound connected");
         Ok(Box::new(s))

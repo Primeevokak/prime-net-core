@@ -216,6 +216,18 @@ impl EngineConfig {
                 ));
             }
         }
+        // Evasion range validations — inverted ranges cause panics in rand::gen_range.
+        if self.evasion.fragment_size_min > self.evasion.fragment_size_max {
+            return Err(EngineError::Config(
+                "evasion.fragment_size_min cannot exceed fragment_size_max".to_owned(),
+            ));
+        }
+        if self.evasion.timing_jitter_ms_min > self.evasion.timing_jitter_ms_max {
+            return Err(EngineError::Config(
+                "evasion.timing_jitter_ms_min cannot exceed timing_jitter_ms_max".to_owned(),
+            ));
+        }
+
         if let Some(pt) = &self.pt {
             if self.proxy.is_some() {
                 return Err(EngineError::Config(

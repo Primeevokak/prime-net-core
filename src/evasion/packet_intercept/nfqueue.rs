@@ -168,8 +168,24 @@ impl PacketInterceptor for NfQueueInterceptor {
 
 /// Blocking disorder thread using libnetfilter_queue.
 ///
-/// Reads two packets from the queue (intercept two data segments), sends them
-/// in reversed order with `delay_ms` between, then exits releasing the queue.
+/// Intercepts the first two outgoing data segments and reorders them so that
+/// segment 2 leaves the host before segment 1 (TCP disorder).
+///
+/// ## Strategy
+///
+/// NFQueue allows **deferring** the verdict: if the callback returns without
+/// issuing `set_verdict` for a given `packet_id`, the kernel holds the packet
+/// in the queue until a verdict is issued later.
+///
+/// 1. Segment 1 arrives in the callback — **no verdict is issued** (packet
+///    stays queued in the kernel).
+/// 2. Segment 2 arrives in the callback — `NF_ACCEPT` is issued immediately
+///    so it leaves the host right away.
+/// 3. After `delay_ms` the main thread issues `NF_ACCEPT` for segment 1's
+///    `packet_id`, releasing it.
+///
+/// This avoids the previous broken approach of `NF_DROP` + attempted
+/// reinjection with `packet_id=0`, which silently discarded segment 1.
 fn run_nfq_disorder_thread(
     lib: Arc<NfqLib>,
     _local_port: u16,
@@ -183,16 +199,19 @@ fn run_nfq_disorder_thread(
         return;
     }
 
-    // Shared state passed through the C callback as a raw pointer.
-    // We use a simple pair of slots for the two captured packets.
+    /// Shared state passed through the C callback as a raw pointer.
+    ///
+    /// `held_pkt_id` stores the packet ID of segment 1 whose verdict is
+    /// deferred.  `seg2_accepted` signals that segment 2 has been accepted.
     struct Slots {
-        pkt1: Option<(u32, Vec<u8>)>,
-        pkt2: Option<(u32, Vec<u8>)>,
+        held_pkt_id: Option<u32>,
+        seg2_accepted: bool,
     }
 
-    // Fat-pointer bundle passed to the C callback.
-    // #[repr(C)] guarantees the field layout matches what cb expects when it
-    // casts the void* back to *mut UserData.
+    /// Fat-pointer bundle passed to the C callback.
+    ///
+    /// `#[repr(C)]` guarantees the field layout matches what `cb` expects
+    /// when it casts the `void*` back to `*mut UserData`.
     #[repr(C)]
     struct UserData {
         slots: Slots,
@@ -200,11 +219,15 @@ fn run_nfq_disorder_thread(
     }
 
     let slots = Slots {
-        pkt1: None,
-        pkt2: None,
+        held_pkt_id: None,
+        seg2_accepted: false,
     };
 
-    // C callback — called synchronously inside nfq_handle_packet.
+    /// C callback — called synchronously inside `nfq_handle_packet`.
+    ///
+    /// For the first data segment we defer the verdict (the kernel holds the
+    /// packet).  For the second segment we accept immediately.  All
+    /// subsequent segments are accepted unchanged.
     unsafe extern "C" fn cb(
         qh: *mut nfq_q_handle,
         _msg: *mut std::ffi::c_void,
@@ -222,26 +245,17 @@ fn run_nfq_disorder_thread(
         }
         let pkt_id = u32::from_be((*hdr).packet_id);
 
-        let mut payload_ptr: *mut u8 = std::ptr::null_mut();
-        let payload_len = (lib.get_payload)(nfad, &mut payload_ptr);
-        if payload_len <= 0 || payload_ptr.is_null() {
-            // Drop the packet — we can't store it.
-            (lib.set_verdict)(qh, pkt_id, NF_DROP, 0, std::ptr::null());
-            return 0;
-        }
-
-        let data = std::slice::from_raw_parts(payload_ptr, payload_len as usize).to_vec();
-
-        if slots.pkt1.is_none() {
-            slots.pkt1 = Some((pkt_id, data));
-            // Drop (hold) the first packet.
-            (lib.set_verdict)(qh, pkt_id, NF_DROP, 0, std::ptr::null());
-        } else if slots.pkt2.is_none() {
-            slots.pkt2 = Some((pkt_id, data));
-            // Drop (hold) the second packet too — we will reinject both below.
-            (lib.set_verdict)(qh, pkt_id, NF_DROP, 0, std::ptr::null());
+        if slots.held_pkt_id.is_none() {
+            // Segment 1: defer the verdict — the kernel holds the packet in
+            // the queue until we issue NF_ACCEPT for this packet_id later.
+            slots.held_pkt_id = Some(pkt_id);
+            // Intentionally NO set_verdict call here.
+        } else if !slots.seg2_accepted {
+            // Segment 2: accept immediately so it leaves before segment 1.
+            slots.seg2_accepted = true;
+            (lib.set_verdict)(qh, pkt_id, NF_ACCEPT, 0, std::ptr::null());
         } else {
-            // More than 2 segments — accept remainder unchanged.
+            // Subsequent segments: accept unchanged.
             (lib.set_verdict)(qh, pkt_id, NF_ACCEPT, 0, std::ptr::null());
         }
 
@@ -264,7 +278,10 @@ fn run_nfq_disorder_thread(
     };
 
     if qh.is_null() {
-        warn!("NFQueue: nfq_create_queue failed (queue {NFQUEUE_NUM} — check iptables rule)");
+        warn!(
+            "NFQueue: nfq_create_queue failed (queue {NFQUEUE_NUM} \
+             — check iptables rule)"
+        );
         unsafe { (lib.close)(h) };
         return;
     }
@@ -272,12 +289,12 @@ fn run_nfq_disorder_thread(
     let fd = unsafe { (lib.fd)(h) };
     let mut buf = vec![0u8; 65_535];
 
-    // Read packets until we have both segments or cancel is signalled.
+    // Read packets until we have captured both segments or cancel is signalled.
     for _ in 0..64 {
         if cancel_rx.try_recv().is_ok() {
             break;
         }
-        // Blocking read from the netlink socket.
+        // Non-blocking read from the netlink socket.
         // SAFETY: fd is valid; buf is large enough.
         let rv = unsafe {
             libc::recv(
@@ -288,39 +305,28 @@ fn run_nfq_disorder_thread(
             )
         };
         if rv > 0 {
+            // SAFETY: h and buf are valid; rv is positive.
             unsafe { (lib.handle_packet)(h, buf.as_mut_ptr(), rv as i32) };
         } else {
             std::thread::sleep(Duration::from_millis(1));
         }
 
-        if user.slots.pkt1.is_some() && user.slots.pkt2.is_some() {
+        if user.slots.held_pkt_id.is_some() && user.slots.seg2_accepted {
             break;
         }
     }
 
-    // Reinject in reversed order.
-    if let (Some((_, pkt2)), Some((_, pkt1))) = (user.slots.pkt2.take(), user.slots.pkt1.take()) {
-        // Send segment 2 first.
-        unsafe {
-            (lib.set_verdict)(
-                qh,
-                0, // packet IDs already consumed by DROP verdict; use raw inject
-                NF_ACCEPT,
-                pkt2.len() as u32,
-                pkt2.as_ptr(),
-            );
+    // Release the held segment 1 after a delay so it arrives after segment 2.
+    if let Some(pkt1_id) = user.slots.held_pkt_id.take() {
+        if user.slots.seg2_accepted {
+            // Segment 2 already left — wait, then release segment 1.
+            std::thread::sleep(Duration::from_millis(delay_ms.clamp(10, 200)));
         }
-
-        std::thread::sleep(Duration::from_millis(delay_ms.clamp(10, 200)));
-
-        // Send segment 1.
+        // Accept segment 1 (deferred verdict).
+        // SAFETY: qh and pkt1_id are valid; passing 0 length + null pointer
+        // means "accept the original packet payload unchanged".
         unsafe {
-            (lib.set_verdict)(qh, 0, NF_ACCEPT, pkt1.len() as u32, pkt1.as_ptr());
-        }
-    } else if let Some((_, pkt1)) = user.slots.pkt1.take() {
-        // Only one segment captured — accept it.
-        unsafe {
-            (lib.set_verdict)(qh, 0, NF_ACCEPT, pkt1.len() as u32, pkt1.as_ptr());
+            (lib.set_verdict)(qh, pkt1_id, NF_ACCEPT, 0, std::ptr::null());
         }
     }
 

@@ -1036,6 +1036,13 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                 app.status_line = format!("GPC: {}", if *v { "вкл" } else { "выкл" });
                 save_privacy_config(app)?;
             }
+            KeyCode::Char('a') => {
+                let v = &mut app.config_editor.config.adblock.enabled;
+                *v = !*v;
+                app.status_line =
+                    format!("Блокировка рекламы: {}", if *v { "вкл" } else { "выкл" });
+                save_privacy_config(app)?;
+            }
             _ => {}
         },
         Tab::PrivacyHeaders => {

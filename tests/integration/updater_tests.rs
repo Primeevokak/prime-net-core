@@ -29,8 +29,8 @@ fn test_update_check_finds_new_version() {
         .with_header("content-type", "application/json")
         .with_body(
             json!({
-                "tag_name": "v0.2.0",
-                "name": "Release 0.2.0",
+                "tag_name": "v99.0.0",
+                "name": "Release 99.0.0",
                 "prerelease": false,
                 "assets": [{
                     "name": "prime-net-engine-linux-x64",
@@ -46,7 +46,7 @@ fn test_update_check_finds_new_version() {
         .args(["--config", cfg.path().to_str().unwrap(), "update", "check"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("0.2.0"));
+        .stdout(predicate::str::contains("99.0.0"));
 
     mock.assert();
 }

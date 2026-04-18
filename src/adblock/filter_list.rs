@@ -89,6 +89,18 @@ pub async fn update_filter_list(source: &FilterListSource, cache_dir: &Path) -> 
     }
 
     let content_length = resp.content_length();
+
+    // Guard against excessively large filter lists (max 50 MB).
+    const MAX_LIST_BYTES: u64 = 50 * 1024 * 1024;
+    if let Some(cl) = content_length {
+        if cl > MAX_LIST_BYTES {
+            return Err(EngineError::Internal(format!(
+                "adblock list '{}' too large ({cl} bytes, max {MAX_LIST_BYTES})",
+                source.name
+            )));
+        }
+    }
+
     let body = resp.text().await.map_err(|e| {
         EngineError::Internal(format!("adblock list '{}' read body: {e}", source.name))
     })?;

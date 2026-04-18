@@ -19,7 +19,7 @@ impl PrivacyDashboard {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(6),
-                Constraint::Length(6),
+                Constraint::Length(7),
                 Constraint::Min(8),
                 Constraint::Length(3),
             ])
@@ -62,6 +62,10 @@ impl PrivacyDashboard {
                 cfg.privacy.tracker_blocker.on_block
             )),
             Line::from(format!(
+                "Блокировка рекламы: {}",
+                on_off(cfg.adblock.enabled),
+            )),
+            Line::from(format!(
                 "Referer: {} ({:?})",
                 on_off(cfg.privacy.referer.enabled),
                 cfg.privacy.referer.mode
@@ -98,8 +102,10 @@ impl PrivacyDashboard {
         );
 
         frame.render_widget(
-            Paragraph::new("[v] смена режима referer  [b] блокировщик  [n] DNT  [g] GPC")
-                .block(Block::default().borders(Borders::ALL)),
+            Paragraph::new(
+                "[v] смена режима referer  [b] блокировщик  [a] реклама  [n] DNT  [g] GPC",
+            )
+            .block(Block::default().borders(Borders::ALL)),
             chunks[3],
         );
     }

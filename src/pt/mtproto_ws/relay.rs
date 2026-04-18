@@ -14,6 +14,11 @@ use crate::error::{EngineError, Result};
 
 use super::handshake::{parse_init, AesCtr, MtProtoTransport};
 
+/// Maximum allowed size for a single WS frame or MTProto packet (16 MiB).
+///
+/// Prevents OOM when a malicious or broken peer sends an absurdly large length.
+const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
 /// Telegram DC fallback IPs used when DNS resolution of the CF proxy domain fails.
 const DC_IPS: &[(i16, &str)] = &[
     (1, "149.154.175.50"),
@@ -138,6 +143,11 @@ async fn read_mtproto_packet<R: AsyncRead + Unpin>(
                 cs.apply(&mut ext);
                 (u32::from_le_bytes([ext[0], ext[1], ext[2], 0]) as usize) * 4
             };
+            if len > MAX_FRAME_SIZE {
+                return Err(EngineError::Internal(format!(
+                    "MTProto abridged packet too large: {len} bytes (max {MAX_FRAME_SIZE})"
+                )));
+            }
             let mut data = vec![0u8; len];
             r.read_exact(&mut data).await.map_err(EngineError::Io)?;
             cs.apply(&mut data);
@@ -148,6 +158,12 @@ async fn read_mtproto_packet<R: AsyncRead + Unpin>(
             r.read_exact(&mut hdr).await.map_err(EngineError::Io)?;
             cs.apply(&mut hdr);
             let len = u32::from_le_bytes(hdr) as usize;
+            if len > MAX_FRAME_SIZE {
+                return Err(EngineError::Internal(format!(
+                    "MTProto intermediate packet too large: {len} bytes \
+                     (max {MAX_FRAME_SIZE})"
+                )));
+            }
             let mut data = vec![0u8; len];
             r.read_exact(&mut data).await.map_err(EngineError::Io)?;
             cs.apply(&mut data);
@@ -160,6 +176,12 @@ async fn read_mtproto_packet<R: AsyncRead + Unpin>(
             let raw_len = u32::from_le_bytes(hdr);
             let has_padding = (raw_len & 0x8000_0000) != 0;
             let data_len = (raw_len & 0x7FFF_FFFF) as usize;
+            if data_len > MAX_FRAME_SIZE {
+                return Err(EngineError::Internal(format!(
+                    "MTProto padded packet too large: {data_len} bytes \
+                     (max {MAX_FRAME_SIZE})"
+                )));
+            }
             let mut data = vec![0u8; data_len];
             r.read_exact(&mut data).await.map_err(EngineError::Io)?;
             cs.apply(&mut data);
@@ -256,6 +278,11 @@ async fn read_ws_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
         r.read_exact(&mut ext).await.map_err(EngineError::Io)?;
         u64::from_be_bytes(ext) as usize
     };
+    if payload_len > MAX_FRAME_SIZE {
+        return Err(EngineError::Internal(format!(
+            "WS frame too large: {payload_len} bytes (max {MAX_FRAME_SIZE})"
+        )));
+    }
     let mut mask_key = [0u8; 4];
     if masked {
         r.read_exact(&mut mask_key).await.map_err(EngineError::Io)?;
@@ -281,7 +308,13 @@ async fn connect_wss(host: &str, sni: &str) -> Result<tokio_rustls::client::TlsS
         .next()
         .ok_or_else(|| EngineError::Internal(format!("DNS: no address for {host}")))?;
 
-    let tcp = TcpStream::connect(addr).await.map_err(EngineError::Io)?;
+    let tcp = tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        TcpStream::connect(addr),
+    )
+    .await
+    .map_err(|_| EngineError::Internal(format!("TCP connect to {addr} timed out after 10s")))?
+    .map_err(EngineError::Io)?;
 
     let root_store = {
         let mut store = rustls::RootCertStore::empty();
@@ -294,10 +327,13 @@ async fn connect_wss(host: &str, sni: &str) -> Result<tokio_rustls::client::TlsS
     let connector = TlsConnector::from(Arc::new(tls_cfg));
     let server_name = rustls::pki_types::ServerName::try_from(sni.to_owned())
         .map_err(|_| EngineError::Internal(format!("invalid TLS SNI: {sni}")))?;
-    let mut tls = connector
-        .connect(server_name, tcp)
-        .await
-        .map_err(EngineError::Io)?;
+    let mut tls = tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        connector.connect(server_name, tcp),
+    )
+    .await
+    .map_err(|_| EngineError::Internal(format!("TLS handshake with {sni} timed out after 10s")))?
+    .map_err(EngineError::Io)?;
 
     // WebSocket upgrade — Telegram's WSS endpoint is at /apiws.
     let key_bytes: [u8; 16] = rand::thread_rng().gen();
@@ -319,21 +355,26 @@ async fn connect_wss(host: &str, sni: &str) -> Result<tokio_rustls::client::TlsS
         .await
         .map_err(EngineError::Io)?;
 
-    // Read HTTP response headers byte-by-byte until \r\n\r\n.
-    let mut response = Vec::new();
-    let mut buf = [0u8; 1];
-    loop {
-        tls.read_exact(&mut buf).await.map_err(EngineError::Io)?;
-        response.push(buf[0]);
-        if response.ends_with(b"\r\n\r\n") {
-            break;
+    // Read HTTP response headers byte-by-byte until \r\n\r\n (with timeout).
+    let response = tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+        let mut resp = Vec::new();
+        let mut b = [0u8; 1];
+        loop {
+            tls.read_exact(&mut b).await.map_err(EngineError::Io)?;
+            resp.push(b[0]);
+            if resp.ends_with(b"\r\n\r\n") {
+                break;
+            }
+            if resp.len() > 4096 {
+                return Err(EngineError::Internal(
+                    "WS upgrade response exceeded 4 KiB".to_owned(),
+                ));
+            }
         }
-        if response.len() > 4096 {
-            return Err(EngineError::Internal(
-                "WS upgrade response exceeded 4 KiB".to_owned(),
-            ));
-        }
-    }
+        Ok::<Vec<u8>, EngineError>(resp)
+    })
+    .await
+    .map_err(|_| EngineError::Internal("WS upgrade response timed out after 10s".to_owned()))??;
     let resp_str = String::from_utf8_lossy(&response);
     if !resp_str.contains("101") {
         return Err(EngineError::Internal(format!(

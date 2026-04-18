@@ -8,6 +8,7 @@ use prime_net_engine_core::EngineConfig;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::adblock_runtime;
 use crate::blocklist_runtime::reload_blocklist;
 
 /// Spawn a background task that polls `path` for modification time changes
@@ -85,6 +86,23 @@ async fn apply_hot_reload(cfg: &EngineConfig) {
         }
         Err(e) => {
             warn!(target: "socks_cmd", error = %e, "config hot-reload: blocklist update failed");
+        }
+    }
+
+    // Reload adblock engine (filter lists, whitelist, enabled state).
+    match adblock_runtime::reload_adblock(&cfg.adblock).await {
+        Ok(stats) if stats.enabled => {
+            info!(
+                target: "socks_cmd",
+                dns_rules = stats.dns_rules_loaded,
+                "config hot-reloaded: adblock updated"
+            );
+        }
+        Ok(_) => {
+            info!(target: "socks_cmd", "config hot-reloaded: adblock disabled");
+        }
+        Err(e) => {
+            warn!(target: "socks_cmd", error = %e, "config hot-reload: adblock update failed");
         }
     }
 

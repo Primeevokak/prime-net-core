@@ -400,6 +400,23 @@ pub async fn handle_socks5_request_with_target(
     icd: Option<Vec<u8>>,
 ) -> Result<()> {
     let target_label = target.to_string();
+
+    // DNS-level adblock: block the domain before any upstream connection attempt.
+    // This runs AFTER DPI evasion routing is selected but BEFORE the TCP connect,
+    // so censorship bypass is unaffected by adblock.
+    if let Some(check_fn) = relay_opts.adblock_domain_check {
+        let domain = match &target.addr {
+            crate::pt::TargetAddr::Domain(d) => Some(d.as_str()),
+            _ => None,
+        };
+        if let Some(d) = domain {
+            if check_fn(d) {
+                debug!(conn_id, domain = d, "adblock: DNS-level block");
+                return Err(EngineError::BlockedByAdblock(d.to_owned()));
+            }
+        }
+    }
+
     let tuned = tune_relay_for_target(relay_opts, target.port, &target_label, false, false, &cfg);
     let relay_opts = tuned.options;
 

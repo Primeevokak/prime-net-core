@@ -330,11 +330,13 @@ impl TcpDesyncEngine {
             .unwrap_or("unknown")
     }
 
-    /// Reference to the profile at `idx`; panics if out of range.
+    /// Reference to the profile at `idx`.
     ///
     /// Used by the discovery module to clone profiles for reordering.
+    /// Clamps to the last valid index if `idx` is out of range.
     pub fn profile_at(&self, idx: usize) -> &NativeDesyncProfile {
-        &self.profiles[idx]
+        let clamped = idx.min(self.profiles.len().saturating_sub(1));
+        &self.profiles[clamped]
     }
 
     /// Returns `true` if the profile at `idx` is safe for Cloudflare-hosted targets.

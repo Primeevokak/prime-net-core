@@ -32,6 +32,8 @@ pub enum EngineError {
     Internal(String),
     #[error("blocked by privacy policy: {0}")]
     BlockedByPrivacyPolicy(String),
+    #[error("blocked by adblock: {0}")]
+    BlockedByAdblock(String),
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;

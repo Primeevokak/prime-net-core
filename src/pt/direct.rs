@@ -603,12 +603,15 @@ fn should_apply_low_ttl(ip: IpAddr, ttl: u8) -> bool {
         return false;
     }
     if ttl >= 32 {
-        // Non-aggressive TTL values are generally safe for normal routing.
+        // Non-aggressive TTL values are generally safe for all destinations.
         return true;
     }
+    // Low TTL (<32) is for DPI evasion — only apply to public IPs where DPI
+    // middleboxes operate.  Skip private/loopback/link-local where low TTL
+    // would just break connectivity.
     match ip {
-        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
-        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local(),
+        IpAddr::V4(v4) => !(v4.is_private() || v4.is_loopback() || v4.is_link_local()),
+        IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local()),
     }
 }
 
@@ -689,15 +692,15 @@ mod tests {
     }
 
     #[test]
-    fn low_ttl_is_not_applied_to_public_ip_with_aggressive_value() {
+    fn low_ttl_is_applied_to_public_ip_for_dpi_evasion() {
         let ip: IpAddr = "8.8.8.8".parse().expect("ip");
-        assert!(!should_apply_low_ttl(ip, 3));
+        assert!(should_apply_low_ttl(ip, 3));
     }
 
     #[test]
-    fn low_ttl_is_applied_to_private_ip() {
+    fn low_ttl_is_not_applied_to_private_ip() {
         let ip: IpAddr = "192.168.1.10".parse().expect("ip");
-        assert!(should_apply_low_ttl(ip, 3));
+        assert!(!should_apply_low_ttl(ip, 3));
     }
 
     #[test]

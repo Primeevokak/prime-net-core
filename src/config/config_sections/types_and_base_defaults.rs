@@ -334,8 +334,11 @@ pub struct EvasionConfig {
     pub tls_record_max_fragment_size: Option<usize>,
     #[serde(default = "default_rst_retry_max")]
     pub rst_retry_max: usize,
+    #[serde(default)]
     pub traffic_shaping_enabled: bool,
+    #[serde(default = "default_timing_jitter_ms_min")]
     pub timing_jitter_ms_min: u64,
+    #[serde(default = "default_timing_jitter_ms_max")]
     pub timing_jitter_ms_max: u64,
     #[serde(default = "default_client_hello_split_offsets")]
     pub client_hello_split_offsets: Vec<usize>,
@@ -843,6 +846,8 @@ fn default_fragment_sleep_ms() -> u64 { 1 }
 fn default_fake_ttl() -> u8 { 2 }
 fn default_fake_data_size() -> usize { 16 }
 fn default_rst_retry_max() -> usize { 2 }
+fn default_timing_jitter_ms_min() -> u64 { 5 }
+fn default_timing_jitter_ms_max() -> u64 { 35 }
 fn default_split_at_sni() -> bool { true }
 fn default_fragment_budget_bytes() -> usize { 16 * 1024 }
 fn default_packet_bypass_enabled() -> bool { true }

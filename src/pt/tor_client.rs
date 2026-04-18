@@ -40,7 +40,8 @@ impl Drop for TorClientGuard {
 }
 
 pub async fn start_tor_obfs4(bind: &str, cfg: &Obfs4PtConfig) -> Result<TorClientGuard> {
-    let socks_addr = normalize_bind(bind).await?;
+    let bind_result = normalize_bind(bind).await?;
+    let socks_addr = bind_result.addr;
     let data_dir = make_temp_dir("tor-obfs4")?;
     let tor_bin = ensure_pt_binary("tor", &cfg.tor_bin).await?;
     let obfs4_bin = ensure_pt_binary("obfs4proxy", &cfg.obfs4proxy_bin).await?;
@@ -64,11 +65,17 @@ pub async fn start_tor_obfs4(bind: &str, cfg: &Obfs4PtConfig) -> Result<TorClien
         &["UseBridges 1".to_owned(), plugin_line, bridge_line],
     );
 
+    // Drop the ephemeral port guard right before spawning Tor so that
+    // the port is freed for Tor to bind.  This minimises the TOCTOU
+    // window compared to dropping early.
+    drop(bind_result._ephemeral_guard);
+
     spawn_tor_and_wait_ready(socks_addr, &data_dir, &tor_bin, &cfg.tor_args, &torrc).await
 }
 
 pub async fn start_tor_snowflake(bind: &str, cfg: &SnowflakePtConfig) -> Result<TorClientGuard> {
-    let socks_addr = normalize_bind(bind).await?;
+    let bind_result = normalize_bind(bind).await?;
+    let socks_addr = bind_result.addr;
     let data_dir = make_temp_dir("tor-snowflake")?;
     let tor_bin = ensure_pt_binary("tor", &cfg.tor_bin).await?;
     let snowflake_bin = ensure_pt_binary("snowflake-client", &cfg.snowflake_bin).await?;
@@ -120,6 +127,11 @@ pub async fn start_tor_snowflake(bind: &str, cfg: &SnowflakePtConfig) -> Result<
             format!("Bridge snowflake {bridge}"),
         ],
     );
+
+    // Drop the ephemeral port guard right before spawning Tor so that
+    // the port is freed for Tor to bind.  This minimises the TOCTOU
+    // window compared to dropping early.
+    drop(bind_result._ephemeral_guard);
 
     spawn_tor_and_wait_ready(socks_addr, &data_dir, &tor_bin, &cfg.tor_args, &torrc).await
 }
@@ -541,7 +553,19 @@ fn windows_pathexts() -> Vec<String> {
         .collect()
 }
 
-async fn normalize_bind(bind: &str) -> Result<SocketAddr> {
+/// Result of [`normalize_bind`]: a concrete socket address and an optional
+/// ephemeral port guard that must be kept alive until the consumer is about
+/// to bind the port itself.
+struct BindResult {
+    addr: SocketAddr,
+    /// When the caller requested port 0 we bind an ephemeral port and hold
+    /// the listener here so no other process can steal the port before Tor
+    /// starts.  The caller must [`drop`] this guard immediately before
+    /// spawning Tor.
+    _ephemeral_guard: Option<tokio::net::TcpListener>,
+}
+
+async fn normalize_bind(bind: &str) -> Result<BindResult> {
     let bind = bind.trim();
     if bind.is_empty() {
         return Err(EngineError::Config(
@@ -554,15 +578,22 @@ async fn normalize_bind(bind: &str) -> Result<SocketAddr> {
         )
     })?;
     if addr.port() != 0 {
-        return Ok(addr);
+        return Ok(BindResult {
+            addr,
+            _ephemeral_guard: None,
+        });
     }
 
-    // Port 0: pick an ephemeral port ourselves and pass a concrete SocksPort to Tor.
+    // Port 0: pick an ephemeral port ourselves and pass a concrete SocksPort
+    // to Tor.  Keep the listener alive so no other process can steal the port
+    // between now and the moment Tor binds it (TOCTOU mitigation).
     let host = addr.ip();
     let listener = tokio::net::TcpListener::bind(SocketAddr::new(host, 0)).await?;
     let picked = listener.local_addr()?;
-    drop(listener);
-    Ok(picked)
+    Ok(BindResult {
+        addr: picked,
+        _ephemeral_guard: Some(listener),
+    })
 }
 
 fn make_temp_dir(prefix: &str) -> Result<PathBuf> {
@@ -834,8 +865,10 @@ mod tests {
 
     #[tokio::test]
     async fn normalize_bind_picks_ephemeral_port_on_zero() {
-        let a = normalize_bind("127.0.0.1:0").await.expect("bind");
-        assert_eq!(a.ip(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
-        assert!(a.port() != 0);
+        let result = normalize_bind("127.0.0.1:0").await.expect("bind");
+        assert_eq!(result.addr.ip(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(result.addr.port() != 0);
+        // The ephemeral guard should be present when port 0 is requested.
+        assert!(result._ephemeral_guard.is_some());
     }
 }

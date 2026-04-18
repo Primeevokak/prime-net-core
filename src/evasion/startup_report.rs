@@ -192,7 +192,12 @@ pub fn log_report(report: &DesyncEngineReport) {
 
     // ── Overall summary ──────────────────────────────────────────────────
     let ok_count = report.total_profiles - report.degraded.len();
-    if report.degraded.is_empty() {
+    if report.total_profiles == 0 {
+        warn!(
+            target: "desync",
+            "no desync profiles loaded — native bypass is effectively disabled"
+        );
+    } else if report.degraded.is_empty() {
         info!(
             target: "desync",
             total = report.total_profiles,

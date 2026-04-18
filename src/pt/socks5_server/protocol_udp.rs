@@ -81,8 +81,10 @@ pub async fn handle_udp_associate(
     // Vec because multiple domains can resolve to the same IP (CDN/Cloudflare).
     let mut addr_to_domain: HashMap<SocketAddr, Vec<String>> = HashMap::new();
     let mut probe_check = tokio::time::interval(std::time::Duration::from_secs(1));
-    // Idle timeout created once outside the loop so it tracks real elapsed idle time.
-    let idle_timeout = tokio::time::sleep(std::time::Duration::from_secs(300));
+    // Resettable idle timeout: reset on every successful data relay so that
+    // active streams (e.g. Discord voice calls) are not killed after 5 minutes.
+    let idle_duration = std::time::Duration::from_secs(300);
+    let idle_timeout = tokio::time::sleep(idle_duration);
     tokio::pin!(idle_timeout);
 
     loop {
@@ -101,6 +103,12 @@ pub async fn handle_udp_associate(
             udp_res = udp_recv.recv_from(&mut buf) => {
                 match udp_res {
                     Ok((n, src)) => {
+                        // Reset idle timer on any data activity so active streams
+                        // (e.g. Discord voice) are not killed after 5 minutes.
+                        idle_timeout
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + idle_duration);
+
                         if client_source_addr.is_none() {
                             client_source_addr = Some(src);
                         }

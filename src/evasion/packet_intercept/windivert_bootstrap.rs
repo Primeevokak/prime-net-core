@@ -74,8 +74,10 @@ fn engine_dir() -> Result<PathBuf, WinDivertBootstrapError> {
 pub async fn ensure_windivert_available() -> Result<bool, WinDivertBootstrapError> {
     let dir = engine_dir()?;
     let dll_path = dir.join("WinDivert.dll");
+    let sys_path = dir.join("WinDivert64.sys");
 
-    if dll_path.exists() {
+    // Both files must be present; if only one exists, re-download.
+    if dll_path.exists() && sys_path.exists() {
         return Ok(false);
     }
 

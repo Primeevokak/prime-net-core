@@ -1,3 +1,4 @@
+mod adblock_runtime;
 #[cfg(feature = "tun")]
 mod auto_route;
 mod blocklist_builtin;

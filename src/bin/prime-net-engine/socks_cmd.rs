@@ -15,7 +15,9 @@ use crate::blocklist_runtime::{
     initialize_runtime_blocklist, is_bypass_domain_runtime, log_runtime_blocklist_stats,
 };
 use crate::config_watcher::spawn_config_watcher;
-use crate::stats_writer::spawn_stats_writer;
+use crate::stats_writer::{
+    build_capability_snapshot, spawn_stats_writer, EngineCapabilitySnapshot,
+};
 
 #[derive(Debug, Clone)]
 pub struct SocksOpts {
@@ -119,6 +121,7 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
     }
 
     let mut native_profiles_count: usize = 0;
+    let mut capability_snapshot: Option<EngineCapabilitySnapshot> = None;
     let engine_start = std::time::Instant::now();
 
     // Initialize in-process TcpDesyncEngine (native bypass) — no binary required.
@@ -181,6 +184,7 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
         // Log detailed capability report before wrapping the engine in Arc.
         let report = prime_net_engine_core::evasion::startup_report::analyze_engine(&engine);
         prime_net_engine_core::evasion::startup_report::log_report(&report);
+        capability_snapshot = Some(build_capability_snapshot(&report, &engine));
 
         relay_opts.native_bypass = Some(Arc::new(engine));
         info!(
@@ -188,6 +192,34 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
             profiles = native_profiles_count,
             "native TLS/TCP desync engine active"
         );
+    }
+
+    // Initialize adblock engine (DNS-level ad/tracker blocking).
+    // Runs AFTER blocklist + DPI evasion setup so filter list downloads
+    // go through the network without proxy loops.
+    //
+    // Always set the function pointer so hot-reload can enable adblock later
+    // even if it was disabled at startup.  The function checks `enabled`
+    // internally and returns false when disabled.
+    relay_opts.adblock_domain_check = Some(crate::adblock_runtime::is_adblock_blocked);
+    if cfg.adblock.enabled {
+        match crate::adblock_runtime::initialize_adblock(&cfg.adblock).await {
+            Ok(stats) => {
+                info!(
+                    target: "socks_cmd",
+                    dns_rules = stats.dns_rules_loaded,
+                    "adblock engine active"
+                );
+                crate::adblock_runtime::spawn_adblock_updater(cfg.adblock.clone());
+            }
+            Err(e) => {
+                warn!(
+                    target: "socks_cmd",
+                    error = %e,
+                    "adblock initialisation failed — continuing without ad blocking"
+                );
+            }
+        }
     }
 
     let resolver = Arc::new(ResolverChain::from_config(&cfg.anticensorship)?);
@@ -236,6 +268,7 @@ pub async fn run_socks(mut cfg: EngineConfig, opts: &SocksOpts) -> Result<()> {
             listen_addr.to_string(),
             native_profiles_count,
             engine_start,
+            capability_snapshot.clone(),
         )
     });
 

@@ -27,6 +27,7 @@ pub async fn handle_http_proxy(
     let mut buf = Vec::with_capacity(2048);
     buf.extend_from_slice(&first_two);
     let mut tmp = [0u8; 512];
+    let header_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         if find_http_header_end(&buf).is_some() {
             break;
@@ -36,7 +37,15 @@ pub async fn handle_http_proxy(
                 "HTTP header too large".to_owned(),
             ));
         }
-        let n = tcp.read(&mut tmp).await?;
+        let n = match tokio::time::timeout_at(header_deadline, tcp.read(&mut tmp)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(EngineError::Io(e)),
+            Err(_) => {
+                return Err(EngineError::Internal(
+                    "HTTP header read timed out".to_owned(),
+                ))
+            }
+        };
         if n == 0 {
             return Ok(());
         }
