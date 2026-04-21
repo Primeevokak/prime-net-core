@@ -264,7 +264,11 @@ impl PrimeHttpClient {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
 
-        let tmp_path: PathBuf = PathBuf::from(format!("{}.prime.tmp", path.to_string_lossy()));
+        let tmp_path: PathBuf = {
+            let mut s = path.as_os_str().to_owned();
+            s.push(".prime.tmp");
+            PathBuf::from(s)
+        };
         let mut out = tokio::fs::OpenOptions::new()
             .create(true)
             .truncate(true)

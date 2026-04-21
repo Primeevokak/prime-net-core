@@ -302,7 +302,7 @@ fn sort_profiles_by_cache(
 
     indexed
         .into_iter()
-        .map(|(i, _)| engine.profile_at(i).clone())
+        .filter_map(|(i, _)| engine.profile_at(i).cloned())
         .collect()
 }
 

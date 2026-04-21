@@ -201,67 +201,71 @@ impl PrimeHttpClient {
                 let _ = poll_fn(|cx| h3_conn.poll_close(cx)).await;
             });
 
-            let http_req = request_to_http_request(&parsed, &request)?;
-            let mut stream = send_request
-                .send_request(http_req)
-                .await
-                .map_err(|e| EngineError::Internal(format!("h3 send_request failed: {e}")))?;
-
-            if !request.body.is_empty() {
-                stream
-                    .send_data(Bytes::from(request.body.clone()))
+            let result = async {
+                let http_req = request_to_http_request(&parsed, &request)?;
+                let mut stream = send_request
+                    .send_request(http_req)
                     .await
-                    .map_err(|e| EngineError::Internal(format!("h3 send_data failed: {e}")))?;
-            }
-            stream
-                .finish()
-                .await
-                .map_err(|e| EngineError::Internal(format!("h3 finish failed: {e}")))?;
+                    .map_err(|e| EngineError::Internal(format!("h3 send_request failed: {e}")))?;
 
-            let resp = stream
-                .recv_response()
-                .await
-                .map_err(|e| EngineError::Internal(format!("h3 recv_response failed: {e}")))?;
-
-            let mut body = Vec::new();
-            let mut downloaded: u64 = 0;
-            let max_bytes = (self.config.download.max_response_body_mb as u64) * 1024 * 1024;
-            let request_timeout =
-                Duration::from_millis(self.config.transport.http3_request_timeout_ms);
-
-            loop {
-                let chunk_res = tokio::time::timeout(request_timeout, stream.recv_data()).await;
-                let mut chunk = match chunk_res {
-                    Ok(Ok(Some(c))) => c,
-                    Ok(Ok(None)) => break,
-                    Ok(Err(e)) => {
-                        return Err(EngineError::Internal(format!("h3 recv_data failed: {e}")));
-                    }
-                    Err(_) => {
-                        return Err(EngineError::Internal(
-                            "HTTP/3 data transfer timeout".to_owned(),
-                        ));
-                    }
-                };
-
-                let n = chunk.remaining();
-                if downloaded + (n as u64) > max_bytes {
-                    driver.abort();
-                    return Err(EngineError::Internal(format!(
-                        "HTTP/3 response body exceeded limit of {} MB",
-                        self.config.download.max_response_body_mb
-                    )));
+                if !request.body.is_empty() {
+                    stream
+                        .send_data(Bytes::from(request.body.clone()))
+                        .await
+                        .map_err(|e| EngineError::Internal(format!("h3 send_data failed: {e}")))?;
                 }
-                let bytes = chunk.copy_to_bytes(n);
-                downloaded += bytes.len() as u64;
-                if let Some(h) = &progress {
-                    h(downloaded, 0, 0.0);
+                stream
+                    .finish()
+                    .await
+                    .map_err(|e| EngineError::Internal(format!("h3 finish failed: {e}")))?;
+
+                let resp = stream
+                    .recv_response()
+                    .await
+                    .map_err(|e| EngineError::Internal(format!("h3 recv_response failed: {e}")))?;
+
+                let mut body = Vec::new();
+                let mut downloaded: u64 = 0;
+                let max_bytes = (self.config.download.max_response_body_mb as u64) * 1024 * 1024;
+                let request_timeout =
+                    Duration::from_millis(self.config.transport.http3_request_timeout_ms);
+
+                loop {
+                    let chunk_res = tokio::time::timeout(request_timeout, stream.recv_data()).await;
+                    let mut chunk = match chunk_res {
+                        Ok(Ok(Some(c))) => c,
+                        Ok(Ok(None)) => break,
+                        Ok(Err(e)) => {
+                            return Err(EngineError::Internal(format!("h3 recv_data failed: {e}")));
+                        }
+                        Err(_) => {
+                            return Err(EngineError::Internal(
+                                "HTTP/3 data transfer timeout".to_owned(),
+                            ));
+                        }
+                    };
+
+                    let n = chunk.remaining();
+                    if downloaded + (n as u64) > max_bytes {
+                        return Err(EngineError::Internal(format!(
+                            "HTTP/3 response body exceeded limit of {} MB",
+                            self.config.download.max_response_body_mb
+                        )));
+                    }
+                    let bytes = chunk.copy_to_bytes(n);
+                    downloaded += bytes.len() as u64;
+                    if let Some(h) = &progress {
+                        h(downloaded, 0, 0.0);
+                    }
+                    body.extend_from_slice(&bytes);
                 }
-                body.extend_from_slice(&bytes);
+
+                Ok(response_to_response_data(&resp, body))
             }
+            .await;
 
             driver.abort();
-            return Ok(response_to_response_data(&resp, body));
+            return result;
         }
 
         Err(last_err.unwrap_or_else(|| {
@@ -349,27 +353,40 @@ impl PrimeHttpClient {
                 let _ = poll_fn(|cx| h3_conn.poll_close(cx)).await;
             });
 
-            let http_req = request_to_http_request(&parsed, &request)?;
-            let mut stream = send_request
-                .send_request(http_req)
-                .await
-                .map_err(|e| EngineError::Internal(format!("h3 send_request failed: {e}")))?;
-
-            if !request.body.is_empty() {
-                stream
-                    .send_data(Bytes::from(request.body.clone()))
+            let result = async {
+                let http_req = request_to_http_request(&parsed, &request)?;
+                let mut stream = send_request
+                    .send_request(http_req)
                     .await
-                    .map_err(|e| EngineError::Internal(format!("h3 send_data failed: {e}")))?;
-            }
-            stream
-                .finish()
-                .await
-                .map_err(|e| EngineError::Internal(format!("h3 finish failed: {e}")))?;
+                    .map_err(|e| EngineError::Internal(format!("h3 send_request failed: {e}")))?;
 
-            let resp = stream
-                .recv_response()
-                .await
-                .map_err(|e| EngineError::Internal(format!("h3 recv_response failed: {e}")))?;
+                if !request.body.is_empty() {
+                    stream
+                        .send_data(Bytes::from(request.body.clone()))
+                        .await
+                        .map_err(|e| EngineError::Internal(format!("h3 send_data failed: {e}")))?;
+                }
+                stream
+                    .finish()
+                    .await
+                    .map_err(|e| EngineError::Internal(format!("h3 finish failed: {e}")))?;
+
+                let resp = stream
+                    .recv_response()
+                    .await
+                    .map_err(|e| EngineError::Internal(format!("h3 recv_response failed: {e}")))?;
+
+                Ok((resp, stream))
+            }
+            .await;
+
+            let (resp, stream) = match result {
+                Ok(v) => v,
+                Err(e) => {
+                    driver.abort();
+                    return Err(e);
+                }
+            };
 
             let status = StatusCode::from_u16(resp.status().as_u16())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);

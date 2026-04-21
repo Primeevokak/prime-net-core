@@ -21,7 +21,10 @@ fn find_chrome() -> Option<PathBuf> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let chrome_path = find_chrome().expect("Chrome not found in standard paths!");
+    let Some(chrome_path) = find_chrome() else {
+        eprintln!("Chrome not found in standard paths!");
+        std::process::exit(1);
+    };
     println!("Found Chrome at: {:?}", chrome_path);
 
     let current_dir = env::current_dir()?;
@@ -36,7 +39,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .args(["build", "--release", "--bin", "prime-net-engine"])
             .status()?;
         if !status.success() {
-            panic!("Failed to build engine");
+            eprintln!("Failed to build engine");
+            std::process::exit(1);
         }
     }
 

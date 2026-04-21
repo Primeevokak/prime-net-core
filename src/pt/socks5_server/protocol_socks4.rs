@@ -31,7 +31,6 @@ pub async fn handle_socks4(
     let port = u16::from_be_bytes(p_buf);
     let mut ip_buf = [0u8; 4];
     tcp.read_exact(&mut ip_buf).await?;
-    let target_addr = TargetAddr::Ip(std::net::IpAddr::V4(ip_buf.into()));
 
     // Read user ID (and discard) — cap at 255 bytes to prevent unbounded reads
     const MAX_USER_ID_LEN: usize = 255;
@@ -49,6 +48,31 @@ pub async fn handle_socks4(
             break;
         }
     }
+
+    // SOCKS4a extension: when IP is 0.0.0.x (x != 0), a domain name follows
+    // the user ID null terminator.
+    let is_socks4a = ip_buf[0] == 0 && ip_buf[1] == 0 && ip_buf[2] == 0 && ip_buf[3] != 0;
+    let target_addr = if is_socks4a {
+        let mut domain_bytes = Vec::with_capacity(64);
+        loop {
+            if domain_bytes.len() >= MAX_USER_ID_LEN {
+                return Err(EngineError::Internal(
+                    "SOCKS4a domain name exceeds 255 bytes".to_owned(),
+                ));
+            }
+            let mut b = [0u8; 1];
+            tcp.read_exact(&mut b).await?;
+            if b[0] == 0 {
+                break;
+            }
+            domain_bytes.push(b[0]);
+        }
+        let domain = String::from_utf8(domain_bytes)
+            .map_err(|_| EngineError::Internal("SOCKS4a domain is not valid UTF-8".to_owned()))?;
+        TargetAddr::Domain(domain)
+    } else {
+        TargetAddr::Ip(std::net::IpAddr::V4(ip_buf.into()))
+    };
 
     let mut out = outbound
         .connect(TargetEndpoint {

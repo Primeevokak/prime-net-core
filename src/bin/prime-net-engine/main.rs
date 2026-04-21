@@ -39,6 +39,19 @@ use crate::update_cmd::{run_update, UpdateOpts};
 use crate::wizard::{run_wizard, WizardOpts};
 
 fn main() {
+    // Clear proxy env vars BEFORE spawning any threads.
+    // `set_var`/`remove_var` are unsound in a multi-threaded process (Rust 1.80+),
+    // so we do this while only the main thread exists.
+    // SAFETY: no other threads are running at this point.
+    unsafe {
+        std::env::set_var("http_proxy", "");
+        std::env::set_var("https_proxy", "");
+        std::env::set_var("all_proxy", "");
+        std::env::remove_var("http_proxy");
+        std::env::remove_var("https_proxy");
+        std::env::remove_var("all_proxy");
+    }
+
     let worker_threads = std::env::var("PRIME_WORKER_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -71,13 +84,7 @@ fn main() {
 }
 
 async fn real_main() -> Result<()> {
-    // Aggressively prevent any library from using system proxy.
-    std::env::set_var("http_proxy", "");
-    std::env::set_var("https_proxy", "");
-    std::env::set_var("all_proxy", "");
-    std::env::remove_var("http_proxy");
-    std::env::remove_var("https_proxy");
-    std::env::remove_var("all_proxy");
+    // Proxy env vars already cleared in `fn main()` before any threads exist.
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {

@@ -107,7 +107,9 @@ pub fn build_capability_snapshot(
 
     let mut profiles = Vec::with_capacity(report.total_profiles);
     for idx in 0..engine.profile_count() {
-        let p = engine.profile_at(idx);
+        let Some(p) = engine.profile_at(idx) else {
+            continue;
+        };
         let technique_label = technique_short_label(&p.technique);
 
         // Find whether this profile appears in the degraded list.

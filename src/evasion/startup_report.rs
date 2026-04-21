@@ -63,7 +63,9 @@ pub fn analyze_engine(engine: &TcpDesyncEngine) -> DesyncEngineReport {
     let mut degraded = Vec::new();
 
     for idx in 0..engine.profile_count() {
-        let profile = engine.profile_at(idx);
+        let Some(profile) = engine.profile_at(idx) else {
+            continue;
+        };
         let name = profile.name.clone();
 
         // Check technique-level degradation.

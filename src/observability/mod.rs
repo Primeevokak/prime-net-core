@@ -208,9 +208,12 @@ pub mod prometheus {
             self.sum_micros.fetch_add(micros, Ordering::Relaxed);
             self.count.fetch_add(1, Ordering::Relaxed);
 
+            // Increment only the single matching bucket (first `le >= seconds`).
+            // `render()` accumulates these into Prometheus-style cumulative counts.
             for (idx, le) in self.buckets.iter().copied().enumerate() {
                 if seconds <= le {
                     self.bucket_counts[idx].fetch_add(1, Ordering::Relaxed);
+                    break;
                 }
             }
         }

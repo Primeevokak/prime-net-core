@@ -74,6 +74,11 @@ pub async fn handle_udp_associate(
 
     let mut tcp_buf = [0u8; 1];
 
+    // Rate-limiter: at most one Discord fake burst and one QUIC fake burst
+    // per destination per second. Prevents unbounded task/socket spawning.
+    let mut discord_fake_last: HashMap<SocketAddr, tokio::time::Instant> = HashMap::new();
+    let mut quic_fake_last: HashMap<SocketAddr, tokio::time::Instant> = HashMap::new();
+
     // QUIC silent-drop probe state (all owned by this task — no shared state, no race).
     // Key: "domain:443", Value: Instant when the probe packet was sent.
     let mut quic_pending: HashMap<String, tokio::time::Instant> = HashMap::new();
@@ -124,6 +129,8 @@ pub async fn handle_udp_associate(
                                 &relay_opts,
                                 &mut quic_pending,
                                 &mut addr_to_domain,
+                                &mut discord_fake_last,
+                                &mut quic_fake_last,
                             ).await {
                                 Ok(Some(target_addr)) => {
                                     // Cap the map to prevent memory growth during long UDP sessions.
@@ -202,6 +209,8 @@ async fn handle_client_to_remote(
     relay_opts: &RelayOptions,
     quic_pending: &mut HashMap<String, tokio::time::Instant>,
     addr_to_domain: &mut HashMap<SocketAddr, Vec<String>>,
+    discord_fake_last: &mut HashMap<SocketAddr, tokio::time::Instant>,
+    quic_fake_last: &mut HashMap<SocketAddr, tokio::time::Instant>,
 ) -> std::io::Result<Option<SocketAddr>> {
     if data.len() < 4 {
         return Ok(None);
@@ -310,28 +319,38 @@ async fn handle_client_to_remote(
     // fingerprints Discord voice traffic by port range and packet structure
     // gets confused by the fakes.
     if is_discord_voice_port(target_addr.port()) && relay_opts.native_bypass.is_some() {
-        let target = target_addr;
-        let pkt_len = payload.len();
-        // Pre-generate all fakes to avoid holding non-Send ThreadRng across await.
-        let fakes: Vec<Vec<u8>> = {
-            use rand::Rng;
-            let mut rng = rand::thread_rng();
-            (0..DISCORD_FAKE_COUNT)
-                .map(|_| {
-                    let mut fake = vec![0u8; pkt_len];
-                    rng.fill(&mut fake[..]);
-                    fake
-                })
-                .collect()
-        };
-        tokio::spawn(async move {
-            for fake in &fakes {
-                if let Ok(sock) = crate::evasion::quic_initial::bind_udp_for_target(target).await {
-                    let _ = sock.set_ttl(3);
-                    let _ = sock.send_to(fake, target).await;
+        let now = tokio::time::Instant::now();
+        let should_inject = discord_fake_last
+            .get(&target_addr)
+            .map(|t| now.duration_since(*t) >= std::time::Duration::from_secs(1))
+            .unwrap_or(true);
+        if should_inject {
+            discord_fake_last.insert(target_addr, now);
+            let target = target_addr;
+            let pkt_len = payload.len();
+            // Pre-generate all fakes to avoid holding non-Send ThreadRng across await.
+            let fakes: Vec<Vec<u8>> = {
+                use rand::Rng;
+                let mut rng = rand::thread_rng();
+                (0..DISCORD_FAKE_COUNT)
+                    .map(|_| {
+                        let mut fake = vec![0u8; pkt_len];
+                        rng.fill(&mut fake[..]);
+                        fake
+                    })
+                    .collect()
+            };
+            tokio::spawn(async move {
+                for fake in &fakes {
+                    if let Ok(sock) =
+                        crate::evasion::quic_initial::bind_udp_for_target(target).await
+                    {
+                        let _ = sock.set_ttl(3);
+                        let _ = sock.send_to(fake, target).await;
+                    }
                 }
-            }
-        });
+            });
+        }
     }
 
     // QUIC Initial desync: for port-443 UDP, inject a fake Initial with a
@@ -341,21 +360,29 @@ async fn handle_client_to_remote(
     // This replaces the hard block for censored domains with an active bypass.
     if target_addr.port() == 443 && relay_opts.native_bypass.is_some() {
         if let Some(hdr) = parse_quic_initial_header(payload) {
-            // Inject multiple fake QUIC Initials with diverse whitelisted SNIs.
-            // zapret sends 6-11 copies; we use the configured repeat count (default 8).
-            let repeat = cfg.evasion.quic_fake_repeat_count.max(1);
-            let target = target_addr;
-            let dcid = hdr.dcid.clone();
-            tokio::spawn(async move {
-                for _ in 0..repeat {
-                    let sni = random_whitelisted_sni();
-                    let _ = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        send_fake_quic_initial(target, &dcid, sni, FAKE_QUIC_TTL),
-                    )
-                    .await;
-                }
-            });
+            let now = tokio::time::Instant::now();
+            let should_inject = quic_fake_last
+                .get(&target_addr)
+                .map(|t| now.duration_since(*t) >= std::time::Duration::from_secs(1))
+                .unwrap_or(true);
+            if should_inject {
+                quic_fake_last.insert(target_addr, now);
+                // Inject multiple fake QUIC Initials with diverse whitelisted SNIs.
+                // zapret sends 6-11 copies; we use the configured repeat count (default 8).
+                let repeat = cfg.evasion.quic_fake_repeat_count.max(1);
+                let target = target_addr;
+                let dcid = hdr.dcid.clone();
+                tokio::spawn(async move {
+                    for _ in 0..repeat {
+                        let sni = random_whitelisted_sni();
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            send_fake_quic_initial(target, &dcid, sni, FAKE_QUIC_TTL),
+                        )
+                        .await;
+                    }
+                });
+            }
         }
     }
 

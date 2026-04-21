@@ -5,6 +5,8 @@
 //! instead of bypassing the engine.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpStream;
@@ -21,14 +23,19 @@ const DEAD_PORT: u16 = 1;
 
 /// Guard for the kill switch monitor task.
 ///
-/// Returned by [`spawn_kill_switch_monitor`]. Carries no state currently;
-/// reserved for future cleanup on drop (e.g. restoring the system proxy
-/// from within an async context).
+/// Returned by [`spawn_kill_switch_monitor`]. The `engaged` flag is shared
+/// with the background monitor and reflects whether the kill switch is
+/// currently active.
 pub struct KillSwitchGuard {
-    /// Whether the kill switch was ever engaged during this session.
-    ///
-    /// Reserved for future cleanup logic.
-    pub engaged: bool,
+    /// Whether the kill switch is currently engaged.
+    pub engaged: Arc<AtomicBool>,
+}
+
+impl KillSwitchGuard {
+    /// Returns `true` if the kill switch is currently engaged.
+    pub fn is_engaged(&self) -> bool {
+        self.engaged.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for KillSwitchGuard {
@@ -54,9 +61,11 @@ impl Drop for KillSwitchGuard {
 /// let _guard = spawn_kill_switch_monitor(addr, true);
 /// ```
 pub fn spawn_kill_switch_monitor(socks_addr: SocketAddr, enabled: bool) -> KillSwitchGuard {
+    let engaged = Arc::new(AtomicBool::new(false));
     if !enabled {
-        return KillSwitchGuard { engaged: false };
+        return KillSwitchGuard { engaged };
     }
+    let engaged_flag = engaged.clone();
     tokio::spawn(async move {
         let mut was_alive = true;
         loop {
@@ -68,6 +77,7 @@ pub fn spawn_kill_switch_monitor(socks_addr: SocketAddr, enabled: bool) -> KillS
                     addr = %socks_addr,
                     "SOCKS5 proxy unreachable — engaging kill switch"
                 );
+                engaged_flag.store(true, Ordering::Relaxed);
                 engage_kill_switch(socks_addr.port()).await;
             } else if !was_alive && alive {
                 info!(
@@ -75,12 +85,13 @@ pub fn spawn_kill_switch_monitor(socks_addr: SocketAddr, enabled: bool) -> KillS
                     addr = %socks_addr,
                     "SOCKS5 proxy restored — disengaging kill switch"
                 );
+                engaged_flag.store(false, Ordering::Relaxed);
                 disengage_kill_switch(socks_addr.port()).await;
             }
             was_alive = alive;
         }
     });
-    KillSwitchGuard { engaged: false }
+    KillSwitchGuard { engaged }
 }
 
 /// Returns `true` when a TCP connection to `addr` succeeds within [`CHECK_TIMEOUT`].
@@ -142,9 +153,11 @@ mod kill_switch_tests {
     fn guard_disabled_returns_immediately() {
         // With enabled=false, the function must return synchronously with no tokio runtime.
         let addr: SocketAddr = "127.0.0.1:1080".parse().unwrap();
-        let guard = KillSwitchGuard { engaged: false };
+        let guard = KillSwitchGuard {
+            engaged: Arc::new(AtomicBool::new(false)),
+        };
         // Just verify fields are accessible and the type can be constructed.
-        assert!(!guard.engaged);
+        assert!(!guard.is_engaged());
         let _ = addr;
     }
 

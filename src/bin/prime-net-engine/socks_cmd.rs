@@ -332,7 +332,7 @@ fn build_direct_relay_options(cfg: &EngineConfig) -> RelayOptions {
         randomize_fragment_size: true,
         fragment_sleep_ms: sleep_ms,
         fragment_budget_bytes: cfg.evasion.fragment_budget_bytes.max(128 * 1024), // Ensure at least 128KB budget
-        tcp_window_size: cfg.evasion.tcp_window_size as u16,
+        tcp_window_size: cfg.evasion.tcp_window_size.min(u16::MAX as u32) as u16,
         classifier_persist_enabled: cfg.evasion.classifier_persist_enabled,
         classifier_cache_path: Some(cfg.evasion.classifier_cache_path.clone().into()),
         classifier_entry_ttl_secs: cfg.evasion.classifier_entry_ttl_secs,

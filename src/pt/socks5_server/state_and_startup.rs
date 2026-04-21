@@ -53,7 +53,14 @@ pub async fn start_socks5_server(
                         Err(e) => { error!(target: "socks5", error = %e, "failed to accept connection"); }
                     }
                 }
-                _ = &mut shutdown_rx => { break; }
+                // Drain completed tasks so JoinHandles don't accumulate.
+                Some(_) = join_set.join_next() => {}
+                _ = &mut shutdown_rx => {
+                    // Cancel all active connections on shutdown.
+                    join_set.abort_all();
+                    while join_set.join_next().await.is_some() {}
+                    break;
+                }
             }
         }
     });
